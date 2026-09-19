@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "kind": "model",
+  "generated_at": "2026-09-19T14:54:40.041377+00:00",
+  "system": {
+    "chip": "Apple M4 Pro",
+    "machine": "arm64",
+    "macos": "26.6.2",
+    "metal_infer_commit": "97dce6e2aad1203e6960d25fc8a02b5f4f1bc6b6",
+    "metal_infer_dirty": false,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  },
+  "suite": {
+    "warmup": 1,
+    "iterations": 5,
+    "prompt_tokens": 512,
+    "generation_tokens": 128
+  },
+  "results": [
+    {
+      "benchmark": "qwen3_model",
+      "device": "Apple M4 Pro",
+      "iterations": 5,
+      "mean_ms": 17191.6897994,
+      "median_ms": 17255.826708,
+      "p95_ms": 17384.924208000004,
+      "throughput": null,
+      "throughput_unit": null,
+      "allocated_bytes": 1265975296,
+      "prefill": {
+        "tokens": 512,
+        "mean_ms": 818.6247329999999,
+        "median_ms": 808.1116659999999,
+        "p95_ms": 857.182625,
+        "tokens_per_second": 625.4392023115189
+      },
+      "decode": {
+        "tokens": 128,
+        "mean_ms": 16373.065066399999,
+        "median_ms": 16447.715042,
+        "p95_ms": 16527.741583000003,
+        "tokens_per_second": 7.817717665012847
+      },
+      "backend": "metal-infer"
+    },
+    {
+      "backend": "mlx-lm",
+      "benchmark": "qwen3_model",
+      "prefill": {
+        "tokens": 512,
+        "tokens_per_second": 4697.143
+      },
+      "decode": {
+        "tokens": 128,
+        "tokens_per_second": 168.135
+      },
+      "peak_memory_gb": 1.96
+    }
+  ]
+}

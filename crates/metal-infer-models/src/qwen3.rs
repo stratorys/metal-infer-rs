@@ -57,6 +57,13 @@ impl FusionOptions {
         add_rms_norm: true,
         qk_rope_cache: true,
     };
+
+    pub const RECOMMENDED: Self = Self {
+        qkv: true,
+        gate_up: false,
+        add_rms_norm: false,
+        qk_rope_cache: true,
+    };
 }
 
 pub struct KvCache {
@@ -180,7 +187,7 @@ impl Qwen3Model {
             final_norm,
             lm_head,
             attention_kind: AttentionKind::Tiled,
-            fusion_options: FusionOptions::NONE,
+            fusion_options: FusionOptions::RECOMMENDED,
         })
     }
 

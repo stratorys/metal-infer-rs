@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use metal_infer_cli::CliError;
-use metal_infer_core::{AttentionKind, DispatchStats, MetalContext};
+use metal_infer_core::{AttentionConfig, AttentionKind, DispatchStats, MetalContext};
 use metal_infer_models::{FusionOptions, KvCache, Qwen3Model};
 use serde::Serialize;
 
@@ -48,6 +48,22 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         iterations: usize,
         #[arg(long, default_value_t = 3)]
+        warmup: usize,
+    },
+    Attention {
+        #[arg(long, default_value_t = 1)]
+        tokens: usize,
+        #[arg(long, default_value_t = 640)]
+        length: usize,
+        #[arg(long, default_value_t = 16)]
+        query_heads: usize,
+        #[arg(long, default_value_t = 8)]
+        kv_heads: usize,
+        #[arg(long, default_value_t = 128)]
+        head_dim: usize,
+        #[arg(long, default_value_t = 50)]
+        iterations: usize,
+        #[arg(long, default_value_t = 10)]
         warmup: usize,
     },
     Block {
@@ -259,6 +275,68 @@ fn run() -> Result<(), CliError> {
                 warmup,
             )?
         }
+        Command::Attention {
+            tokens,
+            length,
+            query_heads,
+            kv_heads,
+            head_dim,
+            iterations,
+            warmup,
+        } => {
+            require_iterations(iterations)?;
+            if tokens == 0
+                || length == 0
+                || tokens > length
+                || query_heads == 0
+                || kv_heads == 0
+                || head_dim == 0
+            {
+                return Err(CliError::InvalidArguments(
+                    "attention dimensions must be non-zero and tokens must not exceed length"
+                        .into(),
+                ));
+            }
+            let query = context.tensor_f16(
+                &vec![0.01; tokens * query_heads * head_dim],
+                &[tokens, query_heads, head_dim],
+            )?;
+            let key = context.tensor_f16(
+                &vec![0.02; length * kv_heads * head_dim],
+                &[length, kv_heads, head_dim],
+            )?;
+            let value = context.tensor_f16(
+                &vec![0.03; length * kv_heads * head_dim],
+                &[length, kv_heads, head_dim],
+            )?;
+            let dispatch = || {
+                dispatch_attention(
+                    &context,
+                    &query,
+                    &key,
+                    &value,
+                    AttentionConfig {
+                        query_heads,
+                        kv_heads,
+                        head_dim,
+                        causal: true,
+                        query_offset: length - tokens,
+                    },
+                )
+            };
+            for _ in 0..warmup {
+                let _ = dispatch()?;
+            }
+            let (samples, gpu_samples) = measure_dispatch(iterations, dispatch)?;
+            report(
+                format!("attention_f16[tokens={tokens},length={length}]"),
+                &context,
+                samples,
+                Some(gpu_samples),
+                None,
+                None,
+            )
+        }
         Command::Block {
             model,
             tokens,
@@ -400,6 +478,18 @@ fn dispatch_matmul(
 ) -> Result<DispatchStats, metal_infer_core::CoreError> {
     let mut batch = context.begin_batch()?;
     let _output = batch.matmul(input, weight)?;
+    batch.finish()
+}
+
+fn dispatch_attention(
+    context: &MetalContext,
+    query: &metal_infer_core::Tensor,
+    key: &metal_infer_core::Tensor,
+    value: &metal_infer_core::Tensor,
+    config: AttentionConfig,
+) -> Result<DispatchStats, metal_infer_core::CoreError> {
+    let mut batch = context.begin_batch()?;
+    let _output = batch.attention(query, key, value, config, AttentionKind::Tiled)?;
     batch.finish()
 }
 

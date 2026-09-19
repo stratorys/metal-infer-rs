@@ -79,6 +79,16 @@ Projection benchmarks default to the vectorized `K=1024` path. Pass `--k 1023`
 to QKV or gate/up to measure the scalar fallback. Reports contain separate GPU
 and wall-clock distributions plus the fused/unfused speedup.
 
+Measure decode attention independently at the target cache length with:
+
+```sh
+target/release/metal-infer-bench attention --tokens 1 --length 512
+```
+
+Single-token tiled attention uses the split-KV kernel by default. QKV and
+QK+RoPE+cache are the default model fusions; benchmark flags still select an
+explicit fusion set so unfused baselines remain reproducible.
+
 ## Results
 
 See the [results index](results/README.md). Each entry contains its exact

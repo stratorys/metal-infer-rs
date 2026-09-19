@@ -232,6 +232,33 @@ fn tiled_attention_matches_reference() -> Result<(), CoreError> {
         .attention(&query, &key, &value, config, AttentionKind::Tiled)?
         .to_f32_vec()?;
     assert_close(&tiled, &reference);
+
+    let query_values: Vec<f32> = (0..2 * 128)
+        .map(|value| (value % 43) as f32 / 43.0 - 0.5)
+        .collect();
+    let key_values: Vec<f32> = (0..17 * 128)
+        .map(|value| (value % 37) as f32 / 37.0 - 0.25)
+        .collect();
+    let value_values: Vec<f32> = (0..17 * 128)
+        .map(|value| (value % 29) as f32 / 29.0)
+        .collect();
+    let query = context.tensor_f16(&query_values, &[1, 2, 128])?;
+    let key = context.tensor_f16(&key_values, &[17, 1, 128])?;
+    let value = context.tensor_f16(&value_values, &[17, 1, 128])?;
+    let config = AttentionConfig {
+        query_heads: 2,
+        kv_heads: 1,
+        head_dim: 128,
+        causal: true,
+        query_offset: 16,
+    };
+    let reference = context
+        .attention(&query, &key, &value, config, AttentionKind::Reference)?
+        .to_f32_vec()?;
+    let tiled = context
+        .attention(&query, &key, &value, config, AttentionKind::Tiled)?
+        .to_f32_vec()?;
+    assert_close(&tiled, &reference);
     Ok(())
 }
 

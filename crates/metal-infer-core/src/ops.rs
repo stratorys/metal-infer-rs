@@ -587,8 +587,10 @@ impl CommandBatch<'_> {
             kv_length: to_u32(*kv_length, "kv_length")?,
             padding: 0,
         };
+        let decode_attention = kind == AttentionKind::Tiled && *tokens == 1;
         let kernel = match kind {
             AttentionKind::Reference => "attention_reference_f16",
+            AttentionKind::Tiled if decode_attention => "attention_decode_f16",
             AttentionKind::Tiled => "attention_tiled_f16",
         };
         let (grid, threadgroup) = match kind {
@@ -596,6 +598,13 @@ impl CommandBatch<'_> {
                 size(config.head_dim, config.query_heads, *tokens),
                 size(config.head_dim.min(256), 1, 1),
             ),
+            AttentionKind::Tiled if decode_attention => {
+                let groups = checked_mul(config.query_heads, *tokens, "attention groups")?;
+                (
+                    size(checked_mul(groups, 256, "decode attention grid")?, 1, 1),
+                    size(256, 1, 1),
+                )
+            }
             AttentionKind::Tiled => {
                 let groups = checked_mul(config.query_heads, *tokens, "attention groups")?;
                 (

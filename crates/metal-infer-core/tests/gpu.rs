@@ -26,6 +26,38 @@ fn matvec_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
+fn batched_dependent_kernels_match_eager_execution() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let left = context.tensor_f16(&[1.0, 2.0, 3.0, 4.0], &[2, 2])?;
+    let right = context.tensor_f16(&[0.5, 1.0, 1.5, 2.0], &[2, 2])?;
+
+    let eager = context.add(&context.add(&left, &right)?, &right)?;
+
+    let mut batch = context.begin_batch()?;
+    let intermediate = batch.add(&left, &right)?;
+    let batched = batch.add(&intermediate, &right)?;
+    batch.finish()?;
+
+    assert_close(&batched.to_f32_vec()?, &eager.to_f32_vec()?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn invalid_batch_can_be_abandoned() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let input = context.tensor_f16(&[1.0, 2.0], &[1, 2])?;
+    let incompatible_weight = context.tensor_f16(&[1.0, 2.0, 3.0], &[1, 3])?;
+    let mut batch = context.begin_batch()?;
+
+    let result = batch.matmul(&input, &incompatible_weight);
+    assert!(result.is_err(), "incompatible matmul should fail");
+    drop(batch);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
 fn tiled_attention_matches_reference() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let query_values: Vec<f32> = (0..32).map(|value| value as f32 / 31.0 - 0.5).collect();

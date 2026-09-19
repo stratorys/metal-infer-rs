@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use metal_infer_core::{AttentionConfig, AttentionKind, DType, MetalContext, Tensor};
+use metal_infer_core::{AttentionConfig, AttentionKind, CommandBatch, DType, MetalContext, Tensor};
 
 use crate::weights::WeightMap;
 use crate::{ModelError, Qwen3Config};
@@ -218,7 +218,8 @@ impl Qwen3Model {
             return Err(ModelError::Config("block benchmark requires tokens".into()));
         }
         let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
-        let hidden = self.context.embedding(&token_tensor, &self.embedding)?;
+        let mut batch = self.context.begin_batch()?;
+        let hidden = batch.embedding(&token_tensor, &self.embedding)?;
         let shape = [
             tokens.len(),
             self.config.num_key_value_heads,
@@ -232,7 +233,9 @@ impl Qwen3Model {
             .layers
             .first()
             .ok_or_else(|| ModelError::Config("model has no transformer layer".into()))?;
-        self.forward_layer(hidden, layer, &cache, 0, tokens.len())
+        let output = self.forward_layer(&mut batch, hidden, layer, &cache, 0, tokens.len())?;
+        batch.finish()?;
+        Ok(output)
     }
 
     fn forward(
@@ -253,27 +256,28 @@ impl Qwen3Model {
             });
         }
         let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
-        let mut hidden = self.context.embedding(&token_tensor, &self.embedding)?;
+        let mut batch = self.context.begin_batch()?;
+        let mut hidden = batch.embedding(&token_tensor, &self.embedding)?;
         let offset = cache.filled;
         for (layer_index, layer) in self.layers.iter().enumerate() {
             let layer_cache = cache
                 .layers
                 .get(layer_index)
                 .ok_or_else(|| ModelError::Config("missing KV cache layer".into()))?;
-            hidden = self.forward_layer(hidden, layer, layer_cache, offset, requested)?;
+            hidden =
+                self.forward_layer(&mut batch, hidden, layer, layer_cache, offset, requested)?;
         }
-        cache.filled = requested;
-        let normalized =
-            self.context
-                .rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)?;
+        let normalized = batch.rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)?;
         let last = normalized.row(tokens.len() - 1)?;
-        self.context
-            .matmul(&last, &self.lm_head)
-            .map_err(Into::into)
+        let logits = batch.matmul(&last, &self.lm_head)?;
+        batch.finish()?;
+        cache.filled = requested;
+        Ok(logits)
     }
 
     fn forward_layer(
         &self,
+        batch: &mut CommandBatch<'_>,
         hidden: Tensor,
         layer: &LayerWeights,
         cache: &LayerCache,
@@ -285,48 +289,39 @@ impl Qwen3Model {
             .first()
             .copied()
             .ok_or_else(|| ModelError::Config("hidden state has no token dimension".into()))?;
-        let normalized =
-            self.context
-                .rms_norm(&hidden, &layer.input_norm, self.config.rms_norm_eps)?;
-        let query = self
-            .context
+        let normalized = batch.rms_norm(&hidden, &layer.input_norm, self.config.rms_norm_eps)?;
+        let query = batch
             .matmul(&normalized, &layer.attention.query)?
             .reshape(&[
                 tokens,
                 self.config.num_attention_heads,
                 self.config.head_dim,
             ])?;
-        let key = self
-            .context
-            .matmul(&normalized, &layer.attention.key)?
-            .reshape(&[
-                tokens,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-            ])?;
-        let value = self
-            .context
+        let key = batch.matmul(&normalized, &layer.attention.key)?.reshape(&[
+            tokens,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        ])?;
+        let value = batch
             .matmul(&normalized, &layer.attention.value)?
             .reshape(&[
                 tokens,
                 self.config.num_key_value_heads,
                 self.config.head_dim,
             ])?;
-        let query = self.context.rms_norm(
+        let query = batch.rms_norm(
             &query,
             &layer.attention.query_norm,
             self.config.rms_norm_eps,
         )?;
-        let key =
-            self.context
-                .rms_norm(&key, &layer.attention.key_norm, self.config.rms_norm_eps)?;
-        let query = self.context.rope(&query, offset, self.config.rope_theta)?;
-        let key = self.context.rope(&key, offset, self.config.rope_theta)?;
-        self.context.copy_into_cache(&key, &cache.key, offset)?;
-        self.context.copy_into_cache(&value, &cache.value, offset)?;
+        let key = batch.rms_norm(&key, &layer.attention.key_norm, self.config.rms_norm_eps)?;
+        let query = batch.rope(&query, offset, self.config.rope_theta)?;
+        let key = batch.rope(&key, offset, self.config.rope_theta)?;
+        batch.copy_into_cache(&key, &cache.key, offset)?;
+        batch.copy_into_cache(&value, &cache.value, offset)?;
         let active_key = cache.key.prefix(active_length)?;
         let active_value = cache.value.prefix(active_length)?;
-        let attention = self.context.attention(
+        let attention = batch.attention(
             &query,
             &active_key,
             &active_value,
@@ -340,18 +335,18 @@ impl Qwen3Model {
             self.attention_kind,
         )?;
         let attention = attention.reshape(&[tokens, self.config.query_width()])?;
-        let attention = self.context.matmul(&attention, &layer.attention.output)?;
-        let residual = self.context.add(&hidden, &attention)?;
-        let normalized = self.context.rms_norm(
+        let attention = batch.matmul(&attention, &layer.attention.output)?;
+        let residual = batch.add(&hidden, &attention)?;
+        let normalized = batch.rms_norm(
             &residual,
             &layer.post_attention_norm,
             self.config.rms_norm_eps,
         )?;
-        let gate = self.context.matmul(&normalized, &layer.mlp.gate)?;
-        let up = self.context.matmul(&normalized, &layer.mlp.up)?;
-        let activated = self.context.swiglu(&gate, &up)?;
-        let down = self.context.matmul(&activated, &layer.mlp.down)?;
-        self.context.add(&residual, &down).map_err(Into::into)
+        let gate = batch.matmul(&normalized, &layer.mlp.gate)?;
+        let up = batch.matmul(&normalized, &layer.mlp.up)?;
+        let activated = batch.swiglu(&gate, &up)?;
+        let down = batch.matmul(&activated, &layer.mlp.down)?;
+        batch.add(&residual, &down).map_err(Into::into)
     }
 }
 

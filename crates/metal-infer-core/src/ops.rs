@@ -1,12 +1,9 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::time::Instant;
 
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize,
-};
+use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-use crate::{CoreError, DType, DispatchStats, MetalContext, Tensor};
+use crate::{CommandBatch, CoreError, DType, MetalContext, Tensor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttentionKind {
@@ -62,15 +59,97 @@ struct AttentionParams {
 }
 
 impl MetalContext {
+    fn immediate<T>(
+        &self,
+        encode: impl FnOnce(&mut CommandBatch<'_>) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        let mut batch = self.begin_batch()?;
+        let output = encode(&mut batch)?;
+        batch.finish()?;
+        Ok(output)
+    }
+
     pub fn add(
         &self,
+        left: &Tensor,
+        right: &Tensor,
+    ) -> Result<Tensor, CoreError> {
+        self.immediate(|batch| batch.add(left, right))
+    }
+
+    pub fn matmul(
+        &self,
+        input: &Tensor,
+        weight: &Tensor,
+    ) -> Result<Tensor, CoreError> {
+        self.immediate(|batch| batch.matmul(input, weight))
+    }
+
+    pub fn rms_norm(
+        &self,
+        input: &Tensor,
+        weight: &Tensor,
+        epsilon: f32,
+    ) -> Result<Tensor, CoreError> {
+        self.immediate(|batch| batch.rms_norm(input, weight, epsilon))
+    }
+
+    pub fn swiglu(
+        &self,
+        gate: &Tensor,
+        up: &Tensor,
+    ) -> Result<Tensor, CoreError> {
+        self.immediate(|batch| batch.swiglu(gate, up))
+    }
+
+    pub fn embedding(
+        &self,
+        tokens: &Tensor,
+        table: &Tensor,
+    ) -> Result<Tensor, CoreError> {
+        self.immediate(|batch| batch.embedding(tokens, table))
+    }
+
+    pub fn rope(
+        &self,
+        input: &Tensor,
+        offset: usize,
+        theta: f32,
+    ) -> Result<Tensor, CoreError> {
+        self.immediate(|batch| batch.rope(input, offset, theta))
+    }
+
+    pub fn attention(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        config: AttentionConfig,
+        kind: AttentionKind,
+    ) -> Result<Tensor, CoreError> {
+        self.immediate(|batch| batch.attention(query, key, value, config, kind))
+    }
+
+    pub fn copy_into_cache(
+        &self,
+        source: &Tensor,
+        cache: &Tensor,
+        offset: usize,
+    ) -> Result<(), CoreError> {
+        self.immediate(|batch| batch.copy_into_cache(source, cache, offset))
+    }
+}
+
+impl CommandBatch<'_> {
+    pub fn add(
+        &mut self,
         left: &Tensor,
         right: &Tensor,
     ) -> Result<Tensor, CoreError> {
         require_f16(left)?;
         require_f16(right)?;
         require_same_shape(left, right)?;
-        let out = self.empty(left.shape(), DType::F16)?;
+        let out = self.context.empty(left.shape(), DType::F16)?;
         let count = to_u32(left.len(), "element count")?;
         self.dispatch(
             "add_f16",
@@ -83,7 +162,7 @@ impl MetalContext {
     }
 
     pub fn matmul(
-        &self,
+        &mut self,
         input: &Tensor,
         weight: &Tensor,
     ) -> Result<Tensor, CoreError> {
@@ -96,7 +175,7 @@ impl MetalContext {
                 "matmul inner dimensions differ: {k} and {weight_k}"
             )));
         }
-        let out = self.empty(&[m, n], DType::F16)?;
+        let out = self.context.empty(&[m, n], DType::F16)?;
         let params = MatrixParams {
             m: to_u32(m, "m")?,
             n: to_u32(n, "n")?,
@@ -124,7 +203,7 @@ impl MetalContext {
     }
 
     pub fn rms_norm(
-        &self,
+        &mut self,
         input: &Tensor,
         weight: &Tensor,
         epsilon: f32,
@@ -141,7 +220,7 @@ impl MetalContext {
             )));
         }
         let rows = input.len() / width;
-        let out = self.empty(input.shape(), DType::F16)?;
+        let out = self.context.empty(input.shape(), DType::F16)?;
         let params = NormParams {
             rows: to_u32(rows, "rows")?,
             width: to_u32(width, "width")?,
@@ -159,14 +238,14 @@ impl MetalContext {
     }
 
     pub fn swiglu(
-        &self,
+        &mut self,
         gate: &Tensor,
         up: &Tensor,
     ) -> Result<Tensor, CoreError> {
         require_f16(gate)?;
         require_f16(up)?;
         require_same_shape(gate, up)?;
-        let out = self.empty(gate.shape(), DType::F16)?;
+        let out = self.context.empty(gate.shape(), DType::F16)?;
         let count = to_u32(gate.len(), "element count")?;
         self.dispatch(
             "swiglu_f16",
@@ -179,7 +258,7 @@ impl MetalContext {
     }
 
     pub fn embedding(
-        &self,
+        &mut self,
         tokens: &Tensor,
         table: &Tensor,
     ) -> Result<Tensor, CoreError> {
@@ -190,7 +269,7 @@ impl MetalContext {
         }
         require_f16(table)?;
         let [_, width] = matrix_shape(table)?;
-        let out = self.empty(&[tokens.len(), width], DType::F16)?;
+        let out = self.context.empty(&[tokens.len(), width], DType::F16)?;
         let params = [
             to_u32(tokens.len(), "token count")?,
             to_u32(width, "embedding width")?,
@@ -206,7 +285,7 @@ impl MetalContext {
     }
 
     pub fn rope(
-        &self,
+        &mut self,
         input: &Tensor,
         offset: usize,
         theta: f32,
@@ -221,7 +300,7 @@ impl MetalContext {
         if !head_dim.is_multiple_of(2) {
             return Err(CoreError::Shape("RoPE head_dim must be even".into()));
         }
-        let out = self.empty(shape, DType::F16)?;
+        let out = self.context.empty(shape, DType::F16)?;
         let params = RopeParams {
             tokens: to_u32(*tokens, "tokens")?,
             heads: to_u32(*heads, "heads")?,
@@ -241,7 +320,7 @@ impl MetalContext {
     }
 
     pub fn attention(
-        &self,
+        &mut self,
         query: &Tensor,
         key: &Tensor,
         value: &Tensor,
@@ -284,7 +363,7 @@ impl MetalContext {
                 "tiled attention requires a power-of-two head_dim <= 256".into(),
             ));
         }
-        let out = self.empty(query.shape(), DType::F16)?;
+        let out = self.context.empty(query.shape(), DType::F16)?;
         let params = AttentionParams {
             tokens: to_u32(*tokens, "tokens")?,
             q_heads: to_u32(config.query_heads, "query_heads")?,
@@ -310,7 +389,7 @@ impl MetalContext {
     }
 
     pub fn copy_into_cache(
-        &self,
+        &mut self,
         source: &Tensor,
         cache: &Tensor,
         offset: usize,
@@ -348,18 +427,15 @@ impl MetalContext {
     }
 
     fn dispatch<T>(
-        &self,
+        &mut self,
         kernel: &str,
         tensors: &[&Tensor],
         params: &T,
         grid: MTLSize,
         threadgroup: MTLSize,
-    ) -> Result<DispatchStats, CoreError> {
-        let pipeline = self.pipeline(kernel)?;
-        let command_buffer = self.command_buffer()?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(CoreError::Resource("compute encoder"))?;
+    ) -> Result<(), CoreError> {
+        let pipeline = self.context.pipeline(kernel)?;
+        let encoder = self.encoder()?;
         encoder.setComputePipelineState(&pipeline);
         for (index, tensor) in tensors.iter().enumerate() {
             // SAFETY: tensor resources remain alive through command completion
@@ -373,26 +449,12 @@ impl MetalContext {
                 )
             };
         }
-        let (pointer, length): (NonNull<c_void>, usize) = unsafe { Self::bytes(params) };
+        let (pointer, length): (NonNull<c_void>, usize) = unsafe { MetalContext::bytes(params) };
         // SAFETY: Metal copies `length` bytes from a valid repr(C)/scalar value
         // while encoding.
         unsafe { encoder.setBytes_length_atIndex(pointer, length, tensors.len()) };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-        encoder.endEncoding();
-        let started = Instant::now();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-        let wall_time = started.elapsed();
-        if command_buffer.status() == MTLCommandBufferStatus::Error {
-            return Err(command_buffer
-                .error()
-                .map_or(CoreError::UnknownCommand, CoreError::Command));
-        }
-        let gpu_seconds = (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0);
-        Ok(DispatchStats {
-            gpu_time: std::time::Duration::from_secs_f64(gpu_seconds),
-            wall_time,
-        })
+        Ok(())
     }
 }
 

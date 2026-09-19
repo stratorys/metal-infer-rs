@@ -3,14 +3,16 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::time::Duration;
+use std::time::Instant;
 
 use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction, MTLLibrary, MTLResourceOptions,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLFunction, MTLLibrary, MTLResourceOptions,
 };
 
 use crate::{CoreError, DType, Tensor};
@@ -23,6 +25,12 @@ pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub struct DispatchStats {
     pub gpu_time: Duration,
     pub wall_time: Duration,
+}
+
+pub struct CommandBatch<'context> {
+    pub(crate) context: &'context MetalContext,
+    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
 }
 
 #[derive(Clone)]
@@ -57,6 +65,18 @@ impl MetalContext {
 
     pub fn allocated_bytes(&self) -> usize {
         self.device.currentAllocatedSize()
+    }
+
+    pub fn begin_batch(&self) -> Result<CommandBatch<'_>, CoreError> {
+        let command_buffer = self.command_buffer()?;
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(CoreError::Resource("compute encoder"))?;
+        Ok(CommandBatch {
+            context: self,
+            command_buffer,
+            encoder: Some(encoder),
+        })
     }
 
     pub fn empty(
@@ -190,6 +210,48 @@ impl MetalContext {
     pub(crate) unsafe fn bytes<T>(value: &T) -> (NonNull<c_void>, usize) {
         let pointer = NonNull::from(value).cast();
         (pointer, std::mem::size_of::<T>())
+    }
+}
+
+impl CommandBatch<'_> {
+    pub(crate) fn encoder(
+        &self
+    ) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>, CoreError> {
+        self.encoder
+            .as_deref()
+            .ok_or(CoreError::Resource("finished compute encoder"))
+    }
+
+    pub fn finish(mut self) -> Result<DispatchStats, CoreError> {
+        let encoder = self
+            .encoder
+            .take()
+            .ok_or(CoreError::Resource("finished compute encoder"))?;
+        encoder.endEncoding();
+        let started = Instant::now();
+        self.command_buffer.commit();
+        self.command_buffer.waitUntilCompleted();
+        let wall_time = started.elapsed();
+        if self.command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(self
+                .command_buffer
+                .error()
+                .map_or(CoreError::UnknownCommand, CoreError::Command));
+        }
+        let gpu_seconds =
+            (self.command_buffer.GPUEndTime() - self.command_buffer.GPUStartTime()).max(0.0);
+        Ok(DispatchStats {
+            gpu_time: Duration::from_secs_f64(gpu_seconds),
+            wall_time,
+        })
+    }
+}
+
+impl Drop for CommandBatch<'_> {
+    fn drop(&mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            encoder.endEncoding();
+        }
     }
 }
 

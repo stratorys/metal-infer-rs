@@ -1,0 +1,435 @@
+{
+  "schema_version": 1,
+  "kind": "kernels",
+  "generated_at": "2026-09-19T16:08:19.941065+00:00",
+  "system": {
+    "chip": "Apple M4 Pro",
+    "machine": "arm64",
+    "macos": "26.6.2",
+    "metal_infer_commit": "dc66e29be78a481ef4b4f8caaef2c5daa36e7e2d",
+    "metal_infer_dirty": false,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  },
+  "suite": {
+    "warmup": 5,
+    "iterations": 20,
+    "shapes": [
+      {
+        "m": 1,
+        "n": 1024,
+        "k": 1024
+      },
+      {
+        "m": 1,
+        "n": 2048,
+        "k": 1024
+      },
+      {
+        "m": 1,
+        "n": 3072,
+        "k": 1024
+      },
+      {
+        "m": 1,
+        "n": 1024,
+        "k": 3072
+      },
+      {
+        "m": 1,
+        "n": 151936,
+        "k": 1024
+      },
+      {
+        "m": 64,
+        "n": 128,
+        "k": 128
+      },
+      {
+        "m": 128,
+        "n": 1024,
+        "k": 1024
+      },
+      {
+        "m": 512,
+        "n": 1024,
+        "k": 1024
+      },
+      {
+        "m": 1024,
+        "n": 1024,
+        "k": 1024
+      }
+    ]
+  },
+  "results": [
+    {
+      "benchmark": "matmul_f16[1,1024,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.19546249999999998,
+      "median_ms": 0.195,
+      "p95_ms": 0.20041699999999998,
+      "gpu_mean_ms": 0.0365479,
+      "gpu_median_ms": 0.03675,
+      "gpu_p95_ms": 0.037208,
+      "throughput": 0.010729178231118502,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 2572288,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 1024,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,1024,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 1024,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.3857458486891119,
+      "median_ms": 0.4190829968138132,
+      "p95_ms": 0.5153340025572106,
+      "throughput": 0.005436615862819509,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1,2048,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.27129159999999997,
+      "median_ms": 0.20650000000000002,
+      "p95_ms": 0.459167,
+      "gpu_mean_ms": 0.0437667,
+      "gpu_median_ms": 0.043667,
+      "gpu_p95_ms": 0.044583000000000005,
+      "throughput": 0.015460500804300613,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 4669440,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 2048,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,2048,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 2048,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.3362748015206307,
+      "median_ms": 0.22006249855621718,
+      "p95_ms": 0.5830000009154901,
+      "throughput": 0.012472846555951878,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1,3072,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.25487075,
+      "median_ms": 0.215459,
+      "p95_ms": 0.472541,
+      "gpu_mean_ms": 0.0560354,
+      "gpu_median_ms": 0.055958,
+      "gpu_p95_ms": 0.056625,
+      "throughput": 0.024684888320844978,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 6766592,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 3072,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,3072,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 3072,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.31864159827819094,
+      "median_ms": 0.22593749963562004,
+      "p95_ms": 0.498042005347088,
+      "throughput": 0.019744616001163874,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1,1024,3072]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.29282715,
+      "median_ms": 0.24625,
+      "p95_ms": 0.545041,
+      "gpu_mean_ms": 0.09094580000000001,
+      "gpu_median_ms": 0.090625,
+      "gpu_p95_ms": 0.09375,
+      "throughput": 0.021485220888841763,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 6766592,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 1024,
+        "k": 3072
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,1024,3072]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 1024,
+        "k": 3072
+      },
+      "iterations": 20,
+      "mean_ms": 0.27750015033234376,
+      "median_ms": 0.2222084985987749,
+      "p95_ms": 0.4590419994201511,
+      "throughput": 0.022671901231279098,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1,151936,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 1.4878457499999997,
+      "median_ms": 1.496417,
+      "p95_ms": 1.624167,
+      "gpu_mean_ms": 1.2726582999999998,
+      "gpu_median_ms": 1.236125,
+      "gpu_p95_ms": 1.4463329999999999,
+      "throughput": 0.2091378948388971,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 311640064,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 151936,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,151936,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 151936,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 1.4794313501624856,
+      "median_ms": 1.4287499980127905,
+      "p95_ms": 1.541749996249564,
+      "throughput": 0.2103273855632604,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[64,128,128]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.1498625,
+      "median_ms": 0.15029099999999998,
+      "p95_ms": 0.156459,
+      "gpu_mean_ms": 0.0061917,
+      "gpu_median_ms": 0.006125,
+      "gpu_p95_ms": 0.0065,
+      "throughput": 0.01399384102093586,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 524288,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 64,
+        "n": 128,
+        "k": 128
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[64,128,128]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 64,
+        "n": 128,
+        "k": 128
+      },
+      "iterations": 20,
+      "mean_ms": 0.4421019992150832,
+      "median_ms": 0.537041498319013,
+      "p95_ms": 0.7675000015296973,
+      "throughput": 0.004743593115894807,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[128,1024,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.47971250000000004,
+      "median_ms": 0.417667,
+      "p95_ms": 0.81075,
+      "gpu_mean_ms": 0.25455625000000004,
+      "gpu_median_ms": 0.245875,
+      "gpu_p95_ms": 0.27308299999999996,
+      "throughput": 0.5595756958594991,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 2834432,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 128,
+        "n": 1024,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[128,1024,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 128,
+        "n": 1024,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.3959040495828958,
+      "median_ms": 0.2871870019589551,
+      "p95_ms": 0.7924160017864779,
+      "throughput": 0.6780315995322852,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[512,1024,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 1.2309563000000001,
+      "median_ms": 1.032167,
+      "p95_ms": 1.7563749999999998,
+      "gpu_mean_ms": 0.9983708999999998,
+      "gpu_median_ms": 0.7240000000000001,
+      "gpu_p95_ms": 1.5187499999999998,
+      "throughput": 0.8722826504888921,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 3620864,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 512,
+        "n": 1024,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[512,1024,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 512,
+        "n": 1024,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.6628125011047814,
+      "median_ms": 0.6142705024103634,
+      "p95_ms": 0.8130839996738359,
+      "throughput": 1.6199782324718954,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1024,1024,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 1.65390625,
+      "median_ms": 1.640541,
+      "p95_ms": 1.7463330000000001,
+      "gpu_mean_ms": 1.4129521,
+      "gpu_median_ms": 1.395625,
+      "gpu_p95_ms": 1.49675,
+      "throughput": 1.2984313034671704,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 4669440,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1024,
+        "n": 1024,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1024,1024,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1024,
+        "n": 1024,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.7466708000720246,
+      "median_ms": 0.7386039978882764,
+      "p95_ms": 1.1932499983231537,
+      "throughput": 2.8760782500036854,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    }
+  ]
+}

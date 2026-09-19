@@ -3,7 +3,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use metal_infer_cli::CliError;
-use metal_infer_core::{AttentionConfig, AttentionKind, DispatchStats, MetalContext};
+use metal_infer_core::{
+    AttentionConfig, AttentionKind, DispatchStats, MetalContext, QkNormRopeCacheConfig, Tensor,
+};
 use metal_infer_models::{FusionOptions, KvCache, Qwen3Model};
 use serde::Serialize;
 
@@ -51,6 +53,8 @@ enum Command {
         warmup: usize,
     },
     Attention {
+        #[arg(long, value_enum, default_value_t = AttentionBenchmarkKind::Compare)]
+        kind: AttentionBenchmarkKind,
         #[arg(long, default_value_t = 1)]
         tokens: usize,
         #[arg(long, default_value_t = 640)]
@@ -112,6 +116,14 @@ enum FusionKind {
     QkRopeCache,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AttentionBenchmarkKind {
+    Compare,
+    Reference,
+    Tiled,
+    DecodeSplitKv,
+}
+
 #[derive(Serialize)]
 struct Report {
     benchmark: String,
@@ -135,6 +147,8 @@ struct Report {
     fusions: Option<FusionSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<FusionComparison>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attention_comparison: Option<AttentionComparison>,
     prefill: Option<PhaseReport>,
     decode: Option<PhaseReport>,
 }
@@ -188,6 +202,22 @@ struct TimingReport {
     gpu_p95_ms: f64,
 }
 
+#[derive(Serialize)]
+struct AttentionComparison {
+    reference: AttentionVariantReport,
+    tiled: AttentionVariantReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decode_split_kv: Option<AttentionVariantReport>,
+}
+
+#[derive(Serialize)]
+struct AttentionVariantReport {
+    kind: &'static str,
+    #[serde(flatten)]
+    timing: TimingReport,
+    max_abs_error: f64,
+}
+
 #[derive(Clone, Copy)]
 struct PhaseSample {
     wall: Duration,
@@ -209,6 +239,24 @@ struct FusionDimensions {
     kv_heads: usize,
     head_dim: usize,
     cache_capacity: usize,
+}
+
+#[derive(Clone, Copy)]
+struct AttentionDimensions {
+    tokens: usize,
+    length: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+#[derive(Clone, Copy)]
+struct AttentionCase<'tensor> {
+    context: &'tensor MetalContext,
+    query: &'tensor Tensor,
+    key: &'tensor Tensor,
+    value: &'tensor Tensor,
+    config: AttentionConfig,
 }
 
 fn main() {
@@ -276,6 +324,7 @@ fn run() -> Result<(), CliError> {
             )?
         }
         Command::Attention {
+            kind,
             tokens,
             length,
             query_heads,
@@ -283,60 +332,19 @@ fn run() -> Result<(), CliError> {
             head_dim,
             iterations,
             warmup,
-        } => {
-            require_iterations(iterations)?;
-            if tokens == 0
-                || length == 0
-                || tokens > length
-                || query_heads == 0
-                || kv_heads == 0
-                || head_dim == 0
-            {
-                return Err(CliError::InvalidArguments(
-                    "attention dimensions must be non-zero and tokens must not exceed length"
-                        .into(),
-                ));
-            }
-            let query = context.tensor_f16(
-                &vec![0.01; tokens * query_heads * head_dim],
-                &[tokens, query_heads, head_dim],
-            )?;
-            let key = context.tensor_f16(
-                &vec![0.02; length * kv_heads * head_dim],
-                &[length, kv_heads, head_dim],
-            )?;
-            let value = context.tensor_f16(
-                &vec![0.03; length * kv_heads * head_dim],
-                &[length, kv_heads, head_dim],
-            )?;
-            let dispatch = || {
-                dispatch_attention(
-                    &context,
-                    &query,
-                    &key,
-                    &value,
-                    AttentionConfig {
-                        query_heads,
-                        kv_heads,
-                        head_dim,
-                        causal: true,
-                        query_offset: length - tokens,
-                    },
-                )
-            };
-            for _ in 0..warmup {
-                let _ = dispatch()?;
-            }
-            let (samples, gpu_samples) = measure_dispatch(iterations, dispatch)?;
-            report(
-                format!("attention_f16[tokens={tokens},length={length}]"),
-                &context,
-                samples,
-                Some(gpu_samples),
-                None,
-                None,
-            )
-        }
+        } => run_attention_benchmark(
+            &context,
+            kind,
+            AttentionDimensions {
+                tokens,
+                length,
+                query_heads,
+                kv_heads,
+                head_dim,
+            },
+            iterations,
+            warmup,
+        )?,
         Command::Block {
             model,
             tokens,
@@ -437,6 +445,13 @@ fn run() -> Result<(), CliError> {
                     comparison.gpu_speedup, comparison.wall_speedup
                 );
             }
+            if let Some(comparison) = &report.attention_comparison {
+                print_attention_variant(&comparison.reference);
+                print_attention_variant(&comparison.tiled);
+                if let Some(decode) = &comparison.decode_split_kv {
+                    print_attention_variant(decode);
+                }
+            }
             println!("Metal allocated: {} bytes", report.allocated_bytes);
         }
     }
@@ -483,14 +498,237 @@ fn dispatch_matmul(
 
 fn dispatch_attention(
     context: &MetalContext,
-    query: &metal_infer_core::Tensor,
-    key: &metal_infer_core::Tensor,
-    value: &metal_infer_core::Tensor,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
     config: AttentionConfig,
+    kind: AttentionKind,
 ) -> Result<DispatchStats, metal_infer_core::CoreError> {
     let mut batch = context.begin_batch()?;
-    let _output = batch.attention(query, key, value, config, AttentionKind::Tiled)?;
+    let _output = batch.attention(query, key, value, config, kind)?;
     batch.finish()
+}
+
+fn run_attention_benchmark(
+    context: &MetalContext,
+    selection: AttentionBenchmarkKind,
+    dimensions: AttentionDimensions,
+    iterations: usize,
+    warmup: usize,
+) -> Result<Report, CliError> {
+    require_iterations(iterations)?;
+    let AttentionDimensions {
+        tokens,
+        length,
+        query_heads,
+        kv_heads,
+        head_dim,
+    } = dimensions;
+    if tokens == 0
+        || length == 0
+        || tokens > length
+        || query_heads == 0
+        || kv_heads == 0
+        || head_dim == 0
+    {
+        return Err(CliError::InvalidArguments(
+            "attention dimensions must be non-zero and tokens must not exceed length".into(),
+        ));
+    }
+    if !query_heads.is_multiple_of(kv_heads) {
+        return Err(CliError::InvalidArguments(
+            "attention query-heads must be divisible by kv-heads".into(),
+        ));
+    }
+    if matches!(selection, AttentionBenchmarkKind::DecodeSplitKv) && tokens != 1 {
+        return Err(CliError::InvalidArguments(
+            "decode-split-kv attention requires --tokens 1".into(),
+        ));
+    }
+
+    let query_values: Vec<f32> = (0..tokens * query_heads * head_dim)
+        .map(|index| (index % 43) as f32 / 43.0 - 0.5)
+        .collect();
+    let key_values: Vec<f32> = (0..length * kv_heads * head_dim)
+        .map(|index| (index % 37) as f32 / 37.0 - 0.25)
+        .collect();
+    let value_values: Vec<f32> = (0..length * kv_heads * head_dim)
+        .map(|index| (index % 29) as f32 / 29.0)
+        .collect();
+    let query = context.tensor_f16(&query_values, &[tokens, query_heads, head_dim])?;
+    let key = context.tensor_f16(&key_values, &[length, kv_heads, head_dim])?;
+    let value = context.tensor_f16(&value_values, &[length, kv_heads, head_dim])?;
+    let config = AttentionConfig {
+        query_heads,
+        kv_heads,
+        head_dim,
+        causal: true,
+        query_offset: length - tokens,
+    };
+    let case = AttentionCase {
+        context,
+        query: &query,
+        key: &key,
+        value: &value,
+        config,
+    };
+    let benchmark = format!("attention_f16[tokens={tokens},length={length}]");
+
+    if !matches!(selection, AttentionBenchmarkKind::Compare) {
+        let kind = attention_kind(selection);
+        let (samples, gpu_samples) = measure_attention_variant(case, kind, iterations, warmup)?;
+        return Ok(report(
+            format!("{benchmark}[{}]", attention_kind_name(kind)),
+            context,
+            samples,
+            Some(gpu_samples),
+            None,
+            None,
+        ));
+    }
+
+    let reference_output = attention_output(case, AttentionKind::Reference)?;
+    let reference = attention_variant_report(
+        case,
+        AttentionKind::Reference,
+        &reference_output,
+        iterations,
+        warmup,
+    )?;
+    let tiled = attention_variant_report(
+        case,
+        AttentionKind::Tiled,
+        &reference_output,
+        iterations,
+        warmup,
+    )?;
+    let decode_split_kv = if tokens == 1 {
+        Some(attention_variant_report(
+            case,
+            AttentionKind::DecodeSplitKv,
+            &reference_output,
+            iterations,
+            warmup,
+        )?)
+    } else {
+        None
+    };
+    let selected = decode_split_kv.as_ref().unwrap_or(&tiled);
+    Ok(Report {
+        benchmark,
+        device: context.device_name(),
+        iterations,
+        mean_ms: selected.timing.wall_mean_ms,
+        median_ms: selected.timing.wall_median_ms,
+        p95_ms: selected.timing.wall_p95_ms,
+        gpu_mean_ms: Some(selected.timing.gpu_mean_ms),
+        gpu_median_ms: Some(selected.timing.gpu_median_ms),
+        gpu_p95_ms: Some(selected.timing.gpu_p95_ms),
+        throughput: None,
+        throughput_unit: None,
+        allocated_bytes: context.allocated_bytes(),
+        allocation_growth_bytes: None,
+        fusions: None,
+        comparison: None,
+        attention_comparison: Some(AttentionComparison {
+            reference,
+            tiled,
+            decode_split_kv,
+        }),
+        prefill: None,
+        decode: None,
+    })
+}
+
+fn attention_variant_report(
+    case: AttentionCase<'_>,
+    kind: AttentionKind,
+    reference: &[f32],
+    iterations: usize,
+    warmup: usize,
+) -> Result<AttentionVariantReport, CliError> {
+    let output = attention_output(case, kind)?;
+    let (wall, gpu) = measure_attention_variant(case, kind, iterations, warmup)?;
+    Ok(AttentionVariantReport {
+        kind: attention_kind_name(kind),
+        timing: timing_report(wall, gpu),
+        max_abs_error: max_abs_error(&output, reference),
+    })
+}
+
+fn measure_attention_variant(
+    case: AttentionCase<'_>,
+    kind: AttentionKind,
+    iterations: usize,
+    warmup: usize,
+) -> Result<(Vec<Duration>, Vec<Duration>), metal_infer_core::CoreError> {
+    for _ in 0..warmup {
+        let _ = dispatch_attention(
+            case.context,
+            case.query,
+            case.key,
+            case.value,
+            case.config,
+            kind,
+        )?;
+    }
+    measure_dispatch(iterations, || {
+        dispatch_attention(
+            case.context,
+            case.query,
+            case.key,
+            case.value,
+            case.config,
+            kind,
+        )
+    })
+}
+
+fn attention_output(
+    case: AttentionCase<'_>,
+    kind: AttentionKind,
+) -> Result<Vec<f32>, metal_infer_core::CoreError> {
+    case.context
+        .attention(case.query, case.key, case.value, case.config, kind)?
+        .to_f32_vec()
+}
+
+const fn attention_kind(selection: AttentionBenchmarkKind) -> AttentionKind {
+    match selection {
+        AttentionBenchmarkKind::Reference => AttentionKind::Reference,
+        AttentionBenchmarkKind::Tiled => AttentionKind::Tiled,
+        AttentionBenchmarkKind::DecodeSplitKv => AttentionKind::DecodeSplitKv,
+        AttentionBenchmarkKind::Compare => AttentionKind::Reference,
+    }
+}
+
+const fn attention_kind_name(kind: AttentionKind) -> &'static str {
+    match kind {
+        AttentionKind::Reference => "reference",
+        AttentionKind::Tiled => "tiled",
+        AttentionKind::DecodeSplitKv => "decode-split-kv",
+    }
+}
+
+fn max_abs_error(
+    actual: &[f32],
+    expected: &[f32],
+) -> f64 {
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| f64::from((actual - expected).abs()))
+        .fold(0.0, f64::max)
+}
+
+fn print_attention_variant(variant: &AttentionVariantReport) {
+    println!(
+        "{}: {:.3} ms wall, {:.3} ms GPU, max abs error {:.6}",
+        variant.kind,
+        variant.timing.wall_mean_ms,
+        variant.timing.gpu_mean_ms,
+        variant.max_abs_error
+    );
 }
 
 fn run_fusion_benchmark(
@@ -677,6 +915,7 @@ fn measure_fusion_pair<E>(
         ),
         fusions: None,
         comparison: Some(comparison),
+        attention_comparison: None,
         prefill: None,
         decode: None,
     })
@@ -782,9 +1021,11 @@ fn dispatch_qk_rope_cache(
             query_weight,
             key_weight,
             key_cache,
-            offset,
-            10_000.0,
-            1.0e-6,
+            QkNormRopeCacheConfig {
+                offset,
+                theta: 10_000.0,
+                epsilon: 1.0e-6,
+            },
         )?;
     } else {
         let query = batch.rms_norm(query, query_weight, 1.0e-6)?;
@@ -828,6 +1069,7 @@ fn report(
         allocation_growth_bytes: None,
         fusions: None,
         comparison: None,
+        attention_comparison: None,
         prefill: None,
         decode: None,
     }
@@ -891,6 +1133,7 @@ fn model_report(
         ),
         fusions: Some(fusion_options.into()),
         comparison: None,
+        attention_comparison: None,
         prefill: Some(prefill),
         decode: Some(decode),
     }
@@ -940,5 +1183,35 @@ fn require_iterations(iterations: usize) -> Result<(), CliError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttentionBenchmarkKind, AttentionKind, attention_kind, max_abs_error};
+
+    #[test]
+    fn attention_selection_maps_to_explicit_kernel() {
+        assert_eq!(
+            attention_kind(AttentionBenchmarkKind::Reference),
+            AttentionKind::Reference,
+            "reference selection mismatch"
+        );
+        assert_eq!(
+            attention_kind(AttentionBenchmarkKind::Tiled),
+            AttentionKind::Tiled,
+            "tiled selection mismatch"
+        );
+        assert_eq!(
+            attention_kind(AttentionBenchmarkKind::DecodeSplitKv),
+            AttentionKind::DecodeSplitKv,
+            "split-KV selection mismatch"
+        );
+    }
+
+    #[test]
+    fn maximum_absolute_error_uses_largest_difference() {
+        let error = max_abs_error(&[1.0, -2.0, 4.5], &[0.5, -1.0, 4.25]);
+        assert_eq!(error, 1.0, "maximum absolute error mismatch");
     }
 }

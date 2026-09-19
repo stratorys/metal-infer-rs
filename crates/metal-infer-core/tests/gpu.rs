@@ -1,4 +1,6 @@
-use metal_infer_core::{AttentionConfig, AttentionKind, CoreError, MetalContext};
+use metal_infer_core::{
+    AttentionConfig, AttentionKind, CoreError, MetalContext, QkNormRopeCacheConfig,
+};
 
 const TOLERANCE: f32 = 0.02;
 
@@ -36,7 +38,9 @@ fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
     let weight = context.tensor_f16(&weight_values, &[257, 128])?;
     let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
     let expected: Vec<f32> = weight_values
-        .chunks_exact(128)
+        .as_chunks::<128>()
+        .0
+        .iter()
         .map(|row| {
             row.iter()
                 .zip(&input_values)
@@ -60,7 +64,7 @@ fn simd_rms_norm_matches_cpu() -> Result<(), CoreError> {
     let weight = context.tensor_f16(&weight_values, &[65])?;
     let actual = context.rms_norm(&input, &weight, 1.0e-6)?.to_f32_vec()?;
     let mut expected = Vec::with_capacity(input_values.len());
-    for row in input_values.chunks_exact(65) {
+    for row in input_values.as_chunks::<65>().0 {
         let mean_square = row.iter().map(|value| value * value).sum::<f32>() / 65.0;
         let scale = (mean_square + 1.0e-6).sqrt().recip();
         expected.extend(
@@ -157,9 +161,11 @@ fn fused_qk_transform_matches_individual_ops() -> Result<(), CoreError> {
         &query_weight,
         &key_weight,
         &actual_cache,
-        1,
-        10_000.0,
-        1.0e-6,
+        QkNormRopeCacheConfig {
+            offset: 1,
+            theta: 10_000.0,
+            epsilon: 1.0e-6,
+        },
     )?;
     batch.finish()?;
     assert_close(&actual_query.to_f32_vec()?, &expected_query.to_f32_vec()?);
@@ -259,6 +265,10 @@ fn tiled_attention_matches_reference() -> Result<(), CoreError> {
         .attention(&query, &key, &value, config, AttentionKind::Tiled)?
         .to_f32_vec()?;
     assert_close(&tiled, &reference);
+    let decode = context
+        .attention(&query, &key, &value, config, AttentionKind::DecodeSplitKv)?
+        .to_f32_vec()?;
+    assert_close(&decode, &reference);
     Ok(())
 }
 

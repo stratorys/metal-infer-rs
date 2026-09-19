@@ -273,13 +273,13 @@ impl CommandBatch<'_> {
                 .newBufferWithLength_options(chunk_len, MTLResourceOptions::StorageModeShared)
                 .ok_or(CoreError::Resource("scratch buffer"))?;
             let chunk_index = state.chunks.len();
+            let mut free = Vec::new();
+            if allocation_len < chunk_len {
+                free.push(allocation_len..chunk_len);
+            }
             state.chunks.push(ScratchChunk {
                 buffer: buffer.clone(),
-                free: if allocation_len < chunk_len {
-                    vec![allocation_len..chunk_len]
-                } else {
-                    Vec::new()
-                },
+                free,
             });
             (chunk_index, 0..allocation_len, buffer)
         };

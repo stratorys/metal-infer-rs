@@ -9,6 +9,7 @@ use crate::{CommandBatch, CoreError, DType, MetalContext, Tensor};
 pub enum AttentionKind {
     Reference,
     Tiled,
+    DecodeSplitKv,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -18,6 +19,13 @@ pub struct AttentionConfig {
     pub head_dim: usize,
     pub causal: bool,
     pub query_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct QkNormRopeCacheConfig {
+    pub offset: usize,
+    pub theta: f32,
+    pub epsilon: f32,
 }
 
 #[repr(C)]
@@ -475,9 +483,7 @@ impl CommandBatch<'_> {
         query_weight: &Tensor,
         key_weight: &Tensor,
         key_cache: &Tensor,
-        offset: usize,
-        theta: f32,
-        epsilon: f32,
+        config: QkNormRopeCacheConfig,
     ) -> Result<Tensor, CoreError> {
         require_f16(query)?;
         require_f16(key)?;
@@ -504,7 +510,7 @@ impl CommandBatch<'_> {
                 "Q/K transform tensor shapes are incompatible".into(),
             ));
         }
-        if !head_dim.is_multiple_of(2) || offset + *tokens > *capacity {
+        if !head_dim.is_multiple_of(2) || config.offset + *tokens > *capacity {
             return Err(CoreError::Shape(
                 "Q/K transform has invalid head_dim or cache offset".into(),
             ));
@@ -515,10 +521,10 @@ impl CommandBatch<'_> {
             query_heads: to_u32(*query_heads, "query heads")?,
             kv_heads: to_u32(*kv_heads, "KV heads")?,
             head_dim: to_u32(*head_dim, "head dim")?,
-            offset: to_u32(offset, "offset")?,
-            theta,
+            offset: to_u32(config.offset, "offset")?,
+            theta: config.theta,
             cache_capacity: to_u32(*capacity, "cache capacity")?,
-            epsilon,
+            epsilon: config.epsilon,
         };
         let heads = checked_add(*query_heads, *kv_heads, "Q/K heads")?;
         let groups = checked_mul(*tokens, heads, "Q/K groups")?;
@@ -569,7 +575,7 @@ impl CommandBatch<'_> {
                 "query_heads must be divisible by kv_heads".into(),
             ));
         }
-        if kind == AttentionKind::Tiled
+        if kind != AttentionKind::Reference
             && (!config.head_dim.is_power_of_two() || config.head_dim > 256)
         {
             return Err(CoreError::Shape(
@@ -587,18 +593,22 @@ impl CommandBatch<'_> {
             kv_length: to_u32(*kv_length, "kv_length")?,
             padding: 0,
         };
-        let decode_attention = kind == AttentionKind::Tiled && *tokens == 1;
+        if kind == AttentionKind::DecodeSplitKv && *tokens != 1 {
+            return Err(CoreError::Shape(
+                "split-KV decode attention requires exactly one query token".into(),
+            ));
+        }
         let kernel = match kind {
             AttentionKind::Reference => "attention_reference_f16",
-            AttentionKind::Tiled if decode_attention => "attention_decode_f16",
             AttentionKind::Tiled => "attention_tiled_f16",
+            AttentionKind::DecodeSplitKv => "attention_decode_f16",
         };
         let (grid, threadgroup) = match kind {
             AttentionKind::Reference => (
                 size(config.head_dim, config.query_heads, *tokens),
                 size(config.head_dim.min(256), 1, 1),
             ),
-            AttentionKind::Tiled if decode_attention => {
+            AttentionKind::DecodeSplitKv => {
                 let groups = checked_mul(config.query_heads, *tokens, "attention groups")?;
                 (
                     size(checked_mul(groups, 256, "decode attention grid")?, 1, 1),

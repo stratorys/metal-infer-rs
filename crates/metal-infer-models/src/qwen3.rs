@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use metal_infer_core::{
-    AttentionConfig, AttentionKind, CommandBatch, DType, DispatchStats, MetalContext, Tensor,
+    AttentionConfig, AttentionKind, CommandBatch, DType, DispatchStats, MetalContext,
+    QkNormRopeCacheConfig, Tensor,
 };
 
 use crate::weights::WeightMap;
@@ -390,9 +391,11 @@ impl Qwen3Model {
                 &layer.attention.query_norm,
                 &layer.attention.key_norm,
                 &cache.key,
-                offset,
-                self.config.rope_theta,
-                self.config.rms_norm_eps,
+                QkNormRopeCacheConfig {
+                    offset,
+                    theta: self.config.rope_theta,
+                    epsilon: self.config.rms_norm_eps,
+                },
             )?
         } else {
             let query = batch.rms_norm(
@@ -409,6 +412,7 @@ impl Qwen3Model {
         batch.copy_into_cache(&value, &cache.value, offset)?;
         let active_key = cache.key.prefix(active_length)?;
         let active_value = cache.value.prefix(active_length)?;
+        let attention_kind = attention_kind_for_tokens(self.attention_kind, tokens);
         let attention = batch.attention(
             &query,
             &active_key,
@@ -420,7 +424,7 @@ impl Qwen3Model {
                 causal: true,
                 query_offset: offset,
             },
-            self.attention_kind,
+            attention_kind,
         )?;
         let attention = attention.reshape(&[tokens, self.config.query_width()])?;
         let attention = batch.matmul(&attention, &layer.attention.output)?;
@@ -451,6 +455,18 @@ impl Qwen3Model {
         let activated = batch.swiglu(&gate, &up)?;
         let down = batch.matmul(&activated, &layer.mlp.down)?;
         batch.add(&residual, &down).map_err(Into::into)
+    }
+}
+
+const fn attention_kind_for_tokens(
+    configured: AttentionKind,
+    tokens: usize,
+) -> AttentionKind {
+    match (configured, tokens) {
+        (AttentionKind::Tiled, 1) => AttentionKind::DecodeSplitKv,
+        (AttentionKind::DecodeSplitKv, 1) => AttentionKind::DecodeSplitKv,
+        (AttentionKind::DecodeSplitKv, _) => AttentionKind::Tiled,
+        (kind, _) => kind,
     }
 }
 
@@ -524,4 +540,28 @@ fn argmax(values: &[f32]) -> Result<u32, ModelError> {
     index
         .try_into()
         .map_err(|_| ModelError::Config("token id does not fit in u32".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttentionKind, attention_kind_for_tokens};
+
+    #[test]
+    fn tiled_attention_selects_split_kv_only_for_decode() {
+        assert_eq!(
+            attention_kind_for_tokens(AttentionKind::Tiled, 1),
+            AttentionKind::DecodeSplitKv,
+            "single-token decode should select split-KV attention"
+        );
+        assert_eq!(
+            attention_kind_for_tokens(AttentionKind::Tiled, 512),
+            AttentionKind::Tiled,
+            "multi-token prefill should keep tiled attention"
+        );
+        assert_eq!(
+            attention_kind_for_tokens(AttentionKind::Reference, 1),
+            AttentionKind::Reference,
+            "reference attention should remain explicitly selectable"
+        );
+    }
 }

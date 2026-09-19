@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::ops::Range;
 use std::ptr::NonNull;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -31,6 +33,25 @@ pub struct CommandBatch<'context> {
     pub(crate) context: &'context MetalContext,
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    scratch: Rc<RefCell<ScratchState>>,
+}
+
+const SCRATCH_ALIGNMENT: usize = 256;
+const SCRATCH_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
+struct ScratchChunk {
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    free: Vec<Range<usize>>,
+}
+
+struct ScratchState {
+    chunks: Vec<ScratchChunk>,
+}
+
+pub(crate) struct ScratchLease {
+    state: Weak<RefCell<ScratchState>>,
+    chunk: usize,
+    range: Range<usize>,
 }
 
 #[derive(Clone)]
@@ -76,6 +97,7 @@ impl MetalContext {
             context: self,
             command_buffer,
             encoder: Some(encoder),
+            scratch: Rc::new(RefCell::new(ScratchState { chunks: Vec::new() })),
         })
     }
 
@@ -214,6 +236,68 @@ impl MetalContext {
 }
 
 impl CommandBatch<'_> {
+    pub(crate) fn empty(
+        &self,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<Tensor, CoreError> {
+        let elements = checked_elements(shape)?;
+        let byte_len = elements
+            .checked_mul(dtype.size())
+            .ok_or_else(|| CoreError::Shape("tensor byte length overflow".into()))?;
+        let allocation_len = align_up(byte_len.max(1), SCRATCH_ALIGNMENT)?;
+        let mut state = self.scratch.borrow_mut();
+        let mut selected = None;
+        for (chunk_index, chunk) in state.chunks.iter_mut().enumerate() {
+            if let Some(range_index) = chunk
+                .free
+                .iter()
+                .position(|range| range.end - range.start >= allocation_len)
+            {
+                let range = chunk.free.remove(range_index);
+                let allocation = range.start..range.start + allocation_len;
+                if allocation.end < range.end {
+                    chunk.free.push(allocation.end..range.end);
+                }
+                selected = Some((chunk_index, allocation, chunk.buffer.clone()));
+                break;
+            }
+        }
+        let (chunk_index, range, buffer) = if let Some(allocation) = selected {
+            allocation
+        } else {
+            let chunk_len = allocation_len.max(SCRATCH_CHUNK_BYTES);
+            let buffer = self
+                .context
+                .device
+                .newBufferWithLength_options(chunk_len, MTLResourceOptions::StorageModeShared)
+                .ok_or(CoreError::Resource("scratch buffer"))?;
+            let chunk_index = state.chunks.len();
+            state.chunks.push(ScratchChunk {
+                buffer: buffer.clone(),
+                free: if allocation_len < chunk_len {
+                    vec![allocation_len..chunk_len]
+                } else {
+                    Vec::new()
+                },
+            });
+            (chunk_index, 0..allocation_len, buffer)
+        };
+        drop(state);
+        let lease = Rc::new(ScratchLease {
+            state: Rc::downgrade(&self.scratch),
+            chunk: chunk_index,
+            range: range.clone(),
+        });
+        Ok(Tensor::new_scratch(
+            buffer,
+            range.start,
+            shape.to_vec(),
+            dtype,
+            lease,
+        ))
+    }
+
     pub(crate) fn encoder(
         &self
     ) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>, CoreError> {
@@ -247,6 +331,31 @@ impl CommandBatch<'_> {
     }
 }
 
+impl Drop for ScratchLease {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut state = state.borrow_mut();
+        let Some(chunk) = state.chunks.get_mut(self.chunk) else {
+            return;
+        };
+        chunk.free.push(self.range.clone());
+        chunk.free.sort_unstable_by_key(|range| range.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(chunk.free.len());
+        for range in chunk.free.drain(..) {
+            if let Some(previous) = merged.last_mut()
+                && previous.end == range.start
+            {
+                previous.end = range.end;
+            } else {
+                merged.push(range);
+            }
+        }
+        chunk.free = merged;
+    }
+}
+
 impl Drop for CommandBatch<'_> {
     fn drop(&mut self) {
         if let Some(encoder) = self.encoder.take() {
@@ -266,6 +375,16 @@ fn checked_elements(shape: &[usize]) -> Result<usize, CoreError> {
             .checked_mul(*dimension)
             .ok_or_else(|| CoreError::Shape("element count overflow".into()))
     })
+}
+
+fn align_up(
+    value: usize,
+    alignment: usize,
+) -> Result<usize, CoreError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded / alignment * alignment)
+        .ok_or_else(|| CoreError::Shape("scratch allocation size overflow".into()))
 }
 
 fn check_data_len(

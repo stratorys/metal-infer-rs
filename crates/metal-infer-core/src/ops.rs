@@ -149,7 +149,7 @@ impl CommandBatch<'_> {
         require_f16(left)?;
         require_f16(right)?;
         require_same_shape(left, right)?;
-        let out = self.context.empty(left.shape(), DType::F16)?;
+        let out = self.empty(left.shape(), DType::F16)?;
         let count = to_u32(left.len(), "element count")?;
         self.dispatch(
             "add_f16",
@@ -175,7 +175,7 @@ impl CommandBatch<'_> {
                 "matmul inner dimensions differ: {k} and {weight_k}"
             )));
         }
-        let out = self.context.empty(&[m, n], DType::F16)?;
+        let out = self.empty(&[m, n], DType::F16)?;
         let params = MatrixParams {
             m: to_u32(m, "m")?,
             n: to_u32(n, "n")?,
@@ -183,12 +183,13 @@ impl CommandBatch<'_> {
             padding: 0,
         };
         if m == 1 {
+            let threads = if k >= 1024 { 256 } else { 128 };
             self.dispatch(
                 "matvec_f16",
                 &[input, weight, &out],
                 &params,
-                size(n, 1, 1),
-                size(n.min(256), 1, 1),
+                size(checked_mul(n, threads, "matvec grid")?, 1, 1),
+                size(threads, 1, 1),
             )?;
         } else {
             self.dispatch(
@@ -220,7 +221,7 @@ impl CommandBatch<'_> {
             )));
         }
         let rows = input.len() / width;
-        let out = self.context.empty(input.shape(), DType::F16)?;
+        let out = self.empty(input.shape(), DType::F16)?;
         let params = NormParams {
             rows: to_u32(rows, "rows")?,
             width: to_u32(width, "width")?,
@@ -245,7 +246,7 @@ impl CommandBatch<'_> {
         require_f16(gate)?;
         require_f16(up)?;
         require_same_shape(gate, up)?;
-        let out = self.context.empty(gate.shape(), DType::F16)?;
+        let out = self.empty(gate.shape(), DType::F16)?;
         let count = to_u32(gate.len(), "element count")?;
         self.dispatch(
             "swiglu_f16",
@@ -269,7 +270,7 @@ impl CommandBatch<'_> {
         }
         require_f16(table)?;
         let [_, width] = matrix_shape(table)?;
-        let out = self.context.empty(&[tokens.len(), width], DType::F16)?;
+        let out = self.empty(&[tokens.len(), width], DType::F16)?;
         let params = [
             to_u32(tokens.len(), "token count")?,
             to_u32(width, "embedding width")?,
@@ -300,7 +301,7 @@ impl CommandBatch<'_> {
         if !head_dim.is_multiple_of(2) {
             return Err(CoreError::Shape("RoPE head_dim must be even".into()));
         }
-        let out = self.context.empty(shape, DType::F16)?;
+        let out = self.empty(shape, DType::F16)?;
         let params = RopeParams {
             tokens: to_u32(*tokens, "tokens")?,
             heads: to_u32(*heads, "heads")?,
@@ -363,7 +364,7 @@ impl CommandBatch<'_> {
                 "tiled attention requires a power-of-two head_dim <= 256".into(),
             ));
         }
-        let out = self.context.empty(query.shape(), DType::F16)?;
+        let out = self.empty(query.shape(), DType::F16)?;
         let params = AttentionParams {
             tokens: to_u32(*tokens, "tokens")?,
             q_heads: to_u32(config.query_heads, "query_heads")?,
@@ -378,12 +379,25 @@ impl CommandBatch<'_> {
             AttentionKind::Reference => "attention_reference_f16",
             AttentionKind::Tiled => "attention_tiled_f16",
         };
+        let (grid, threadgroup) = match kind {
+            AttentionKind::Reference => (
+                size(config.head_dim, config.query_heads, *tokens),
+                size(config.head_dim.min(256), 1, 1),
+            ),
+            AttentionKind::Tiled => {
+                let groups = checked_mul(config.query_heads, *tokens, "attention groups")?;
+                (
+                    size(checked_mul(groups, 32, "attention grid")?, 1, 1),
+                    size(32, 1, 1),
+                )
+            }
+        };
         self.dispatch(
             kernel,
             &[query, key, value, &out],
             &params,
-            size(config.head_dim, config.query_heads, *tokens),
-            size(config.head_dim, 1, 1),
+            grid,
+            threadgroup,
         )?;
         Ok(out)
     }
@@ -498,6 +512,15 @@ fn to_u32(
     value
         .try_into()
         .map_err(|_| CoreError::Shape(format!("{label} does not fit in u32")))
+}
+
+fn checked_mul(
+    left: usize,
+    right: usize,
+    label: &str,
+) -> Result<usize, CoreError> {
+    left.checked_mul(right)
+        .ok_or_else(|| CoreError::Shape(format!("{label} overflow")))
 }
 
 fn round_up(

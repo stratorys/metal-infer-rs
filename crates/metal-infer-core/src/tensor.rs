@@ -1,9 +1,12 @@
+use std::rc::Rc;
+
 use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
 use crate::CoreError;
+use crate::context::ScratchLease;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DType {
@@ -35,6 +38,7 @@ pub struct Tensor {
     pub(crate) offset_bytes: usize,
     shape: Vec<usize>,
     dtype: DType,
+    scratch: Option<Rc<ScratchLease>>,
 }
 
 impl std::fmt::Debug for Tensor {
@@ -62,6 +66,23 @@ impl Tensor {
             offset_bytes: 0,
             shape,
             dtype,
+            scratch: None,
+        }
+    }
+
+    pub(crate) fn new_scratch(
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        offset_bytes: usize,
+        shape: Vec<usize>,
+        dtype: DType,
+        scratch: Rc<ScratchLease>,
+    ) -> Self {
+        Self {
+            buffer,
+            offset_bytes,
+            shape,
+            dtype,
+            scratch: Some(scratch),
         }
     }
 
@@ -105,6 +126,7 @@ impl Tensor {
             offset_bytes: self.offset_bytes,
             shape: shape.to_vec(),
             dtype: self.dtype,
+            scratch: self.scratch.clone(),
         })
     }
 
@@ -130,6 +152,7 @@ impl Tensor {
             offset_bytes: self.offset_bytes,
             shape,
             dtype: self.dtype,
+            scratch: self.scratch.clone(),
         })
     }
 
@@ -154,6 +177,7 @@ impl Tensor {
             offset_bytes: self.offset_bytes + row * *width * self.dtype.size(),
             shape: vec![1, *width],
             dtype: self.dtype,
+            scratch: self.scratch.clone(),
         })
     }
 

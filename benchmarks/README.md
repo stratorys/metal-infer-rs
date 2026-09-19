@@ -11,6 +11,8 @@ uv run benchmarks/compare.py kernels
 ```
 
 The cases, warm-up count, and measured iterations are defined in `suite.json`.
+They include `m=1` decode projections for Qwen3 hidden, MLP, and vocabulary
+dimensions, followed by larger prefill-oriented matrix multiplications.
 The command creates a run directory under `results/<machine>/` containing raw
 JSON, an SVG graph, and a standalone README. Commands and their complete output
 are displayed as they run; each step ends with its elapsed time and primary

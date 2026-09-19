@@ -73,13 +73,37 @@ kernel void matvec_f16(device const half *x [[buffer(0)]],
                        device const half *weight [[buffer(1)]],
                        device half *out [[buffer(2)]],
                        constant MatrixParams &p [[buffer(3)]],
-                       uint column [[thread_position_in_grid]]) {
+                       uint column [[threadgroup_position_in_grid]],
+                       uint thread_index [[thread_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+                       uint group_size [[threads_per_threadgroup]]) {
   if (column >= p.n)
     return;
+  device const half *row = weight + column * p.k;
   float sum = 0.0f;
-  for (uint i = 0; i < p.k; ++i)
-    sum += float(x[i]) * float(weight[column * p.k + i]);
-  out[column] = half(sum);
+  if ((p.k & 3) == 0) {
+    device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
+    device const half4 *row4 = reinterpret_cast<device const half4 *>(row);
+    uint vectors = p.k / 4;
+    for (uint i = thread_index; i < vectors; i += group_size)
+      sum += dot(float4(x4[i]), float4(row4[i]));
+  } else {
+    for (uint i = thread_index; i < p.k; i += group_size)
+      sum += float(x[i]) * float(row[i]);
+  }
+
+  threadgroup float partial[8];
+  float simd_total = simd_sum(sum);
+  if (lane == 0)
+    partial[simdgroup_index] = simd_total;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint simdgroups = group_size / 32;
+  float total = simdgroup_index == 0 && lane < simdgroups ? partial[lane] : 0.0f;
+  total = simd_sum(total);
+  if (thread_index == 0)
+    out[column] = half(total);
 }
 
 kernel void rms_norm_f16(device const half *x [[buffer(0)]],
@@ -180,46 +204,52 @@ kernel void attention_tiled_f16(device const half *q [[buffer(0)]],
                                 device const half *v [[buffer(2)]],
                                 device half *out [[buffer(3)]],
                                 constant AttentionParams &p [[buffer(4)]],
-                                uint3 id [[thread_position_in_grid]],
-                                uint lane [[thread_index_in_threadgroup]],
-                                uint3 group_size [[threads_per_threadgroup]]) {
-  uint d = id.x, h = id.y, qi = id.z;
-  if (d >= p.head_dim || h >= p.q_heads || qi >= p.tokens)
+                                uint group [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+  uint qi = group / p.q_heads;
+  uint h = group - qi * p.q_heads;
+  if (h >= p.q_heads || qi >= p.tokens)
     return;
   uint kvh = h / (p.q_heads / p.kv_heads);
   uint available =
       p.causal != 0 ? min(p.kv_length, p.query_offset + qi + 1) : p.kv_length;
-  threadgroup float partial[256];
-  threadgroup float coefficients[3];
   float running_max = -INFINITY;
   float running_sum = 0.0f;
-  float accumulator = 0.0f;
+  float accumulator[8];
+  for (uint component = 0; component < 8; ++component)
+    accumulator[component] = 0.0f;
   float scale = rsqrt(float(p.head_dim));
   for (uint j = 0; j < available; ++j) {
-    partial[lane] = float(q[(qi * p.q_heads + h) * p.head_dim + d]) *
-                    float(k[(j * p.kv_heads + kvh) * p.head_dim + d]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = group_size.x / 2; stride > 0; stride >>= 1) {
-      if (lane < stride)
-        partial[lane] += partial[lane + stride];
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+    float partial = 0.0f;
+    for (uint component = 0; component < 8; ++component) {
+      uint d = lane + component * 32;
+      if (d < p.head_dim) {
+        partial += float(q[(qi * p.q_heads + h) * p.head_dim + d]) *
+                   float(k[(j * p.kv_heads + kvh) * p.head_dim + d]);
+      }
     }
-    if (lane == 0) {
-      float score = partial[0] * scale;
-      float next_max = max(running_max, score);
-      coefficients[0] = exp(running_max - next_max);
-      coefficients[1] = exp(score - next_max);
-      coefficients[2] = next_max;
+    float score = simd_sum(partial) * scale;
+    float next_max = max(running_max, score);
+    float previous_scale = exp(running_max - next_max);
+    float current_scale = exp(score - next_max);
+    for (uint component = 0; component < 8; ++component) {
+      uint d = lane + component * 32;
+      if (d < p.head_dim) {
+        accumulator[component] =
+            accumulator[component] * previous_scale +
+            current_scale * float(v[(j * p.kv_heads + kvh) * p.head_dim + d]);
+      }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    accumulator =
-        accumulator * coefficients[0] +
-        coefficients[1] * float(v[(j * p.kv_heads + kvh) * p.head_dim + d]);
-    running_sum = running_sum * coefficients[0] + coefficients[1];
-    running_max = coefficients[2];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    running_sum = running_sum * previous_scale + current_scale;
+    running_max = next_max;
   }
-  out[(qi * p.q_heads + h) * p.head_dim + d] = half(accumulator / running_sum);
+  for (uint component = 0; component < 8; ++component) {
+    uint d = lane + component * 32;
+    if (d < p.head_dim) {
+      out[(qi * p.q_heads + h) * p.head_dim + d] =
+          half(accumulator[component] / running_sum);
+    }
+  }
 }
 
 kernel void copy_kv_f16(device const half *source [[buffer(0)]],

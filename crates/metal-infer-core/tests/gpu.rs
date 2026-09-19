@@ -26,6 +26,30 @@ fn matvec_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
+fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let input_values: Vec<f32> = (0..128).map(|index| index as f32 / 128.0 - 0.5).collect();
+    let weight_values: Vec<f32> = (0..257 * 128)
+        .map(|index| (index % 31) as f32 / 31.0 - 0.5)
+        .collect();
+    let input = context.tensor_f16(&input_values, &[1, 128])?;
+    let weight = context.tensor_f16(&weight_values, &[257, 128])?;
+    let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
+    let expected: Vec<f32> = weight_values
+        .chunks_exact(128)
+        .map(|row| {
+            row.iter()
+                .zip(&input_values)
+                .map(|(left, right)| left * right)
+                .sum()
+        })
+        .collect();
+    assert_close(&actual, &expected);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
 fn batched_dependent_kernels_match_eager_execution() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let left = context.tensor_f16(&[1.0, 2.0, 3.0, 4.0], &[2, 2])?;
@@ -36,9 +60,12 @@ fn batched_dependent_kernels_match_eager_execution() -> Result<(), CoreError> {
     let mut batch = context.begin_batch()?;
     let intermediate = batch.add(&left, &right)?;
     let batched = batch.add(&intermediate, &right)?;
+    drop(intermediate);
+    let batched = batch.add(&batched, &right)?;
     batch.finish()?;
 
-    assert_close(&batched.to_f32_vec()?, &eager.to_f32_vec()?);
+    let expected = context.add(&eager, &right)?;
+    assert_close(&batched.to_f32_vec()?, &expected.to_f32_vec()?);
     Ok(())
 }
 
@@ -60,16 +87,22 @@ fn invalid_batch_can_be_abandoned() -> Result<(), CoreError> {
 #[ignore = "requires direct access to an Apple Metal device"]
 fn tiled_attention_matches_reference() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
-    let query_values: Vec<f32> = (0..32).map(|value| value as f32 / 31.0 - 0.5).collect();
-    let key_values: Vec<f32> = (0..16).map(|value| value as f32 / 15.0 - 0.25).collect();
-    let value_values: Vec<f32> = (0..16).map(|value| value as f32 / 10.0).collect();
-    let query = context.tensor_f16(&query_values, &[2, 2, 8])?;
-    let key = context.tensor_f16(&key_values, &[2, 1, 8])?;
-    let value = context.tensor_f16(&value_values, &[2, 1, 8])?;
+    let query_values: Vec<f32> = (0..2 * 2 * 128)
+        .map(|value| (value % 41) as f32 / 41.0 - 0.5)
+        .collect();
+    let key_values: Vec<f32> = (0..2 * 128)
+        .map(|value| (value % 37) as f32 / 37.0 - 0.25)
+        .collect();
+    let value_values: Vec<f32> = (0..2 * 128)
+        .map(|value| (value % 29) as f32 / 29.0)
+        .collect();
+    let query = context.tensor_f16(&query_values, &[2, 2, 128])?;
+    let key = context.tensor_f16(&key_values, &[2, 1, 128])?;
+    let value = context.tensor_f16(&value_values, &[2, 1, 128])?;
     let config = AttentionConfig {
         query_heads: 2,
         kv_heads: 1,
-        head_dim: 8,
+        head_dim: 128,
         causal: true,
         query_offset: 0,
     };

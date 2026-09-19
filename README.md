@@ -35,6 +35,9 @@ cargo run --release --bin metal-infer -- \
 - `metal-infer-models`: weight loading and the Qwen3 implementation;
 - `metal-infer-cli`: text generation and benchmarks.
 
+See [benchmarks](benchmarks/README.md) for the reproducible MLX and llama.cpp
+comparison methodology and results.
+
 ## Validation
 
 ```sh

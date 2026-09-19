@@ -6,7 +6,9 @@
 """Manual MLX baseline for metal-infer's row-major FP16 matmul benchmark."""
 
 import argparse
+import importlib.metadata
 import json
+import platform
 import statistics
 import time
 
@@ -49,13 +51,18 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "backend": "mlx",
                 "benchmark": f"mlx_matmul_f16[{args.m},{args.n},{args.k}]",
+                "device": platform.machine(),
+                "dtype": "f16",
+                "dimensions": {"m": args.m, "n": args.n, "k": args.k},
                 "iterations": args.iterations,
                 "mean_ms": mean * 1000,
                 "median_ms": statistics.median(samples) * 1000,
                 "p95_ms": p95 * 1000,
                 "throughput": operations / mean / 1e12,
                 "throughput_unit": "TFLOP/s",
+                "mlx_version": importlib.metadata.version("mlx"),
             },
             indent=2,
         )

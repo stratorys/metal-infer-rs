@@ -50,6 +50,31 @@ fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
+fn simd_rms_norm_matches_cpu() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let input_values: Vec<f32> = (0..3 * 65)
+        .map(|index| (index % 23) as f32 / 11.0 - 1.0)
+        .collect();
+    let weight_values: Vec<f32> = (0..65).map(|index| 0.5 + index as f32 / 130.0).collect();
+    let input = context.tensor_f16(&input_values, &[3, 65])?;
+    let weight = context.tensor_f16(&weight_values, &[65])?;
+    let actual = context.rms_norm(&input, &weight, 1.0e-6)?.to_f32_vec()?;
+    let mut expected = Vec::with_capacity(input_values.len());
+    for row in input_values.chunks_exact(65) {
+        let mean_square = row.iter().map(|value| value * value).sum::<f32>() / 65.0;
+        let scale = (mean_square + 1.0e-6).sqrt().recip();
+        expected.extend(
+            row.iter()
+                .zip(&weight_values)
+                .map(|(value, weight)| value * scale * weight),
+        );
+    }
+    assert_close(&actual, &expected);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
 fn batched_dependent_kernels_match_eager_execution() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let left = context.tensor_f16(&[1.0, 2.0, 3.0, 4.0], &[2, 2])?;

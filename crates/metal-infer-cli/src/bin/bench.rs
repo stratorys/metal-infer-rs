@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use metal_infer_cli::CliError;
-use metal_infer_core::{AttentionKind, MetalContext};
+use metal_infer_core::{AttentionKind, DispatchStats, MetalContext};
 use metal_infer_models::{KvCache, Qwen3Model};
 use serde::Serialize;
 
@@ -68,6 +68,12 @@ struct Report {
     mean_ms: f64,
     median_ms: f64,
     p95_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_mean_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_median_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_p95_ms: Option<f64>,
     throughput: Option<f64>,
     throughput_unit: Option<&'static str>,
     allocated_bytes: usize,
@@ -106,15 +112,17 @@ fn run() -> Result<(), CliError> {
             let input = context.tensor_f16(&vec![0.01; m * k], &[m, k])?;
             let weight = context.tensor_f16(&vec![0.02; n * k], &[n, k])?;
             for _ in 0..warmup {
-                let _ = context.matmul(&input, &weight)?;
+                let _ = dispatch_matmul(&context, &input, &weight)?;
             }
-            let samples = measure(iterations, || context.matmul(&input, &weight).map(|_| ()))?;
+            let (samples, gpu_samples) =
+                measure_dispatch(iterations, || dispatch_matmul(&context, &input, &weight))?;
             let operations = 2.0 * m as f64 * n as f64 * k as f64;
             let throughput = (operations / 1.0e12) / mean_seconds(&samples);
             report(
                 format!("matmul_f16[{m},{n},{k}]"),
                 &context,
                 samples,
+                Some(gpu_samples),
                 Some(throughput),
                 Some("TFLOP/s"),
             )
@@ -133,7 +141,7 @@ fn run() -> Result<(), CliError> {
                 let _ = model.run_first_block(&token_ids)?;
             }
             let samples = measure(iterations, || model.run_first_block(&token_ids).map(|_| ()))?;
-            report("qwen3_block".into(), &context, samples, None, None)
+            report("qwen3_block".into(), &context, samples, None, None, None)
         }
         Command::Model {
             model,
@@ -173,6 +181,11 @@ fn run() -> Result<(), CliError> {
                 "mean: {:.3} ms, median: {:.3} ms, p95: {:.3} ms",
                 report.mean_ms, report.median_ms, report.p95_ms
             );
+            if let (Some(mean), Some(median), Some(p95)) =
+                (report.gpu_mean_ms, report.gpu_median_ms, report.gpu_p95_ms)
+            {
+                println!("GPU: {mean:.3} ms mean, {median:.3} ms median, {p95:.3} ms p95");
+            }
             if let (Some(value), Some(unit)) = (report.throughput, report.throughput_unit) {
                 println!("throughput: {value:.3} {unit}");
             }
@@ -207,10 +220,36 @@ fn measure<E>(
     Ok(samples)
 }
 
+fn measure_dispatch<E>(
+    iterations: usize,
+    mut operation: impl FnMut() -> Result<DispatchStats, E>,
+) -> Result<(Vec<Duration>, Vec<Duration>), E> {
+    let mut wall_samples = Vec::with_capacity(iterations);
+    let mut gpu_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let stats = operation()?;
+        wall_samples.push(started.elapsed());
+        gpu_samples.push(stats.gpu_time);
+    }
+    Ok((wall_samples, gpu_samples))
+}
+
+fn dispatch_matmul(
+    context: &MetalContext,
+    input: &metal_infer_core::Tensor,
+    weight: &metal_infer_core::Tensor,
+) -> Result<DispatchStats, metal_infer_core::CoreError> {
+    let mut batch = context.begin_batch()?;
+    let _output = batch.matmul(input, weight)?;
+    batch.finish()
+}
+
 fn report(
     benchmark: String,
     context: &MetalContext,
     mut samples: Vec<Duration>,
+    gpu_samples: Option<Vec<Duration>>,
     throughput: Option<f64>,
     throughput_unit: Option<&'static str>,
 ) -> Report {
@@ -221,6 +260,7 @@ fn report(
         .map_or(0.0, Duration::as_secs_f64);
     let p95_index = (samples.len().saturating_sub(1) as f64 * 0.95).round() as usize;
     let p95 = samples.get(p95_index).map_or(0.0, Duration::as_secs_f64);
+    let gpu = gpu_samples.map(duration_report);
     Report {
         benchmark,
         device: context.device_name(),
@@ -228,6 +268,9 @@ fn report(
         mean_ms: mean * 1000.0,
         median_ms: median * 1000.0,
         p95_ms: p95 * 1000.0,
+        gpu_mean_ms: gpu.as_ref().map(|timing| timing.mean_ms),
+        gpu_median_ms: gpu.as_ref().map(|timing| timing.median_ms),
+        gpu_p95_ms: gpu.as_ref().map(|timing| timing.p95_ms),
         throughput,
         throughput_unit,
         allocated_bytes: context.allocated_bytes(),
@@ -270,11 +313,31 @@ fn model_report(
         mean_ms: prefill.mean_ms + decode.mean_ms,
         median_ms: prefill.median_ms + decode.median_ms,
         p95_ms: prefill.p95_ms + decode.p95_ms,
+        gpu_mean_ms: None,
+        gpu_median_ms: None,
+        gpu_p95_ms: None,
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
         prefill: Some(prefill),
         decode: Some(decode),
+    }
+}
+
+fn duration_report(mut samples: Vec<Duration>) -> PhaseReport {
+    samples.sort();
+    let mean = mean_seconds(&samples);
+    let median = samples
+        .get(samples.len() / 2)
+        .map_or(0.0, Duration::as_secs_f64);
+    let p95_index = (samples.len().saturating_sub(1) as f64 * 0.95).round() as usize;
+    let p95 = samples.get(p95_index).map_or(0.0, Duration::as_secs_f64);
+    PhaseReport {
+        tokens: 0,
+        mean_ms: mean * 1000.0,
+        median_ms: median * 1000.0,
+        p95_ms: p95 * 1000.0,
+        tokens_per_second: 0.0,
     }
 }
 

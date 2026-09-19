@@ -193,8 +193,8 @@ def model_svg(results: list[dict[str, Any]]) -> str:
 
 def kernel_table(results: list[dict[str, Any]]) -> str:
     lines = [
-        "| Shape (M×N×K) | Backend | Mean ms | TFLOP/s | Relative |",
-        "|---|---|---:|---:|---:|",
+        "| Shape (M×N×K) | Backend | Mean ms | GPU mean ms | TFLOP/s | Relative |",
+        "|---|---|---:|---:|---:|---:|",
     ]
     grouped: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
     for result in results:
@@ -208,9 +208,12 @@ def kernel_table(results: list[dict[str, Any]]) -> str:
         for row in rows:
             throughput = float(row["throughput"])
             relative = throughput / baseline if baseline > 0 else 0.0
+            gpu_mean = row.get("gpu_mean_ms")
+            gpu_mean_text = f"{float(gpu_mean):.3f}" if gpu_mean is not None else "—"
             lines.append(
                 f"| {shape[0]}×{shape[1]}×{shape[2]} | {row['backend']} | "
-                f"{float(row['mean_ms']):.3f} | {throughput:.4f} | {relative:.2f}× |"
+                f"{float(row['mean_ms']):.3f} | {gpu_mean_text} | "
+                f"{throughput:.4f} | {relative:.2f}× |"
             )
     return "\n".join(lines)
 

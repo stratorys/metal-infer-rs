@@ -37,7 +37,7 @@ pub struct CommandBatch<'context> {
 }
 
 const SCRATCH_ALIGNMENT: usize = 256;
-const SCRATCH_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+const SCRATCH_CHUNK_BYTES: usize = 1024 * 1024;
 
 struct ScratchChunk {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,

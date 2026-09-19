@@ -183,13 +183,14 @@ impl CommandBatch<'_> {
             padding: 0,
         };
         if m == 1 {
-            let threads = if k >= 1024 { 256 } else { 128 };
+            let outputs_per_threadgroup = 32;
+            let groups = n.div_ceil(outputs_per_threadgroup);
             self.dispatch(
                 "matvec_f16",
                 &[input, weight, &out],
                 &params,
-                size(checked_mul(n, threads, "matvec grid")?, 1, 1),
-                size(threads, 1, 1),
+                size(checked_mul(groups, 256, "matvec grid")?, 1, 1),
+                size(256, 1, 1),
             )?;
         } else {
             self.dispatch(
@@ -232,8 +233,8 @@ impl CommandBatch<'_> {
             "rms_norm_f16",
             &[input, weight, &out],
             &params,
-            size(rows, 1, 1),
-            size(rows.min(256), 1, 1),
+            size(checked_mul(rows.div_ceil(8), 256, "RMSNorm grid")?, 1, 1),
+            size(256, 1, 1),
         )?;
         Ok(out)
     }

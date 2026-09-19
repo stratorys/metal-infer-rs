@@ -73,54 +73,68 @@ kernel void matvec_f16(device const half *x [[buffer(0)]],
                        device const half *weight [[buffer(1)]],
                        device half *out [[buffer(2)]],
                        constant MatrixParams &p [[buffer(3)]],
-                       uint column [[threadgroup_position_in_grid]],
-                       uint thread_index [[thread_index_in_threadgroup]],
+                       uint group [[threadgroup_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]],
-                       uint simdgroup_index [[simdgroup_index_in_threadgroup]],
-                       uint group_size [[threads_per_threadgroup]]) {
-  if (column >= p.n)
-    return;
-  device const half *row = weight + column * p.k;
-  float sum = 0.0f;
+                       uint simdgroup_index
+                       [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint rows_per_simdgroup = 4;
+  constexpr uint simdgroups_per_threadgroup = 8;
+  uint first_row = (group * simdgroups_per_threadgroup + simdgroup_index) *
+                   rows_per_simdgroup;
+  float sums[rows_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
   if ((p.k & 3) == 0) {
     device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
-    device const half4 *row4 = reinterpret_cast<device const half4 *>(row);
     uint vectors = p.k / 4;
-    for (uint i = thread_index; i < vectors; i += group_size)
-      sum += dot(float4(x4[i]), float4(row4[i]));
+    for (uint i = lane; i < vectors; i += 32) {
+      float4 input = float4(x4[i]);
+      for (uint output = 0; output < rows_per_simdgroup; ++output) {
+        uint row = first_row + output;
+        if (row < p.n) {
+          device const half4 *weight4 =
+              reinterpret_cast<device const half4 *>(weight + row * p.k);
+          sums[output] += dot(input, float4(weight4[i]));
+        }
+      }
+    }
   } else {
-    for (uint i = thread_index; i < p.k; i += group_size)
-      sum += float(x[i]) * float(row[i]);
+    for (uint i = lane; i < p.k; i += 32) {
+      float input = float(x[i]);
+      for (uint output = 0; output < rows_per_simdgroup; ++output) {
+        uint row = first_row + output;
+        if (row < p.n)
+          sums[output] += input * float(weight[row * p.k + i]);
+      }
+    }
   }
-
-  threadgroup float partial[8];
-  float simd_total = simd_sum(sum);
-  if (lane == 0)
-    partial[simdgroup_index] = simd_total;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  uint simdgroups = group_size / 32;
-  float total = simdgroup_index == 0 && lane < simdgroups ? partial[lane] : 0.0f;
-  total = simd_sum(total);
-  if (thread_index == 0)
-    out[column] = half(total);
+  for (uint output = 0; output < rows_per_simdgroup; ++output) {
+    float total = simd_sum(sums[output]);
+    uint row = first_row + output;
+    if (lane == 0 && row < p.n)
+      out[row] = half(total);
+  }
 }
 
 kernel void rms_norm_f16(device const half *x [[buffer(0)]],
                          device const half *weight [[buffer(1)]],
                          device half *out [[buffer(2)]],
                          constant NormParams &p [[buffer(3)]],
-                         uint row [[thread_position_in_grid]]) {
+                         uint group [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint simdgroup_index
+                         [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint simdgroups_per_threadgroup = 8;
+  uint row = group * simdgroups_per_threadgroup + simdgroup_index;
   if (row >= p.rows)
     return;
   float sum = 0.0f;
   uint base = row * p.width;
-  for (uint i = 0; i < p.width; ++i) {
+  for (uint i = lane; i < p.width; i += 32) {
     float v = float(x[base + i]);
     sum += v * v;
   }
+  sum = simd_sum(sum);
   float scale = rsqrt(sum / float(p.width) + p.epsilon);
-  for (uint i = 0; i < p.width; ++i)
+  for (uint i = lane; i < p.width; i += 32)
     out[base + i] = half(float(x[base + i]) * scale * float(weight[i]));
 }
 

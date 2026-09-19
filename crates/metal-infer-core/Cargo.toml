@@ -1,0 +1,15 @@
+[package]
+name = "metal-infer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+half.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,408 @@
+{
+  "schema_version": 1,
+  "kind": "kernels",
+  "generated_at": "2026-09-19T15:58:31.071539+00:00",
+  "system": {
+    "chip": "Apple M4 Pro",
+    "machine": "arm64",
+    "macos": "26.6.2",
+    "metal_infer_commit": "7f32524820ba263fb69b5176eed86633b1f1c419",
+    "metal_infer_dirty": false,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  },
+  "suite": {
+    "warmup": 5,
+    "iterations": 20,
+    "shapes": [
+      {
+        "m": 1,
+        "n": 1024,
+        "k": 1024
+      },
+      {
+        "m": 1,
+        "n": 2048,
+        "k": 1024
+      },
+      {
+        "m": 1,
+        "n": 3072,
+        "k": 1024
+      },
+      {
+        "m": 1,
+        "n": 1024,
+        "k": 3072
+      },
+      {
+        "m": 1,
+        "n": 151936,
+        "k": 1024
+      },
+      {
+        "m": 64,
+        "n": 128,
+        "k": 128
+      },
+      {
+        "m": 128,
+        "n": 1024,
+        "k": 1024
+      },
+      {
+        "m": 512,
+        "n": 1024,
+        "k": 1024
+      },
+      {
+        "m": 1024,
+        "n": 1024,
+        "k": 1024
+      }
+    ]
+  },
+  "results": [
+    {
+      "benchmark": "matmul_f16[1,1024,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.6981748999999998,
+      "median_ms": 0.701042,
+      "p95_ms": 0.713791,
+      "throughput": 0.0030037630971838144,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 2572288,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 1024,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,1024,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 1024,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.2800437494443031,
+      "median_ms": 0.19579150102799758,
+      "p95_ms": 0.5299580006976612,
+      "throughput": 0.007488658483402769,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1,2048,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.8681979499999999,
+      "median_ms": 0.834083,
+      "p95_ms": 0.886875,
+      "throughput": 0.004831045730987962,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 4669440,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 2048,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,2048,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 2048,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.2526937492802972,
+      "median_ms": 0.20552050045807846,
+      "p95_ms": 0.46795800153631717,
+      "throughput": 0.016598368625840142,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1,3072,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.9449376,
+      "median_ms": 0.909042,
+      "p95_ms": 1.160541,
+      "throughput": 0.006658065040485211,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 6766592,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 3072,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,3072,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 3072,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.25855625099211466,
+      "median_ms": 0.20400000357767567,
+      "p95_ms": 0.4860420012846589,
+      "throughput": 0.024333026085653887,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1,1024,3072]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.7682686999999999,
+      "median_ms": 0.710791,
+      "p95_ms": 1.095042,
+      "throughput": 0.008189134869089423,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 6766592,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 1024,
+        "k": 3072
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,1024,3072]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 1024,
+        "k": 3072
+      },
+      "iterations": 20,
+      "mean_ms": 0.3254041002946906,
+      "median_ms": 0.2210415041190572,
+      "p95_ms": 0.527832999068778,
+      "throughput": 0.01933428618232643,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1,151936,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 4.30599585,
+      "median_ms": 4.312375,
+      "p95_ms": 4.464208,
+      "throughput": 0.07226317415052781,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 311640064,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 151936,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1,151936,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1,
+        "n": 151936,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 1.5105832506378647,
+      "median_ms": 1.4516670016746502,
+      "p95_ms": 1.7927079970831983,
+      "throughput": 0.20598992334160085,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[64,128,128]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.6997500000000001,
+      "median_ms": 0.6765840000000001,
+      "p95_ms": 0.8851669999999999,
+      "throughput": 0.002997001786352268,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 524288,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 64,
+        "n": 128,
+        "k": 128
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[64,128,128]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 64,
+        "n": 128,
+        "k": 128
+      },
+      "iterations": 20,
+      "mean_ms": 0.2520000998629257,
+      "median_ms": 0.1442499997210689,
+      "p95_ms": 0.6349579998641275,
+      "throughput": 0.008322028448166235,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[128,1024,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 0.85698555,
+      "median_ms": 0.857166,
+      "p95_ms": 0.9225420000000001,
+      "throughput": 0.31323218460334595,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 2834432,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 128,
+        "n": 1024,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[128,1024,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 128,
+        "n": 1024,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.35990824981126934,
+      "median_ms": 0.30277100086095743,
+      "p95_ms": 0.7345409976551309,
+      "throughput": 0.7458441314995242,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[512,1024,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 1.7681040999999997,
+      "median_ms": 1.8017910000000001,
+      "p95_ms": 2.170875,
+      "throughput": 0.6072842792457751,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 3620864,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 512,
+        "n": 1024,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[512,1024,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 512,
+        "n": 1024,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.6170561493490823,
+      "median_ms": 0.5793540040031075,
+      "p95_ms": 0.8111669958452694,
+      "throughput": 1.7401039194450367,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    },
+    {
+      "benchmark": "matmul_f16[1024,1024,1024]",
+      "device": "Apple M4 Pro",
+      "iterations": 20,
+      "mean_ms": 2.0913606000000007,
+      "median_ms": 2.099458,
+      "p95_ms": 2.148708,
+      "throughput": 1.0268356628694257,
+      "throughput_unit": "TFLOP/s",
+      "allocated_bytes": 4669440,
+      "prefill": null,
+      "decode": null,
+      "backend": "metal-infer",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1024,
+        "n": 1024,
+        "k": 1024
+      }
+    },
+    {
+      "backend": "mlx",
+      "benchmark": "mlx_matmul_f16[1024,1024,1024]",
+      "device": "arm64",
+      "dtype": "f16",
+      "dimensions": {
+        "m": 1024,
+        "n": 1024,
+        "k": 1024
+      },
+      "iterations": 20,
+      "mean_ms": 0.970116750249872,
+      "median_ms": 1.1527290007506963,
+      "p95_ms": 1.509708999947179,
+      "throughput": 2.213634232629088,
+      "throughput_unit": "TFLOP/s",
+      "mlx_version": "0.32.2"
+    }
+  ]
+}

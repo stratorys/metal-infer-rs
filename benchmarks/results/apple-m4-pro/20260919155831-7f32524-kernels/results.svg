@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="470" viewBox="0 0 1000 470" role="img">
+<title>Kernel benchmark results</title>
+<desc>Grouped FP16 matrix multiplication throughput by shape and backend.</desc>
+<rect width="1000" height="100%" fill="#ffffff"/>
+<text x="500.0" y="35.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="22" font-weight="600" fill="#24292f">FP16 matrix multiplication</text>
+<line x1="110" y1="385.0" x2="930" y2="385.0" stroke="#d8dee4"/>
+<text x="98.0" y="390.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">0.00</text>
+<line x1="110" y1="323.0" x2="930" y2="323.0" stroke="#d8dee4"/>
+<text x="98.0" y="328.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">0.44</text>
+<line x1="110" y1="261.0" x2="930" y2="261.0" stroke="#d8dee4"/>
+<text x="98.0" y="266.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">0.89</text>
+<line x1="110" y1="199.0" x2="930" y2="199.0" stroke="#d8dee4"/>
+<text x="98.0" y="204.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">1.33</text>
+<line x1="110" y1="137.0" x2="930" y2="137.0" stroke="#d8dee4"/>
+<text x="98.0" y="142.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">1.77</text>
+<line x1="110" y1="75.0" x2="930" y2="75.0" stroke="#d8dee4"/>
+<text x="98.0" y="80.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">2.21</text>
+<rect x="128.2" y="384.6" width="24.3" height="0.4" fill="#0072B2" rx="2"/>
+<text x="140.4" y="377.6" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.003</text>
+<rect x="158.6" y="384.0" width="24.3" height="1.0" fill="#D55E00" rx="2"/>
+<text x="170.7" y="377.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.007</text>
+<text x="155.6" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">1×1024×1024</text>
+<rect x="219.3" y="384.3" width="24.3" height="0.7" fill="#0072B2" rx="2"/>
+<text x="231.5" y="377.3" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.005</text>
+<rect x="249.7" y="382.7" width="24.3" height="2.3" fill="#D55E00" rx="2"/>
+<text x="261.9" y="375.7" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.017</text>
+<text x="246.7" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">1×2048×1024</text>
+<rect x="310.4" y="384.1" width="24.3" height="0.9" fill="#0072B2" rx="2"/>
+<text x="322.6" y="377.1" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.007</text>
+<rect x="340.8" y="381.6" width="24.3" height="3.4" fill="#D55E00" rx="2"/>
+<text x="353.0" y="374.6" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.024</text>
+<text x="337.8" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">1×3072×1024</text>
+<rect x="401.6" y="383.9" width="24.3" height="1.1" fill="#0072B2" rx="2"/>
+<text x="413.7" y="376.9" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.008</text>
+<rect x="431.9" y="382.3" width="24.3" height="2.7" fill="#D55E00" rx="2"/>
+<text x="444.1" y="375.3" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.019</text>
+<text x="428.9" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">1×1024×3072</text>
+<rect x="492.7" y="374.9" width="24.3" height="10.1" fill="#0072B2" rx="2"/>
+<text x="504.8" y="367.9" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.072</text>
+<rect x="523.0" y="356.2" width="24.3" height="28.8" fill="#D55E00" rx="2"/>
+<text x="535.2" y="349.2" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.206</text>
+<text x="520.0" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">1×151936×1024</text>
+<rect x="583.8" y="384.6" width="24.3" height="0.4" fill="#0072B2" rx="2"/>
+<text x="595.9" y="377.6" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.003</text>
+<rect x="614.1" y="383.8" width="24.3" height="1.2" fill="#D55E00" rx="2"/>
+<text x="626.3" y="376.8" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.008</text>
+<text x="611.1" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">64×128×128</text>
+<rect x="674.9" y="341.1" width="24.3" height="43.9" fill="#0072B2" rx="2"/>
+<text x="687.0" y="334.1" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.313</text>
+<rect x="705.3" y="280.6" width="24.3" height="104.4" fill="#D55E00" rx="2"/>
+<text x="717.4" y="273.6" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.746</text>
+<text x="702.2" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">128×1024×1024</text>
+<rect x="766.0" y="300.0" width="24.3" height="85.0" fill="#0072B2" rx="2"/>
+<text x="778.1" y="293.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">0.607</text>
+<rect x="796.4" y="141.3" width="24.3" height="243.7" fill="#D55E00" rx="2"/>
+<text x="808.5" y="134.3" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">1.740</text>
+<text x="793.3" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">512×1024×1024</text>
+<rect x="857.1" y="241.2" width="24.3" height="143.8" fill="#0072B2" rx="2"/>
+<text x="869.3" y="234.2" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">1.027</text>
+<rect x="887.5" y="75.0" width="24.3" height="310.0" fill="#D55E00" rx="2"/>
+<text x="899.6" y="68.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="11" font-weight="normal" fill="#24292f">2.214</text>
+<text x="884.4" y="409.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" font-weight="normal" fill="#24292f">1024×1024×1024</text>
+<text x="28.0" y="230.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13" font-weight="600" fill="#24292f">TFLOP/s</text>
+<rect x="250" y="425" width="16" height="16" fill="#0072B2" rx="2"/>
+<text x="274.0" y="438.0" text-anchor="start" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13" font-weight="normal" fill="#24292f">metal-infer</text>
+<rect x="480" y="425" width="16" height="16" fill="#D55E00" rx="2"/>
+<text x="504.0" y="438.0" text-anchor="start" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13" font-weight="normal" fill="#24292f">mlx</text>
+</svg>

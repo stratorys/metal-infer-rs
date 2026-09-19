@@ -18,13 +18,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import report as benchmark_report
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SUITE_PATH = ROOT / "benchmarks" / "suite.json"
-README_PATH = ROOT / "benchmarks" / "README.md"
-DEFAULT_RESULTS = ROOT / "benchmarks" / "results" / "latest.json"
-RESULTS_START = "<!-- BENCH_RESULTS_START -->"
-RESULTS_END = "<!-- BENCH_RESULTS_END -->"
 
 
 class BenchmarkError(RuntimeError):
@@ -122,7 +120,7 @@ class Runner:
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_RESULTS)
+    parser.add_argument("--result-dir", type=pathlib.Path)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -175,11 +173,17 @@ def system_metadata() -> dict[str, Any]:
         commit = capture(["git", "rev-parse", "HEAD"]).strip()
     except BenchmarkError:
         pass
+    dirty = True
+    try:
+        dirty = bool(capture(["git", "status", "--porcelain"]).strip())
+    except BenchmarkError:
+        pass
     return {
         "chip": chip,
         "machine": platform.machine(),
         "macos": platform.mac_ver()[0],
         "metal_infer_commit": commit,
+        "metal_infer_dirty": dirty,
         "rustc": capture(["rustc", "--version"]).strip(),
     }
 
@@ -396,67 +400,34 @@ def model_results(
     return results
 
 
-def render_kernel_table(results: list[dict[str, Any]]) -> str:
-    lines = [
-        "| Shape (M×N×K) | Backend | Mean ms | TFLOP/s | Relative |",
-        "|---|---|---:|---:|---:|",
-    ]
-    grouped: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
-    for result in results:
-        dimensions = result.get("dimensions")
-        if not isinstance(dimensions, dict):
-            continue
-        shape = (int(dimensions["m"]), int(dimensions["n"]), int(dimensions["k"]))
-        grouped.setdefault(shape, []).append(result)
-    for shape, rows in grouped.items():
-        metal = next((row for row in rows if row["backend"] == "metal-infer"), None)
-        baseline = float(metal["throughput"]) if metal is not None else 0.0
-        for row in rows:
-            throughput = float(row["throughput"])
-            relative = throughput / baseline if baseline > 0.0 else 0.0
-            lines.append(
-                f"| {shape[0]}×{shape[1]}×{shape[2]} | {row['backend']} | "
-                f"{float(row['mean_ms']):.3f} | {throughput:.4f} | {relative:.2f}× |"
-            )
-    return "\n".join(lines)
-
-
-def update_readme(results: list[dict[str, Any]], generated_at: str) -> None:
-    if not README_PATH.exists():
-        return
-    current = README_PATH.read_text(encoding="utf-8")
-    if RESULTS_START not in current or RESULTS_END not in current:
-        raise BenchmarkError("benchmark README result markers are missing")
-    table = render_kernel_table(results)
-    replacement = (
-        f"{RESULTS_START}\n\nLast generated: `{generated_at}`.\n\n"
-        f"{table}\n\n{RESULTS_END}"
-    )
-    prefix, remainder = current.split(RESULTS_START, maxsplit=1)
-    _, suffix = remainder.split(RESULTS_END, maxsplit=1)
-    README_PATH.write_text(prefix + replacement + suffix, encoding="utf-8")
-
-
 def write_results(
-    output: pathlib.Path,
+    result_directory: pathlib.Path | None,
     command: str,
     suite: dict[str, Any],
     results: list[dict[str, Any]],
-) -> None:
+) -> pathlib.Path:
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     document = {
         "schema_version": 1,
+        "kind": command,
         "generated_at": generated_at,
         "system": system_metadata(),
         "suite": suite[command[:-1] if command == "kernels" else command],
         "results": results,
     }
-    output = output if output.is_absolute() else ROOT / output
-    output.parent.mkdir(parents=True, exist_ok=True)
+    if result_directory is None:
+        destination = benchmark_report.default_run_directory(document)
+    else:
+        destination = result_directory if result_directory.is_absolute() else ROOT / result_directory
+    if destination.exists() and any(destination.iterdir()):
+        raise BenchmarkError(f"result directory already contains files: {destination}")
+    destination.mkdir(parents=True, exist_ok=True)
+    output = destination / "results.json"
     output.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    if command == "kernels":
-        update_readme(results, generated_at)
-    print(f"wrote {output}")
+    benchmark_report.generate_run_report(document, destination)
+    benchmark_report.rebuild_index()
+    print(f"wrote benchmark report to {destination}")
+    return destination
 
 
 def main() -> None:
@@ -479,13 +450,19 @@ def main() -> None:
             results = kernel_results(suite["kernel"], runner)
         else:
             results = model_results(suite["model"], args, runner)
-        write_results(args.output, args.command, suite, results)
+        write_results(args.result_dir, args.command, suite, results)
         print(
             f"completed {len(results)} benchmark results in "
             f"{time.perf_counter() - started:.2f}s",
             flush=True,
         )
-    except (BenchmarkError, OSError, KeyError, ValueError) as benchmark_error:
+    except (
+        BenchmarkError,
+        benchmark_report.ReportError,
+        OSError,
+        KeyError,
+        ValueError,
+    ) as benchmark_error:
         print(f"benchmark failed: {benchmark_error}", file=sys.stderr)
         sys.exit(1)
 

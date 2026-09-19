@@ -220,8 +220,8 @@ def kernel_table(results: list[dict[str, Any]]) -> str:
 
 def model_table(results: list[dict[str, Any]]) -> str:
     lines = [
-        "| Backend | Prefill tokens/s | Decode tokens/s | Memory |",
-        "|---|---:|---:|---:|",
+        "| Backend | Prefill tokens/s | Prefill wall/GPU ms | Decode tokens/s | Decode wall/GPU ms | Memory |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
     for result in results:
         memory = "not comparable"
@@ -229,10 +229,27 @@ def model_table(results: list[dict[str, Any]]) -> str:
             memory = f"{float(result['peak_memory_gb']):.3f} GB peak"
         elif "allocated_bytes" in result:
             memory = f"{int(result['allocated_bytes']) / 1_000_000_000:.3f} GB allocated"
+            growth = result.get("allocation_growth_bytes")
+            if growth is not None:
+                memory += f", +{int(growth) / 1_000_000:.3f} MB measured"
+        prefill = result["prefill"]
+        decode = result["decode"]
+        prefill_timing = "—"
+        decode_timing = "—"
+        if "wall_mean_ms" in prefill and "gpu_mean_ms" in prefill:
+            prefill_timing = (
+                f"{float(prefill['wall_mean_ms']):.3f}/"
+                f"{float(prefill['gpu_mean_ms']):.3f}"
+            )
+        if "wall_mean_ms" in decode and "gpu_mean_ms" in decode:
+            decode_timing = (
+                f"{float(decode['wall_mean_ms']):.3f}/"
+                f"{float(decode['gpu_mean_ms']):.3f}"
+            )
         lines.append(
             f"| {result['backend']} | "
-            f"{float(result['prefill']['tokens_per_second']):.3f} | "
-            f"{float(result['decode']['tokens_per_second']):.3f} | {memory} |"
+            f"{float(prefill['tokens_per_second']):.3f} | {prefill_timing} | "
+            f"{float(decode['tokens_per_second']):.3f} | {decode_timing} | {memory} |"
         )
     return "\n".join(lines)
 

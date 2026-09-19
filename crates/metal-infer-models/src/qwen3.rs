@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use metal_infer_core::{AttentionConfig, AttentionKind, CommandBatch, DType, MetalContext, Tensor};
+use metal_infer_core::{
+    AttentionConfig, AttentionKind, CommandBatch, DType, DispatchStats, MetalContext, Tensor,
+};
 
 use crate::weights::WeightMap;
 use crate::{ModelError, Qwen3Config};
@@ -31,6 +33,30 @@ struct LayerWeights {
 struct LayerCache {
     key: Tensor,
     value: Tensor,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FusionOptions {
+    pub qkv: bool,
+    pub gate_up: bool,
+    pub add_rms_norm: bool,
+    pub qk_rope_cache: bool,
+}
+
+impl FusionOptions {
+    pub const NONE: Self = Self {
+        qkv: false,
+        gate_up: false,
+        add_rms_norm: false,
+        qk_rope_cache: false,
+    };
+
+    pub const ALL: Self = Self {
+        qkv: true,
+        gate_up: true,
+        add_rms_norm: true,
+        qk_rope_cache: true,
+    };
 }
 
 pub struct KvCache {
@@ -91,6 +117,7 @@ pub struct Qwen3Model {
     final_norm: Tensor,
     lm_head: Tensor,
     attention_kind: AttentionKind,
+    fusion_options: FusionOptions,
 }
 
 impl Qwen3Model {
@@ -153,6 +180,7 @@ impl Qwen3Model {
             final_norm,
             lm_head,
             attention_kind: AttentionKind::Tiled,
+            fusion_options: FusionOptions::NONE,
         })
     }
 
@@ -167,18 +195,38 @@ impl Qwen3Model {
         self.attention_kind = kind;
     }
 
+    pub fn set_fusion_options(
+        &mut self,
+        options: FusionOptions,
+    ) {
+        self.fusion_options = options;
+    }
+
+    pub const fn fusion_options(&self) -> FusionOptions {
+        self.fusion_options
+    }
+
     pub fn prefill(
         &self,
         tokens: &[u32],
         cache: &mut KvCache,
     ) -> Result<Tensor, ModelError> {
+        self.prefill_with_stats(tokens, cache)
+            .map(|(tensor, _)| tensor)
+    }
+
+    pub fn prefill_with_stats(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+    ) -> Result<(Tensor, DispatchStats), ModelError> {
         if tokens.is_empty() {
             return Err(ModelError::Config(
                 "prefill requires at least one token".into(),
             ));
         }
         cache.reset();
-        self.forward(tokens, cache)
+        self.forward_with_stats(tokens, cache)
     }
 
     pub fn decode(
@@ -186,7 +234,16 @@ impl Qwen3Model {
         token: u32,
         cache: &mut KvCache,
     ) -> Result<Tensor, ModelError> {
-        self.forward(&[token], cache)
+        self.decode_with_stats(token, cache)
+            .map(|(tensor, _)| tensor)
+    }
+
+    pub fn decode_with_stats(
+        &self,
+        token: u32,
+        cache: &mut KvCache,
+    ) -> Result<(Tensor, DispatchStats), ModelError> {
+        self.forward_with_stats(&[token], cache)
     }
 
     pub fn generate(
@@ -238,11 +295,11 @@ impl Qwen3Model {
         Ok(output)
     }
 
-    fn forward(
+    fn forward_with_stats(
         &self,
         tokens: &[u32],
         cache: &mut KvCache,
-    ) -> Result<Tensor, ModelError> {
+    ) -> Result<(Tensor, DispatchStats), ModelError> {
         if cache.layers.len() != self.layers.len() {
             return Err(ModelError::Config(
                 "KV cache layer count differs from model".into(),
@@ -270,9 +327,9 @@ impl Qwen3Model {
         let normalized = batch.rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)?;
         let last = normalized.row(tokens.len() - 1)?;
         let logits = batch.matmul(&last, &self.lm_head)?;
-        batch.finish()?;
+        let stats = batch.finish()?;
         cache.filled = requested;
-        Ok(logits)
+        Ok((logits, stats))
     }
 
     fn forward_layer(
@@ -290,34 +347,58 @@ impl Qwen3Model {
             .copied()
             .ok_or_else(|| ModelError::Config("hidden state has no token dimension".into()))?;
         let normalized = batch.rms_norm(&hidden, &layer.input_norm, self.config.rms_norm_eps)?;
-        let query = batch
-            .matmul(&normalized, &layer.attention.query)?
-            .reshape(&[
-                tokens,
-                self.config.num_attention_heads,
-                self.config.head_dim,
-            ])?;
-        let key = batch.matmul(&normalized, &layer.attention.key)?.reshape(&[
+        let (query, key, value) = if self.fusion_options.qkv {
+            batch.matmul3(
+                &normalized,
+                &layer.attention.query,
+                &layer.attention.key,
+                &layer.attention.value,
+            )?
+        } else {
+            (
+                batch.matmul(&normalized, &layer.attention.query)?,
+                batch.matmul(&normalized, &layer.attention.key)?,
+                batch.matmul(&normalized, &layer.attention.value)?,
+            )
+        };
+        let query = query.reshape(&[
+            tokens,
+            self.config.num_attention_heads,
+            self.config.head_dim,
+        ])?;
+        let key = key.reshape(&[
             tokens,
             self.config.num_key_value_heads,
             self.config.head_dim,
         ])?;
-        let value = batch
-            .matmul(&normalized, &layer.attention.value)?
-            .reshape(&[
-                tokens,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-            ])?;
-        let query = batch.rms_norm(
-            &query,
-            &layer.attention.query_norm,
-            self.config.rms_norm_eps,
-        )?;
-        let key = batch.rms_norm(&key, &layer.attention.key_norm, self.config.rms_norm_eps)?;
-        let query = batch.rope(&query, offset, self.config.rope_theta)?;
-        let key = batch.rope(&key, offset, self.config.rope_theta)?;
-        batch.copy_into_cache(&key, &cache.key, offset)?;
+        let value = value.reshape(&[
+            tokens,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        ])?;
+        let query = if self.fusion_options.qk_rope_cache {
+            batch.qk_norm_rope_cache(
+                &query,
+                &key,
+                &layer.attention.query_norm,
+                &layer.attention.key_norm,
+                &cache.key,
+                offset,
+                self.config.rope_theta,
+                self.config.rms_norm_eps,
+            )?
+        } else {
+            let query = batch.rms_norm(
+                &query,
+                &layer.attention.query_norm,
+                self.config.rms_norm_eps,
+            )?;
+            let query = batch.rope(&query, offset, self.config.rope_theta)?;
+            let key = batch.rms_norm(&key, &layer.attention.key_norm, self.config.rms_norm_eps)?;
+            let key = batch.rope(&key, offset, self.config.rope_theta)?;
+            batch.copy_into_cache(&key, &cache.key, offset)?;
+            query
+        };
         batch.copy_into_cache(&value, &cache.value, offset)?;
         let active_key = cache.key.prefix(active_length)?;
         let active_value = cache.value.prefix(active_length)?;
@@ -336,14 +417,30 @@ impl Qwen3Model {
         )?;
         let attention = attention.reshape(&[tokens, self.config.query_width()])?;
         let attention = batch.matmul(&attention, &layer.attention.output)?;
-        let residual = batch.add(&hidden, &attention)?;
-        let normalized = batch.rms_norm(
-            &residual,
-            &layer.post_attention_norm,
-            self.config.rms_norm_eps,
-        )?;
-        let gate = batch.matmul(&normalized, &layer.mlp.gate)?;
-        let up = batch.matmul(&normalized, &layer.mlp.up)?;
+        let (residual, normalized) = if self.fusion_options.add_rms_norm {
+            batch.add_rms_norm(
+                &hidden,
+                &attention,
+                &layer.post_attention_norm,
+                self.config.rms_norm_eps,
+            )?
+        } else {
+            let residual = batch.add(&hidden, &attention)?;
+            let normalized = batch.rms_norm(
+                &residual,
+                &layer.post_attention_norm,
+                self.config.rms_norm_eps,
+            )?;
+            (residual, normalized)
+        };
+        let (gate, up) = if self.fusion_options.gate_up {
+            batch.matmul2(&normalized, &layer.mlp.gate, &layer.mlp.up)?
+        } else {
+            (
+                batch.matmul(&normalized, &layer.mlp.gate)?,
+                batch.matmul(&normalized, &layer.mlp.up)?,
+            )
+        };
         let activated = batch.swiglu(&gate, &up)?;
         let down = batch.matmul(&activated, &layer.mlp.down)?;
         batch.add(&residual, &down).map_err(Into::into)

@@ -13,6 +13,22 @@ struct NormParams {
   float epsilon;
   uint _pad;
 };
+struct MultiMatrixParams {
+  uint n0;
+  uint n1;
+  uint n2;
+  uint k;
+};
+struct QkTransformParams {
+  uint tokens;
+  uint q_heads;
+  uint kv_heads;
+  uint head_dim;
+  uint offset;
+  float theta;
+  uint cache_capacity;
+  float epsilon;
+};
 struct RopeParams {
   uint tokens;
   uint heads;
@@ -114,6 +130,139 @@ kernel void matvec_f16(device const half *x [[buffer(0)]],
   }
 }
 
+kernel void matvec2_f16(device const half *x [[buffer(0)]],
+                        device const half *weight0 [[buffer(1)]],
+                        device const half *weight1 [[buffer(2)]],
+                        device half *out0 [[buffer(3)]],
+                        device half *out1 [[buffer(4)]],
+                        constant MultiMatrixParams &p [[buffer(5)]],
+                        uint group [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint simdgroup_index
+                        [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint rows_per_simdgroup = 4;
+  constexpr uint simdgroups_per_threadgroup = 8;
+  uint first_row = (group * simdgroups_per_threadgroup + simdgroup_index) *
+                   rows_per_simdgroup;
+  float sums0[rows_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float sums1[rows_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if ((p.k & 3) == 0) {
+    device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
+    uint vectors = p.k / 4;
+    for (uint i = lane; i < vectors; i += 32) {
+      float4 input = float4(x4[i]);
+      for (uint output = 0; output < rows_per_simdgroup; ++output) {
+        uint row = first_row + output;
+        if (row < p.n0) {
+          device const half4 *weight4 =
+              reinterpret_cast<device const half4 *>(weight0 + row * p.k);
+          sums0[output] += dot(input, float4(weight4[i]));
+        }
+        if (row < p.n1) {
+          device const half4 *weight4 =
+              reinterpret_cast<device const half4 *>(weight1 + row * p.k);
+          sums1[output] += dot(input, float4(weight4[i]));
+        }
+      }
+    }
+  } else {
+    for (uint i = lane; i < p.k; i += 32) {
+      float input = float(x[i]);
+      for (uint output = 0; output < rows_per_simdgroup; ++output) {
+        uint row = first_row + output;
+        if (row < p.n0)
+          sums0[output] += input * float(weight0[row * p.k + i]);
+        if (row < p.n1)
+          sums1[output] += input * float(weight1[row * p.k + i]);
+      }
+    }
+  }
+  for (uint output = 0; output < rows_per_simdgroup; ++output) {
+    float total0 = simd_sum(sums0[output]);
+    float total1 = simd_sum(sums1[output]);
+    uint row = first_row + output;
+    if (lane == 0) {
+      if (row < p.n0)
+        out0[row] = half(total0);
+      if (row < p.n1)
+        out1[row] = half(total1);
+    }
+  }
+}
+
+kernel void matvec3_f16(device const half *x [[buffer(0)]],
+                        device const half *weight0 [[buffer(1)]],
+                        device const half *weight1 [[buffer(2)]],
+                        device const half *weight2 [[buffer(3)]],
+                        device half *out0 [[buffer(4)]],
+                        device half *out1 [[buffer(5)]],
+                        device half *out2 [[buffer(6)]],
+                        constant MultiMatrixParams &p [[buffer(7)]],
+                        uint group [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint simdgroup_index
+                        [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint rows_per_simdgroup = 4;
+  constexpr uint simdgroups_per_threadgroup = 8;
+  uint first_row = (group * simdgroups_per_threadgroup + simdgroup_index) *
+                   rows_per_simdgroup;
+  float sums0[rows_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float sums1[rows_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float sums2[rows_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if ((p.k & 3) == 0) {
+    device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
+    uint vectors = p.k / 4;
+    for (uint i = lane; i < vectors; i += 32) {
+      float4 input = float4(x4[i]);
+      for (uint output = 0; output < rows_per_simdgroup; ++output) {
+        uint row = first_row + output;
+        if (row < p.n0) {
+          device const half4 *weight4 =
+              reinterpret_cast<device const half4 *>(weight0 + row * p.k);
+          sums0[output] += dot(input, float4(weight4[i]));
+        }
+        if (row < p.n1) {
+          device const half4 *weight4 =
+              reinterpret_cast<device const half4 *>(weight1 + row * p.k);
+          sums1[output] += dot(input, float4(weight4[i]));
+        }
+        if (row < p.n2) {
+          device const half4 *weight4 =
+              reinterpret_cast<device const half4 *>(weight2 + row * p.k);
+          sums2[output] += dot(input, float4(weight4[i]));
+        }
+      }
+    }
+  } else {
+    for (uint i = lane; i < p.k; i += 32) {
+      float input = float(x[i]);
+      for (uint output = 0; output < rows_per_simdgroup; ++output) {
+        uint row = first_row + output;
+        if (row < p.n0)
+          sums0[output] += input * float(weight0[row * p.k + i]);
+        if (row < p.n1)
+          sums1[output] += input * float(weight1[row * p.k + i]);
+        if (row < p.n2)
+          sums2[output] += input * float(weight2[row * p.k + i]);
+      }
+    }
+  }
+  for (uint output = 0; output < rows_per_simdgroup; ++output) {
+    float total0 = simd_sum(sums0[output]);
+    float total1 = simd_sum(sums1[output]);
+    float total2 = simd_sum(sums2[output]);
+    uint row = first_row + output;
+    if (lane == 0) {
+      if (row < p.n0)
+        out0[row] = half(total0);
+      if (row < p.n1)
+        out1[row] = half(total1);
+      if (row < p.n2)
+        out2[row] = half(total2);
+    }
+  }
+}
+
 kernel void rms_norm_f16(device const half *x [[buffer(0)]],
                          device const half *weight [[buffer(1)]],
                          device half *out [[buffer(2)]],
@@ -136,6 +285,35 @@ kernel void rms_norm_f16(device const half *x [[buffer(0)]],
   float scale = rsqrt(sum / float(p.width) + p.epsilon);
   for (uint i = lane; i < p.width; i += 32)
     out[base + i] = half(float(x[base + i]) * scale * float(weight[i]));
+}
+
+kernel void add_rms_norm_f16(device const half *left [[buffer(0)]],
+                             device const half *right [[buffer(1)]],
+                             device const half *weight [[buffer(2)]],
+                             device half *residual [[buffer(3)]],
+                             device half *normalized [[buffer(4)]],
+                             constant NormParams &p [[buffer(5)]],
+                             uint group [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint simdgroup_index
+                             [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint simdgroups_per_threadgroup = 8;
+  uint row = group * simdgroups_per_threadgroup + simdgroup_index;
+  if (row >= p.rows)
+    return;
+  uint base = row * p.width;
+  float sum = 0.0f;
+  for (uint i = lane; i < p.width; i += 32) {
+    float value = float(left[base + i]) + float(right[base + i]);
+    residual[base + i] = half(value);
+    sum += value * value;
+  }
+  sum = simd_sum(sum);
+  float scale = rsqrt(sum / float(p.width) + p.epsilon);
+  for (uint i = lane; i < p.width; i += 32) {
+    float value = float(residual[base + i]);
+    normalized[base + i] = half(value * scale * float(weight[i]));
+  }
 }
 
 kernel void swiglu_f16(device const half *gate [[buffer(0)]],
@@ -176,6 +354,52 @@ kernel void rope_f16(device const half *input [[buffer(0)]],
   float y = float(input[base + second]);
   out[base + pair] = half(x * cos(angle) - y * sin(angle));
   out[base + second] = half(x * sin(angle) + y * cos(angle));
+}
+
+kernel void qk_norm_rope_cache_f16(device const half *query [[buffer(0)]],
+                                   device const half *key [[buffer(1)]],
+                                   device const half *query_weight
+                                   [[buffer(2)]],
+                                   device const half *key_weight [[buffer(3)]],
+                                   device half *query_out [[buffer(4)]],
+                                   device half *key_cache [[buffer(5)]],
+                                   constant QkTransformParams &p [[buffer(6)]],
+                                   uint group [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+  uint query_rows = p.tokens * p.q_heads;
+  bool is_query = group < query_rows;
+  uint row = is_query ? group : group - query_rows;
+  uint heads = is_query ? p.q_heads : p.kv_heads;
+  if (row >= p.tokens * heads)
+    return;
+  uint token = row / heads;
+  uint head = row - token * heads;
+  device const half *input = is_query ? query : key;
+  device const half *weight = is_query ? query_weight : key_weight;
+  uint base = row * p.head_dim;
+  float sum = 0.0f;
+  for (uint i = lane; i < p.head_dim; i += 32) {
+    float value = float(input[base + i]);
+    sum += value * value;
+  }
+  float scale = rsqrt(simd_sum(sum) / float(p.head_dim) + p.epsilon);
+  for (uint pair = lane; pair < p.head_dim / 2; pair += 32) {
+    uint second = pair + p.head_dim / 2;
+    float x = float(input[base + pair]) * scale * float(weight[pair]);
+    float y = float(input[base + second]) * scale * float(weight[second]);
+    float frequency = pow(p.theta, -float(pair * 2) / float(p.head_dim));
+    float angle = float(token + p.offset) * frequency;
+    half rotated_x = half(x * cos(angle) - y * sin(angle));
+    half rotated_y = half(x * sin(angle) + y * cos(angle));
+    if (is_query) {
+      query_out[base + pair] = rotated_x;
+      query_out[base + second] = rotated_y;
+    } else {
+      uint cache_base = ((p.offset + token) * p.kv_heads + head) * p.head_dim;
+      key_cache[cache_base + pair] = rotated_x;
+      key_cache[cache_base + second] = rotated_y;
+    }
+  }
 }
 
 kernel void attention_reference_f16(device const half *q [[buffer(0)]],

@@ -57,6 +57,28 @@ prompt length, generation length, and power conditions match. llama.cpp is not
 included in the kernel table because `llama-bench` measures model execution,
 not an isolated generic matrix multiplication.
 
+The model benchmark starts with every optional fusion disabled. Enable one or
+more families explicitly with `--fuse-qkv`, `--fuse-gate-up`,
+`--fuse-add-rms-norm`, and `--fuse-qk-rope-cache`. These flags are available on
+both `metal-infer-bench model` and `benchmarks/compare.py model`; the inference
+CLI is unchanged.
+
+## Run the fusion microbenchmarks
+
+Compare each fused kernel with its individual operations using Qwen3-0.6B
+dimensions:
+
+```sh
+target/release/metal-infer-bench fusion --kind qkv
+target/release/metal-infer-bench fusion --kind gate-up
+target/release/metal-infer-bench fusion --kind add-rms-norm
+target/release/metal-infer-bench fusion --kind qk-rope-cache
+```
+
+Projection benchmarks default to the vectorized `K=1024` path. Pass `--k 1023`
+to QKV or gate/up to measure the scalar fallback. Reports contain separate GPU
+and wall-clock distributions plus the fused/unfused speedup.
+
 ## Results
 
 See the [results index](results/README.md). Each entry contains its exact

@@ -130,6 +130,10 @@ def arguments() -> argparse.Namespace:
     model.add_argument("--mlx-model", required=True)
     model.add_argument("--gguf", type=pathlib.Path)
     model.add_argument("--llama-bench", type=pathlib.Path)
+    model.add_argument("--fuse-qkv", action="store_true")
+    model.add_argument("--fuse-gate-up", action="store_true")
+    model.add_argument("--fuse-add-rms-norm", action="store_true")
+    model.add_argument("--fuse-qk-rope-cache", action="store_true")
     return parser.parse_args()
 
 
@@ -317,6 +321,16 @@ def model_results(
     generate = int(config["generation_tokens"])
     iterations = int(config["iterations"])
     warmup = int(config["warmup"])
+    fusion_flags = [
+        flag
+        for enabled, flag in (
+            (args.fuse_qkv, "--fuse-qkv"),
+            (args.fuse_gate_up, "--fuse-gate-up"),
+            (args.fuse_add_rms_norm, "--fuse-add-rms-norm"),
+            (args.fuse_qk_rope_cache, "--fuse-qk-rope-cache"),
+        )
+        if enabled
+    ]
     metal, elapsed = runner.run_json(
         [
             str(ROOT / "target" / "release" / "metal-infer-bench"),
@@ -331,6 +345,7 @@ def model_results(
             str(iterations),
             "--warmup",
             str(warmup),
+            *fusion_flags,
             "--format",
             "json",
         ],

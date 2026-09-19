@@ -37,6 +37,26 @@ struct NormParams {
 }
 
 #[repr(C)]
+struct MultiMatrixParams {
+    n0: u32,
+    n1: u32,
+    n2: u32,
+    k: u32,
+}
+
+#[repr(C)]
+struct QkTransformParams {
+    tokens: u32,
+    query_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    offset: u32,
+    theta: f32,
+    cache_capacity: u32,
+    epsilon: f32,
+}
+
+#[repr(C)]
 struct RopeParams {
     tokens: u32,
     heads: u32,
@@ -204,6 +224,90 @@ impl CommandBatch<'_> {
         Ok(out)
     }
 
+    pub fn matmul2(
+        &mut self,
+        input: &Tensor,
+        weight0: &Tensor,
+        weight1: &Tensor,
+    ) -> Result<(Tensor, Tensor), CoreError> {
+        let [m, k] = matrix_shape(input)?;
+        let [n0, k0] = matrix_shape(weight0)?;
+        let [n1, k1] = matrix_shape(weight1)?;
+        require_f16(input)?;
+        require_f16(weight0)?;
+        require_f16(weight1)?;
+        if k != k0 || k != k1 {
+            return Err(CoreError::Shape("matmul2 inner dimensions differ".into()));
+        }
+        if m != 1 {
+            return Ok((self.matmul(input, weight0)?, self.matmul(input, weight1)?));
+        }
+        let out0 = self.empty(&[1, n0], DType::F16)?;
+        let out1 = self.empty(&[1, n1], DType::F16)?;
+        let params = MultiMatrixParams {
+            n0: to_u32(n0, "n0")?,
+            n1: to_u32(n1, "n1")?,
+            n2: 0,
+            k: to_u32(k, "k")?,
+        };
+        let outputs = n0.max(n1);
+        let groups = outputs.div_ceil(32);
+        self.dispatch(
+            "matvec2_f16",
+            &[input, weight0, weight1, &out0, &out1],
+            &params,
+            size(checked_mul(groups, 256, "matmul2 grid")?, 1, 1),
+            size(256, 1, 1),
+        )?;
+        Ok((out0, out1))
+    }
+
+    pub fn matmul3(
+        &mut self,
+        input: &Tensor,
+        weight0: &Tensor,
+        weight1: &Tensor,
+        weight2: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor), CoreError> {
+        let [m, k] = matrix_shape(input)?;
+        let [n0, k0] = matrix_shape(weight0)?;
+        let [n1, k1] = matrix_shape(weight1)?;
+        let [n2, k2] = matrix_shape(weight2)?;
+        require_f16(input)?;
+        require_f16(weight0)?;
+        require_f16(weight1)?;
+        require_f16(weight2)?;
+        if k != k0 || k != k1 || k != k2 {
+            return Err(CoreError::Shape("matmul3 inner dimensions differ".into()));
+        }
+        if m != 1 {
+            return Ok((
+                self.matmul(input, weight0)?,
+                self.matmul(input, weight1)?,
+                self.matmul(input, weight2)?,
+            ));
+        }
+        let out0 = self.empty(&[1, n0], DType::F16)?;
+        let out1 = self.empty(&[1, n1], DType::F16)?;
+        let out2 = self.empty(&[1, n2], DType::F16)?;
+        let params = MultiMatrixParams {
+            n0: to_u32(n0, "n0")?,
+            n1: to_u32(n1, "n1")?,
+            n2: to_u32(n2, "n2")?,
+            k: to_u32(k, "k")?,
+        };
+        let outputs = n0.max(n1).max(n2);
+        let groups = outputs.div_ceil(32);
+        self.dispatch(
+            "matvec3_f16",
+            &[input, weight0, weight1, weight2, &out0, &out1, &out2],
+            &params,
+            size(checked_mul(groups, 256, "matmul3 grid")?, 1, 1),
+            size(256, 1, 1),
+        )?;
+        Ok((out0, out1, out2))
+    }
+
     pub fn rms_norm(
         &mut self,
         input: &Tensor,
@@ -237,6 +341,49 @@ impl CommandBatch<'_> {
             size(256, 1, 1),
         )?;
         Ok(out)
+    }
+
+    pub fn add_rms_norm(
+        &mut self,
+        left: &Tensor,
+        right: &Tensor,
+        weight: &Tensor,
+        epsilon: f32,
+    ) -> Result<(Tensor, Tensor), CoreError> {
+        require_f16(left)?;
+        require_f16(right)?;
+        require_f16(weight)?;
+        require_same_shape(left, right)?;
+        let width = *left
+            .shape()
+            .last()
+            .ok_or_else(|| CoreError::Shape("add_rms_norm requires rank >= 1".into()))?;
+        if weight.shape() != [width] {
+            return Err(CoreError::Shape(format!(
+                "RMSNorm weight must have shape [{width}]"
+            )));
+        }
+        let rows = left.len() / width;
+        let residual = self.empty(left.shape(), DType::F16)?;
+        let normalized = self.empty(left.shape(), DType::F16)?;
+        let params = NormParams {
+            rows: to_u32(rows, "rows")?,
+            width: to_u32(width, "width")?,
+            epsilon,
+            padding: 0,
+        };
+        self.dispatch(
+            "add_rms_norm_f16",
+            &[left, right, weight, &residual, &normalized],
+            &params,
+            size(
+                checked_mul(rows.div_ceil(8), 256, "add RMSNorm grid")?,
+                1,
+                1,
+            ),
+            size(256, 1, 1),
+        )?;
+        Ok((residual, normalized))
     }
 
     pub fn swiglu(
@@ -317,6 +464,70 @@ impl CommandBatch<'_> {
             &params,
             size(*head_dim / 2, *heads, *tokens),
             size((*head_dim / 2).min(32), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    pub fn qk_norm_rope_cache(
+        &mut self,
+        query: &Tensor,
+        key: &Tensor,
+        query_weight: &Tensor,
+        key_weight: &Tensor,
+        key_cache: &Tensor,
+        offset: usize,
+        theta: f32,
+        epsilon: f32,
+    ) -> Result<Tensor, CoreError> {
+        require_f16(query)?;
+        require_f16(key)?;
+        require_f16(query_weight)?;
+        require_f16(key_weight)?;
+        require_f16(key_cache)?;
+        let [tokens, query_heads, head_dim] = query.shape() else {
+            return Err(CoreError::Shape("query must have rank 3".into()));
+        };
+        let [key_tokens, kv_heads, key_dim] = key.shape() else {
+            return Err(CoreError::Shape("key must have rank 3".into()));
+        };
+        let [capacity, cache_heads, cache_dim] = key_cache.shape() else {
+            return Err(CoreError::Shape("key cache must have rank 3".into()));
+        };
+        if tokens != key_tokens
+            || head_dim != key_dim
+            || kv_heads != cache_heads
+            || head_dim != cache_dim
+            || query_weight.shape() != [*head_dim]
+            || key_weight.shape() != [*head_dim]
+        {
+            return Err(CoreError::Shape(
+                "Q/K transform tensor shapes are incompatible".into(),
+            ));
+        }
+        if !head_dim.is_multiple_of(2) || offset + *tokens > *capacity {
+            return Err(CoreError::Shape(
+                "Q/K transform has invalid head_dim or cache offset".into(),
+            ));
+        }
+        let out = self.empty(query.shape(), DType::F16)?;
+        let params = QkTransformParams {
+            tokens: to_u32(*tokens, "tokens")?,
+            query_heads: to_u32(*query_heads, "query heads")?,
+            kv_heads: to_u32(*kv_heads, "KV heads")?,
+            head_dim: to_u32(*head_dim, "head dim")?,
+            offset: to_u32(offset, "offset")?,
+            theta,
+            cache_capacity: to_u32(*capacity, "cache capacity")?,
+            epsilon,
+        };
+        let heads = checked_add(*query_heads, *kv_heads, "Q/K heads")?;
+        let groups = checked_mul(*tokens, heads, "Q/K groups")?;
+        self.dispatch(
+            "qk_norm_rope_cache_f16",
+            &[query, key, query_weight, key_weight, &out, key_cache],
+            &params,
+            size(checked_mul(groups, 32, "Q/K grid")?, 1, 1),
+            size(32, 1, 1),
         )?;
         Ok(out)
     }
@@ -521,6 +732,15 @@ fn checked_mul(
     label: &str,
 ) -> Result<usize, CoreError> {
     left.checked_mul(right)
+        .ok_or_else(|| CoreError::Shape(format!("{label} overflow")))
+}
+
+fn checked_add(
+    left: usize,
+    right: usize,
+    label: &str,
+) -> Result<usize, CoreError> {
+    left.checked_add(right)
         .ok_or_else(|| CoreError::Shape(format!("{label} overflow")))
 }
 

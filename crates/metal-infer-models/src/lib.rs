@@ -8,5 +8,5 @@ mod weights;
 
 pub use config::Qwen3Config;
 pub use error::ModelError;
-pub use qwen3::{KvCache, Qwen3Model};
+pub use qwen3::{FusionOptions, KvCache, Qwen3Model};
 pub use tokenizer::ModelTokenizer;

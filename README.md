@@ -5,10 +5,12 @@ built directly on `objc2-metal` and native Metal Shading Language kernels.
 
 ## Current status
 
-- FP16 tensors and F16/BF16 Safetensors loading;
+- FP16 execution and direct BF16-to-FP16 Safetensors loading without a
+  tensor-sized conversion copy;
 - tiled GEMM for prefill and GEMV for decode;
 - RMSNorm, RoPE, GQA, online causal attention, and SwiGLU;
-- dense Qwen3 blocks, KV cache, prefill, decode, and greedy generation;
+- dense Qwen3 blocks, KV cache, prefill, decode, greedy and sampled generation;
+- an OpenAI-compatible chat completions server with SSE streaming;
 - Rust benchmarks, MLX comparisons through `uv`, and llama.cpp commands;
 - GPU path currently validated on an Apple M4 Pro.
 
@@ -25,9 +27,25 @@ uvx --from huggingface-hub hf download Qwen/Qwen3-0.6B \
 
 # Generate text
 cargo run --release --bin metal-infer -- \
+  generate \
   --model ./models/Qwen3-0.6B \
   --prompt 'Hello' --max-tokens 32 --context 2048
+
+# Start an OpenAI-compatible server for Open WebUI
+cargo run --release --bin metal-infer -- \
+  serve --model Qwen/Qwen3-0.6B --context 8192 --bind 127.0.0.1:8080
+
+# Test the server
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3-0.6B","messages":[{"role":"user","content":"Hello"}],"max_tokens":32,"stream":true}'
 ```
+
+Open WebUI can use `http://host.docker.internal:8080/v1` when it runs in
+Docker, or `http://127.0.0.1:8080/v1` when it runs directly on the Mac. The
+first server version intentionally serializes generation requests. A Hugging
+Face repository ID resolves to its locally cached snapshot; use
+`hf download <owner/model>` first if it is not cached.
 
 ## Workspace layout
 

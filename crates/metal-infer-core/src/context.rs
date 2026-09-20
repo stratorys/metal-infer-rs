@@ -7,7 +7,7 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 use std::time::Instant;
 
-use half::f16;
+use half::{bf16, f16};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -177,6 +177,42 @@ impl MetalContext {
                 bytes.len(),
             )
         };
+        Ok(tensor)
+    }
+
+    /// Converts little-endian BF16 source data directly into an FP16 Metal
+    /// buffer. This deliberately avoids allocating a second, tensor-sized
+    /// host vector while loading large sharded checkpoints.
+    pub fn tensor_bf16_as_f16_bytes(
+        &self,
+        bytes: &[u8],
+        shape: &[usize],
+    ) -> Result<Tensor, CoreError> {
+        let tensor = self.empty(shape, DType::F16)?;
+        if tensor.byte_len() != bytes.len() {
+            return Err(CoreError::DataLength {
+                expected: tensor.byte_len(),
+                actual: bytes.len(),
+            });
+        }
+        let (values, remainder) = bytes.as_chunks::<2>();
+        if !remainder.is_empty() {
+            return Err(CoreError::DataLength {
+                expected: tensor.byte_len(),
+                actual: bytes.len(),
+            });
+        }
+        let destination = tensor.buffer.contents().as_ptr().cast::<u16>();
+        for (index, [low, high]) in values.iter().enumerate() {
+            let value = bf16::from_bits(u16::from_le_bytes([*low, *high]));
+            // SAFETY: `values` contains exactly `tensor.len()` elements and
+            // the Metal shared buffer has one u16 slot per FP16 element.
+            unsafe {
+                destination
+                    .add(index)
+                    .write(f16::from_f32(value.to_f32()).to_bits())
+            };
+        }
         Ok(tensor)
     }
 

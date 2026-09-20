@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use half::{bf16, f16};
 use metal_infer_core::{MetalContext, Tensor};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
@@ -33,16 +32,7 @@ impl WeightMap {
                 let tensor = if view.dtype() == Dtype::F16 {
                     context.tensor_f16_bytes(view.data(), view.shape())?
                 } else if view.dtype() == Dtype::BF16 {
-                    let mut converted = Vec::with_capacity(view.data().len() / 2);
-                    let (chunks, remainder) = view.data().as_chunks::<2>();
-                    for [low, high] in chunks {
-                        let value = bf16::from_bits(u16::from_le_bytes([*low, *high]));
-                        converted.push(f16::from_f32(value.to_f32()).to_bits());
-                    }
-                    if !remainder.is_empty() {
-                        return Err(ModelError::InvalidTensorBytes(name.to_owned()));
-                    }
-                    context.tensor_f16_bits(&converted, view.shape())?
+                    context.tensor_bf16_as_f16_bytes(view.data(), view.shape())?
                 } else {
                     return Err(ModelError::Unsupported(format!(
                         "tensor `{name}` uses {:?}; only F16 and BF16 are supported",

@@ -128,6 +128,29 @@ pub struct Qwen3Model {
     fusion_options: FusionOptions,
 }
 
+#[derive(Clone, Debug)]
+pub struct GenerationOptions {
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub seed: u64,
+    pub stop_token_ids: Vec<u32>,
+}
+
+impl Default for GenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: 32,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 0,
+            stop_token_ids: Vec::new(),
+        }
+    }
+}
+
 impl Qwen3Model {
     pub fn load(
         directory: &Path,
@@ -260,15 +283,42 @@ impl Qwen3Model {
         max_tokens: usize,
         cache: &mut KvCache,
     ) -> Result<Vec<u32>, ModelError> {
-        if max_tokens == 0 {
+        self.generate_with(
+            prompt,
+            &GenerationOptions {
+                max_tokens,
+                ..GenerationOptions::default()
+            },
+            cache,
+            |_| true,
+        )
+    }
+
+    pub fn generate_with(
+        &self,
+        prompt: &[u32],
+        options: &GenerationOptions,
+        cache: &mut KvCache,
+        mut on_token: impl FnMut(u32) -> bool,
+    ) -> Result<Vec<u32>, ModelError> {
+        validate_generation_options(options)?;
+        if options.max_tokens == 0 {
             return Ok(Vec::new());
         }
         let mut logits = self.prefill(prompt, cache)?;
-        let mut generated = Vec::with_capacity(max_tokens);
-        for step in 0..max_tokens {
-            let token = argmax(&logits.to_f32_vec()?)?;
+        let mut generated = Vec::with_capacity(options.max_tokens);
+        let mut random = XorShift64::new(options.seed);
+        for step in 0..options.max_tokens {
+            let values = logits.to_f32_vec()?;
+            let token = sample_token(&values, options, &mut random)?;
+            if options.stop_token_ids.contains(&token) {
+                break;
+            }
             generated.push(token);
-            if step + 1 < max_tokens {
+            if !on_token(token) {
+                break;
+            }
+            if step + 1 < options.max_tokens {
                 logits = self.decode(token, cache)?;
             }
         }
@@ -542,9 +592,108 @@ fn argmax(values: &[f32]) -> Result<u32, ModelError> {
         .map_err(|_| ModelError::Config("token id does not fit in u32".into()))
 }
 
+fn validate_generation_options(options: &GenerationOptions) -> Result<(), ModelError> {
+    if !options.temperature.is_finite() || options.temperature < 0.0 {
+        return Err(ModelError::Config(
+            "temperature must be finite and non-negative".into(),
+        ));
+    }
+    if !options.top_p.is_finite() || !(0.0..=1.0).contains(&options.top_p) {
+        return Err(ModelError::Config("top_p must be between 0 and 1".into()));
+    }
+    Ok(())
+}
+
+fn sample_token(
+    values: &[f32],
+    options: &GenerationOptions,
+    random: &mut XorShift64,
+) -> Result<u32, ModelError> {
+    if options.temperature == 0.0 {
+        return argmax(values);
+    }
+    let mut candidates: Vec<(usize, f32)> = values
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .collect();
+    if candidates.is_empty() {
+        return Err(ModelError::Config("logits contain no finite value".into()));
+    }
+    candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+    if options.top_k > 0 && candidates.len() > options.top_k {
+        candidates.truncate(options.top_k);
+    }
+    let max_logit = candidates
+        .first()
+        .ok_or_else(|| ModelError::Config("logits contain no finite value".into()))?
+        .1;
+    let inverse_temperature = options.temperature.recip();
+    let mut total = 0.0f64;
+    for (_, value) in &mut candidates {
+        *value = ((*value - max_logit) * inverse_temperature).exp();
+        total += f64::from(*value);
+    }
+    if options.top_p < 1.0 {
+        let threshold = total * f64::from(options.top_p);
+        let mut cumulative = 0.0f64;
+        let mut keep = 0usize;
+        for (_, probability) in &candidates {
+            cumulative += f64::from(*probability);
+            keep += 1;
+            if cumulative >= threshold {
+                break;
+            }
+        }
+        candidates.truncate(keep.max(1));
+        total = candidates
+            .iter()
+            .map(|(_, probability)| f64::from(*probability))
+            .sum();
+    }
+    let mut target = random.next_f64() * total;
+    for (index, probability) in candidates {
+        target -= f64::from(probability);
+        if target <= 0.0 {
+            return index
+                .try_into()
+                .map_err(|_| ModelError::Config("token id does not fit in u32".into()));
+        }
+    }
+    Err(ModelError::Config("failed to sample a token".into()))
+}
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    const fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        (value as f64) / (u64::MAX as f64 + 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AttentionKind, attention_kind_for_tokens};
+    use super::{
+        AttentionKind, GenerationOptions, XorShift64, attention_kind_for_tokens, sample_token,
+    };
 
     #[test]
     fn tiled_attention_selects_split_kv_only_for_decode() {
@@ -563,5 +712,23 @@ mod tests {
             AttentionKind::Reference,
             "reference attention should remain explicitly selectable"
         );
+    }
+
+    #[test]
+    fn zero_temperature_is_greedy() {
+        let options = GenerationOptions::default();
+        let token = sample_token(&[1.0, 4.0, 2.0], &options, &mut XorShift64::new(1));
+        assert_eq!(token.expect("sampling should succeed"), 1);
+    }
+
+    #[test]
+    fn top_k_one_is_greedy_even_with_temperature() {
+        let options = GenerationOptions {
+            temperature: 1.0,
+            top_k: 1,
+            ..GenerationOptions::default()
+        };
+        let token = sample_token(&[1.0, 4.0, 2.0], &options, &mut XorShift64::new(1));
+        assert_eq!(token.expect("sampling should succeed"), 1);
     }
 }

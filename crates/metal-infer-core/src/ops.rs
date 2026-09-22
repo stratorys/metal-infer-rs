@@ -1,9 +1,13 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use objc2::AnyThread;
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+use objc2_metal_performance_shaders::{
+    MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication,
+};
 
-use crate::{CommandBatch, CoreError, DType, MetalContext, Tensor};
+use crate::{CommandBatch, CoreError, DType, MatmulBackend, MetalContext, Tensor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttentionKind {
@@ -210,7 +214,10 @@ impl CommandBatch<'_> {
             k: to_u32(k, "k")?,
             padding: 0,
         };
-        if m == 1 {
+        let backend = self.context.matmul_backend();
+        if backend == MatmulBackend::Mps || (backend == MatmulBackend::Auto && m > 1) {
+            self.matmul_mps(input, weight, &out, m, n, k)?;
+        } else if m == 1 {
             let outputs_per_threadgroup = 32;
             let groups = n.div_ceil(outputs_per_threadgroup);
             self.dispatch(
@@ -230,6 +237,75 @@ impl CommandBatch<'_> {
             )?;
         }
         Ok(out)
+    }
+
+    fn matmul_mps(
+        &mut self,
+        input: &Tensor,
+        weight: &Tensor,
+        output: &Tensor,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), CoreError> {
+        let descriptor = |rows, columns, row_bytes| unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                rows,
+                columns,
+                row_bytes,
+                MPSDataType::Float16,
+            )
+        };
+        let input_descriptor = descriptor(m, k, k * DType::F16.size());
+        let weight_descriptor = descriptor(n, k, k * DType::F16.size());
+        let output_descriptor = descriptor(m, n, n * DType::F16.size());
+        let input_matrix = unsafe {
+            MPSMatrix::initWithBuffer_offset_descriptor(
+                MPSMatrix::alloc(),
+                &input.buffer,
+                input.offset_bytes,
+                &input_descriptor,
+            )
+        };
+        let weight_matrix = unsafe {
+            MPSMatrix::initWithBuffer_offset_descriptor(
+                MPSMatrix::alloc(),
+                &weight.buffer,
+                weight.offset_bytes,
+                &weight_descriptor,
+            )
+        };
+        let output_matrix = unsafe {
+            MPSMatrix::initWithBuffer_offset_descriptor(
+                MPSMatrix::alloc(),
+                &output.buffer,
+                output.offset_bytes,
+                &output_descriptor,
+            )
+        };
+        let multiplication = unsafe {
+            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+                MPSMatrixMultiplication::alloc(),
+                &self.context.device,
+                false,
+                true,
+                m,
+                n,
+                k,
+                1.0,
+                0.0,
+            )
+        };
+        self.end_compute_encoding()?;
+        unsafe {
+            multiplication.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+                self.command_buffer_ref(),
+                &input_matrix,
+                &weight_matrix,
+                &output_matrix,
+            )
+        };
+        self.resume_compute_encoding()
     }
 
     pub fn matmul2(

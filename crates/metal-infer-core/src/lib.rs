@@ -5,7 +5,7 @@ mod error;
 mod ops;
 mod tensor;
 
-pub use context::{CommandBatch, DispatchStats, MetalContext};
+pub use context::{CommandBatch, DispatchStats, MatmulBackend, MetalContext};
 pub use error::CoreError;
 pub use ops::{AttentionConfig, AttentionKind, QkNormRopeCacheConfig};
 pub use tensor::{DType, Tensor};

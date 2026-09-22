@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -27,6 +28,24 @@ pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub struct DispatchStats {
     pub gpu_time: Duration,
     pub wall_time: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MatmulBackend {
+    #[default]
+    Auto,
+    NativeMsl,
+    Mps,
+}
+
+impl MatmulBackend {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::NativeMsl => "native-msl",
+            Self::Mps => "mps",
+        }
+    }
 }
 
 pub struct CommandBatch<'context> {
@@ -60,6 +79,7 @@ pub struct MetalContext {
     pub(crate) queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: RefCell<HashMap<String, Pipeline>>,
+    matmul_backend: Rc<Cell<MatmulBackend>>,
 }
 
 impl MetalContext {
@@ -77,6 +97,7 @@ impl MetalContext {
             queue,
             library,
             pipelines: RefCell::new(HashMap::new()),
+            matmul_backend: Rc::new(Cell::new(MatmulBackend::Auto)),
         })
     }
 
@@ -86,6 +107,17 @@ impl MetalContext {
 
     pub fn allocated_bytes(&self) -> usize {
         self.device.currentAllocatedSize()
+    }
+
+    pub fn set_matmul_backend(
+        &self,
+        backend: MatmulBackend,
+    ) {
+        self.matmul_backend.set(backend);
+    }
+
+    pub fn matmul_backend(&self) -> MatmulBackend {
+        self.matmul_backend.get()
     }
 
     pub fn begin_batch(&self) -> Result<CommandBatch<'_>, CoreError> {
@@ -272,6 +304,28 @@ impl MetalContext {
 }
 
 impl CommandBatch<'_> {
+    pub(crate) fn end_compute_encoding(&mut self) -> Result<(), CoreError> {
+        let encoder = self
+            .encoder
+            .take()
+            .ok_or(CoreError::Resource("finished compute encoder"))?;
+        encoder.endEncoding();
+        Ok(())
+    }
+
+    pub(crate) fn resume_compute_encoding(&mut self) -> Result<(), CoreError> {
+        let encoder = self
+            .command_buffer
+            .computeCommandEncoder()
+            .ok_or(CoreError::Resource("compute encoder"))?;
+        self.encoder = Some(encoder);
+        Ok(())
+    }
+
+    pub(crate) fn command_buffer_ref(&self) -> &ProtocolObject<dyn MTLCommandBuffer> {
+        &self.command_buffer
+    }
+
     pub(crate) fn empty(
         &self,
         shape: &[usize],
@@ -343,11 +397,7 @@ impl CommandBatch<'_> {
     }
 
     pub fn finish(mut self) -> Result<DispatchStats, CoreError> {
-        let encoder = self
-            .encoder
-            .take()
-            .ok_or(CoreError::Resource("finished compute encoder"))?;
-        encoder.endEncoding();
+        self.end_compute_encoding()?;
         let started = Instant::now();
         self.command_buffer.commit();
         self.command_buffer.waitUntilCompleted();

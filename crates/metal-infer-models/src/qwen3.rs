@@ -236,6 +236,9 @@ impl Qwen3Model {
         };
         model.tune_matvec_path()?;
         model.tune_fused_decode_norm()?;
+        if context.device_name() == "Apple M4 Pro" {
+            context.set_decode_gemv_config(metal_infer_core::DecodeGemvConfig::Tuned);
+        }
         Ok(model)
     }
 

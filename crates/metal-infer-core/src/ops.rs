@@ -292,12 +292,7 @@ impl CommandBatch<'_> {
             }
             let vocabulary = n >= 65_536;
             let rows = if auto_m4 && k.is_multiple_of(256) {
-                let selected = self.context.auto_matvec_rows();
-                if vocabulary {
-                    selected.vocab
-                } else {
-                    self.context.auto_single_matvec_rows(n, k)
-                }
+                self.context.auto_matvec_rows_for_shape(n, k, vocabulary)
             } else if native && k.is_multiple_of(256) {
                 if vocabulary { 2 } else { 4 }
             } else {
@@ -601,9 +596,22 @@ impl CommandBatch<'_> {
             k: to_u32(width, "width")?,
             epsilon,
         };
-        let groups = n0.max(n1).max(n2).div_ceil(8);
+        let rows =
+            if self.context.matmul_backend() == MatmulBackend::Auto && self.context.is_m4_pro() {
+                self.context
+                    .fused_norm_matvec_rows_for_shape([n0, n1, n2], width)
+            } else {
+                2
+            };
+        let simdgroups = if rows == 1 { 8 } else { 4 };
+        let groups = n0.max(n1).max(n2).div_ceil(rows * simdgroups);
         self.dispatch(
-            "matvec3_rms_f16",
+            match rows {
+                1 => "matvec3_rms_r1_f16",
+                4 => "matvec3_rms_r4_f16",
+                8 => "matvec3_rms_r8_f16",
+                _ => "matvec3_rms_f16",
+            },
             &[
                 input,
                 norm_weight,
@@ -615,8 +623,12 @@ impl CommandBatch<'_> {
                 &out2,
             ],
             &params,
-            size(checked_mul(groups, 128, "rms matmul3 grid")?, 1, 1),
-            size(128, 1, 1),
+            size(
+                checked_mul(groups, simdgroups * 32, "rms matmul3 grid")?,
+                1,
+                1,
+            ),
+            size(simdgroups * 32, 1, 1),
         )?;
         Ok((out0, out1, out2))
     }
@@ -659,9 +671,22 @@ impl CommandBatch<'_> {
             k: to_u32(width, "width")?,
             epsilon,
         };
-        let groups = n0.max(n1).div_ceil(8);
+        let rows =
+            if self.context.matmul_backend() == MatmulBackend::Auto && self.context.is_m4_pro() {
+                self.context
+                    .fused_norm_matvec_rows_for_shape([n0, n1, 0], width)
+            } else {
+                2
+            };
+        let simdgroups = if rows == 1 { 8 } else { 4 };
+        let groups = n0.max(n1).div_ceil(rows * simdgroups);
         self.dispatch(
-            "matvec2_add_rms_f16",
+            match rows {
+                1 => "matvec2_add_rms_r1_f16",
+                4 => "matvec2_add_rms_r4_f16",
+                8 => "matvec2_add_rms_r8_f16",
+                _ => "matvec2_add_rms_f16",
+            },
             &[
                 left,
                 right,
@@ -673,8 +698,12 @@ impl CommandBatch<'_> {
                 &out1,
             ],
             &params,
-            size(checked_mul(groups, 128, "add rms matmul2 grid")?, 1, 1),
-            size(128, 1, 1),
+            size(
+                checked_mul(groups, simdgroups * 32, "add rms matmul2 grid")?,
+                1,
+                1,
+            ),
+            size(simdgroups * 32, 1, 1),
         )?;
         Ok((residual, out0, out1))
     }

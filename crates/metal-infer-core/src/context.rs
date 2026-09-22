@@ -20,6 +20,7 @@ use objc2_metal::{
     MTLLibrary, MTLResourceOptions, MTLStorageMode,
 };
 
+use crate::gemv_dispatch::{self, DecodeGemvConfig};
 use crate::{AttentionConfig, CoreError, DType, Tensor};
 
 const SHADERS: &str = include_str!("kernels/transformer.metal");
@@ -140,11 +141,6 @@ impl Default for AutoMatvecRows {
     }
 }
 
-// Measured with distinct FP16 matrices in a >512 MiB rotating working set.
-// Add entries only after the same GPU measurement on the target device.
-const SINGLE_GEMV_SHAPE_CONFIGS: &[(&str, usize, usize, usize)] =
-    &[("Apple M4 Pro", 1024, 1024, 1)];
-
 impl MatmulBackend {
     pub const fn name(self) -> &'static str {
         match self {
@@ -196,6 +192,8 @@ pub struct MetalContext {
     auto_matvec_enabled: Rc<Cell<bool>>,
     auto_matvec_split_k: Rc<Cell<usize>>,
     auto_matvec_half8: Rc<Cell<bool>>,
+    fused_norm_matvec_rows: Rc<Cell<(usize, usize)>>,
+    decode_gemv_config: Rc<Cell<Option<DecodeGemvConfig>>>,
     profile_tick_nanoseconds: Rc<Cell<Option<f64>>>,
     kernel_profiles: Rc<RefCell<Vec<KernelDispatchProfile>>>,
     flash_decode_blocks: Rc<RefCell<Vec<(usize, usize, usize)>>>,
@@ -226,6 +224,8 @@ impl MetalContext {
             auto_matvec_enabled: Rc::new(Cell::new(true)),
             auto_matvec_split_k: Rc::new(Cell::new(1)),
             auto_matvec_half8: Rc::new(Cell::new(false)),
+            fused_norm_matvec_rows: Rc::new(Cell::new((2, 2))),
+            decode_gemv_config: Rc::new(Cell::new(None)),
             profile_tick_nanoseconds: Rc::new(Cell::new(None)),
             kernel_profiles: Rc::new(RefCell::new(Vec::new())),
             flash_decode_blocks: Rc::new(RefCell::new(Vec::new())),
@@ -345,21 +345,38 @@ impl MetalContext {
         }
     }
 
-    pub(crate) fn auto_single_matvec_rows(
+    pub fn set_decode_gemv_config(
+        &self,
+        config: DecodeGemvConfig,
+    ) {
+        self.decode_gemv_config.set(Some(config));
+    }
+
+    pub fn decode_gemv_config(&self) -> Option<DecodeGemvConfig> {
+        self.decode_gemv_config.get()
+    }
+
+    pub(crate) fn auto_matvec_rows_for_shape(
         &self,
         n: usize,
         k: usize,
+        vocabulary: bool,
     ) -> usize {
         let selected = self.auto_matvec_rows();
-        if self.manual_auto_matvec_rows.get() || !self.auto_matvec_enabled.get() {
-            return selected.single;
-        }
-        SINGLE_GEMV_SHAPE_CONFIGS
-            .iter()
-            .find(|&&(device, shape_n, shape_k, _)| {
-                device == self.device_name && shape_n == n && shape_k == k
-            })
-            .map_or(selected.single, |&(_, _, _, rows)| rows)
+        let fallback = if vocabulary {
+            selected.vocab
+        } else {
+            selected.single
+        };
+        gemv_dispatch::single_rows(
+            &self.device_name,
+            n,
+            k,
+            fallback,
+            self.decode_gemv_config.get(),
+            self.manual_auto_matvec_rows.get(),
+            self.auto_matvec_enabled.get(),
+        )
     }
 
     pub fn set_auto_matvec_enabled(
@@ -395,6 +412,42 @@ impl MetalContext {
 
     pub(crate) fn auto_matvec_half8(&self) -> bool {
         self.auto_matvec_half8.get()
+    }
+
+    /// Rows per SIMD group for the decode-only fused RMSNorm projections.
+    /// The first value selects QKV and the second selects gate/up.
+    pub fn set_fused_norm_matvec_rows(
+        &self,
+        qkv: usize,
+        gate_up: usize,
+    ) -> Result<(), CoreError> {
+        if !matches!(qkv, 1 | 2 | 4 | 8) || !matches!(gate_up, 1 | 2 | 4 | 8) {
+            return Err(CoreError::Shape(
+                "fused norm matvec rows must be 1, 2, 4, or 8".into(),
+            ));
+        }
+        self.fused_norm_matvec_rows.set((qkv, gate_up));
+        Ok(())
+    }
+
+    pub(crate) fn fused_norm_matvec_rows_for_shape(
+        &self,
+        widths: [usize; 3],
+        k: usize,
+    ) -> usize {
+        let [_, _, n2] = widths;
+        let fallback = if n2 == 0 {
+            self.fused_norm_matvec_rows.get().1
+        } else {
+            self.fused_norm_matvec_rows.get().0
+        };
+        gemv_dispatch::fused_norm_rows(
+            &self.device_name,
+            widths,
+            k,
+            fallback,
+            self.decode_gemv_config.get(),
+        )
     }
 
     pub fn set_auto_matvec_rows(

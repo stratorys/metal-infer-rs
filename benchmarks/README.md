@@ -115,6 +115,25 @@ more families explicitly with `--fuse-qkv`, `--fuse-gate-up`,
 both `metal-infer-bench model` and `benchmarks/compare.py model`; the inference
 CLI is unchanged.
 
+On Apple M4 Pro, Qwen3 selects the measured decode GEMV row counts by default
+for the Qwen3-0.6B projection shapes. The model benchmark reports
+`decode_gemv_config: "tuned"` in JSON. To compare the previous and current
+selection with the same binary and workload, run the model benchmark twice,
+changing only `--gemv-config`:
+
+```sh
+for config in baseline tuned; do
+  target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
+    --prompt 512 --generate 128 --warmup 1 --iterations 5 \
+    --fuse-qkv --fuse-gate-up --fuse-add-rms-norm --fuse-qk-rope-cache \
+    --gemv-config "$config" --format json
+done
+```
+
+`benchmarks/compare.py model` uses the tuned default on M4 Pro. Its MLX-LM
+result is indicative: the two existing model benchmarks use different token
+sequences, despite matching the checkpoint and prompt/decode lengths.
+
 Choose the matrix implementation with `--matmul-backend auto`,
 `--matmul-backend reference-msl`, `--matmul-backend native-msl`, or
 `--matmul-backend mps`. The comparison pins

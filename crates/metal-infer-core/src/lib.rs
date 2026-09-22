@@ -2,6 +2,7 @@
 
 mod context;
 mod error;
+mod gemv_dispatch;
 mod ops;
 mod tensor;
 
@@ -9,5 +10,6 @@ pub use context::{
     CommandBatch, DispatchStats, KernelDispatchProfile, MatmulBackend, MetalContext,
 };
 pub use error::CoreError;
+pub use gemv_dispatch::DecodeGemvConfig;
 pub use ops::{AttentionConfig, AttentionKind, QkNormRopeCacheConfig};
 pub use tensor::{DType, Tensor};

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use metal_infer_cli::CliError;
 use metal_infer_core::{
-    AttentionConfig, AttentionKind, DispatchStats, KernelDispatchProfile, MatmulBackend,
-    MetalContext, QkNormRopeCacheConfig, Tensor,
+    AttentionConfig, AttentionKind, DecodeGemvConfig, DispatchStats, KernelDispatchProfile,
+    MatmulBackend, MetalContext, QkNormRopeCacheConfig, Tensor,
 };
 use metal_infer_models::{FusionOptions, KvCache, Qwen3Model};
 use serde::Serialize;
@@ -123,6 +123,15 @@ enum Command {
         fuse_add_rms_norm: bool,
         #[arg(long)]
         fuse_qk_rope_cache: bool,
+        /// Rows per SIMD group in the fused decode QKV plus RMSNorm kernel.
+        #[arg(long)]
+        qkv_rms_rows: Option<usize>,
+        /// Rows per SIMD group in the fused decode gate/up plus add/RMSNorm kernel.
+        #[arg(long)]
+        gate_up_add_rms_rows: Option<usize>,
+        /// Fixed decode GEMV configuration for a same-binary A/B comparison.
+        #[arg(long, value_enum)]
+        gemv_config: Option<DecodeGemvConfigArgument>,
         #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
         matmul_backend: MatmulBackendArgument,
         #[arg(long)]
@@ -156,9 +165,26 @@ impl From<MatmulBackendArgument> for MatmulBackend {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum DecodeGemvConfigArgument {
+    Baseline,
+    Tuned,
+}
+
+impl From<DecodeGemvConfigArgument> for DecodeGemvConfig {
+    fn from(value: DecodeGemvConfigArgument) -> Self {
+        match value {
+            DecodeGemvConfigArgument::Baseline => Self::Baseline,
+            DecodeGemvConfigArgument::Tuned => Self::Tuned,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum FusionKind {
     Qkv,
     GateUp,
+    QkvRms,
+    GateUpAddRms,
     AddRmsNorm,
     QkRopeCache,
 }
@@ -191,6 +217,8 @@ struct Report {
     throughput_unit: Option<&'static str>,
     allocated_bytes: usize,
     matmul_backend: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decode_gemv_config: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allocation_growth_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,13 +462,23 @@ fn run() -> Result<(), CliError> {
             context.set_matmul_backend(matmul_backend.into());
             if let Some(rows) = rows {
                 if matmul_backend != MatmulBackendArgument::Auto
-                    || !matches!(kind, FusionKind::Qkv | FusionKind::GateUp)
+                    || !matches!(
+                        kind,
+                        FusionKind::Qkv
+                            | FusionKind::GateUp
+                            | FusionKind::QkvRms
+                            | FusionKind::GateUpAddRms
+                    )
                 {
                     return Err(CliError::InvalidArguments(
                         "fusion --rows requires auto QKV or gate-up GEMV".into(),
                     ));
                 }
-                context.set_auto_matvec_rows(4, rows, rows, 0)?;
+                if matches!(kind, FusionKind::QkvRms | FusionKind::GateUpAddRms) {
+                    context.set_fused_norm_matvec_rows(rows, rows)?;
+                } else {
+                    context.set_auto_matvec_rows(4, rows, rows, 0)?;
+                }
             }
             run_fusion_benchmark(
                 &context,
@@ -507,6 +545,9 @@ fn run() -> Result<(), CliError> {
             fuse_gate_up,
             fuse_add_rms_norm,
             fuse_qk_rope_cache,
+            qkv_rms_rows,
+            gate_up_add_rms_rows,
+            gemv_config,
             matmul_backend,
             profile_kernels,
         } => {
@@ -515,8 +556,36 @@ fn run() -> Result<(), CliError> {
                     "model prompt, generate, and iterations must be greater than zero".into(),
                 ));
             }
+            if gemv_config.is_some() && (qkv_rms_rows.is_some() || gate_up_add_rms_rows.is_some()) {
+                return Err(CliError::InvalidArguments(
+                    "--gemv-config cannot be combined with individual fused norm row overrides"
+                        .into(),
+                ));
+            }
+            if gemv_config.is_some()
+                && (matmul_backend != MatmulBackendArgument::Auto
+                    || context.device_name() != "Apple M4 Pro")
+            {
+                return Err(CliError::InvalidArguments(
+                    "--gemv-config requires auto matmul on Apple M4 Pro".into(),
+                ));
+            }
             context.set_matmul_backend(matmul_backend.into());
             let mut model = Qwen3Model::load(&model, &context)?;
+            if let Some(config) = gemv_config {
+                context.set_decode_gemv_config(config.into());
+            }
+            if qkv_rms_rows.is_some() || gate_up_add_rms_rows.is_some() {
+                if matmul_backend != MatmulBackendArgument::Auto {
+                    return Err(CliError::InvalidArguments(
+                        "fused norm row overrides require --matmul-backend auto".into(),
+                    ));
+                }
+                context.set_fused_norm_matvec_rows(
+                    qkv_rms_rows.unwrap_or(2),
+                    gate_up_add_rms_rows.unwrap_or(2),
+                )?;
+            }
             let fusion_options = FusionOptions {
                 qkv: fuse_qkv,
                 gate_up: fuse_gate_up,
@@ -558,7 +627,7 @@ fn run() -> Result<(), CliError> {
                 prefill: kernel_phase_profile(&prefill_samples, prefill_kernels),
                 decode: kernel_phase_profile(&decode_samples, decode_kernels),
             });
-            model_report(
+            let mut report = model_report(
                 &context,
                 fusion_options,
                 allocated_before_measurement,
@@ -567,7 +636,9 @@ fn run() -> Result<(), CliError> {
                 prefill_samples,
                 decode_samples,
                 kernel_profile,
-            )
+            );
+            report.decode_gemv_config = context.decode_gemv_config().map(DecodeGemvConfig::name);
+            report
         }
     };
     match arguments.format {
@@ -908,6 +979,7 @@ fn run_attention_benchmark(
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
+        decode_gemv_config: None,
         allocation_growth_bytes: None,
         fusions: None,
         comparison: None,
@@ -1048,23 +1120,34 @@ fn run_fusion_benchmark(
         ));
     }
     if let Some(copies) = rotate {
-        if copies == 0 || !matches!(kind, FusionKind::Qkv | FusionKind::GateUp) {
+        if copies == 0
+            || !matches!(
+                kind,
+                FusionKind::Qkv
+                    | FusionKind::GateUp
+                    | FusionKind::QkvRms
+                    | FusionKind::GateUpAddRms
+            )
+        {
             return Err(CliError::InvalidArguments(
-                "fusion --rotate requires a positive copy count and QKV or gate-up".into(),
+                "fusion --rotate requires a positive copy count and a projection kind".into(),
             ));
         }
         let widths = match kind {
-            FusionKind::Qkv => vec![
+            FusionKind::Qkv | FusionKind::QkvRms => vec![
                 query_heads * head_dim,
                 kv_heads * head_dim,
                 kv_heads * head_dim,
             ],
-            FusionKind::GateUp => vec![intermediate, intermediate],
+            FusionKind::GateUp | FusionKind::GateUpAddRms => vec![intermediate, intermediate],
             FusionKind::AddRmsNorm | FusionKind::QkRopeCache => unreachable!(),
         };
         return run_rotated_fusion(context, kind, k, &widths, copies, iterations, warmup, rows);
     }
     match kind {
+        FusionKind::QkvRms | FusionKind::GateUpAddRms => Err(CliError::InvalidArguments(
+            "fused norm projection benchmarks require --rotate".into(),
+        )),
         FusionKind::Qkv => {
             let input = context.tensor_f16(&vec![0.01; k], &[1, k])?;
             let query_width = query_heads * head_dim;
@@ -1186,6 +1269,8 @@ fn run_rotated_fusion(
         .checked_mul(copies)
         .ok_or_else(|| CliError::InvalidArguments("rotated working set overflow".into()))?;
     let input = context.tensor_f16(&vec![0.01; k], &[1, k])?;
+    let right = context.tensor_f16(&vec![0.02; k], &[1, k])?;
+    let norm = context.tensor_f16(&vec![1.0; k], &[k])?;
     let mut weights = Vec::with_capacity(copies);
     for _ in 0..copies {
         let mut projections = Vec::with_capacity(widths.len());
@@ -1201,6 +1286,37 @@ fn run_rotated_fusion(
         let mut outputs = Vec::with_capacity(copies * widths.len());
         for projections in &weights {
             match (kind, fused) {
+                (FusionKind::QkvRms, true) => {
+                    let query = projections.first().expect("QKV widths validated");
+                    let key = projections.get(1).expect("QKV widths validated");
+                    let value = projections.get(2).expect("QKV widths validated");
+                    let (a, b, c) =
+                        batch.rms_norm_matmul3(&input, &norm, query, key, value, 1.0e-6)?;
+                    outputs.extend([a, b, c]);
+                }
+                (FusionKind::QkvRms, false) => {
+                    let normalized = batch.rms_norm(&input, &norm, 1.0e-6)?;
+                    let query = projections.first().expect("QKV widths validated");
+                    let key = projections.get(1).expect("QKV widths validated");
+                    let value = projections.get(2).expect("QKV widths validated");
+                    let (a, b, c) = batch.matmul3(&normalized, query, key, value)?;
+                    outputs.extend([a, b, c]);
+                }
+                (FusionKind::GateUpAddRms, true) => {
+                    let gate = projections.first().expect("gate-up widths validated");
+                    let up = projections.get(1).expect("gate-up widths validated");
+                    let (residual, a, b) =
+                        batch.add_rms_norm_matmul2(&input, &right, &norm, gate, up, 1.0e-6)?;
+                    outputs.extend([residual, a, b]);
+                }
+                (FusionKind::GateUpAddRms, false) => {
+                    let (residual, normalized) =
+                        batch.add_rms_norm(&input, &right, &norm, 1.0e-6)?;
+                    let gate = projections.first().expect("gate-up widths validated");
+                    let up = projections.get(1).expect("gate-up widths validated");
+                    let (a, b) = batch.matmul2(&normalized, gate, up)?;
+                    outputs.extend([residual, a, b]);
+                }
                 (FusionKind::Qkv, true) => {
                     let (q, kv) = projections.split_first().expect("QKV widths validated");
                     let key = kv.first().expect("QKV widths validated");
@@ -1311,6 +1427,7 @@ fn measure_fusion_pair<E>(
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
+        decode_gemv_config: None,
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()
@@ -1471,6 +1588,7 @@ fn report(
         throughput_unit,
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
+        decode_gemv_config: None,
         allocation_growth_bytes: None,
         fusions: None,
         comparison: None,
@@ -1611,6 +1729,7 @@ fn model_report(
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
+        decode_gemv_config: None,
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()

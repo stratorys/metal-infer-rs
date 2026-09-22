@@ -344,6 +344,35 @@ fn fused_decode_norm_projections_match_separate_ops() -> Result<(), CoreError> {
     );
     assert_close(&actual_gate.to_f32_vec()?, &expected_gate.to_f32_vec()?);
     assert_close(&actual_up.to_f32_vec()?, &expected_up.to_f32_vec()?);
+    if context.device_name() == "Apple M4 Pro" {
+        for rows in [1, 4, 8] {
+            context.set_fused_norm_matvec_rows(rows, rows)?;
+            let mut batch = context.begin_batch()?;
+            let (query, key, value) = batch.rms_norm_matmul3(
+                &input,
+                &norm_weight,
+                &weight0,
+                &weight1,
+                &weight2,
+                1.0e-6,
+            )?;
+            let (residual, gate, up) = batch.add_rms_norm_matmul2(
+                &input,
+                &right,
+                &norm_weight,
+                &weight0,
+                &weight1,
+                1.0e-6,
+            )?;
+            batch.finish()?;
+            assert_close(&query.to_f32_vec()?, &expected0.to_f32_vec()?);
+            assert_close(&key.to_f32_vec()?, &expected1.to_f32_vec()?);
+            assert_close(&value.to_f32_vec()?, &expected2.to_f32_vec()?);
+            assert_close(&residual.to_f32_vec()?, &expected_residual.to_f32_vec()?);
+            assert_close(&gate.to_f32_vec()?, &expected_gate.to_f32_vec()?);
+            assert_close(&up.to_f32_vec()?, &expected_up.to_f32_vec()?);
+        }
+    }
     Ok(())
 }
 

@@ -23,6 +23,8 @@ import report as benchmark_report
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SUITE_PATH = ROOT / "benchmarks" / "suite.json"
+MLX_LM_VERSION = "0.31.3"
+MLX_VERSION = "0.32.2"
 
 
 class BenchmarkError(RuntimeError):
@@ -134,6 +136,11 @@ def arguments() -> argparse.Namespace:
     model.add_argument("--fuse-gate-up", action="store_true")
     model.add_argument("--fuse-add-rms-norm", action="store_true")
     model.add_argument("--fuse-qk-rope-cache", action="store_true")
+    model.add_argument(
+        "--matmul-backend",
+        choices=("auto", "reference-msl", "native-msl", "mps"),
+        default="auto",
+    )
     return parser.parse_args()
 
 
@@ -268,6 +275,8 @@ def parse_mlx_model(output: str, prompt: int, generate: int) -> dict[str, Any]:
             "tokens_per_second": float(generation_tps),
         },
         "peak_memory_gb": float(peak_memory),
+        "mlx_lm_version": MLX_LM_VERSION,
+        "mlx_version": MLX_VERSION,
     }
 
 
@@ -345,6 +354,8 @@ def model_results(
             str(iterations),
             "--warmup",
             str(warmup),
+            "--matmul-backend",
+            args.matmul_backend,
             *fusion_flags,
             "--format",
             "json",
@@ -363,7 +374,9 @@ def model_results(
         [
             "uvx",
             "--from",
-            "mlx-lm",
+            f"mlx-lm=={MLX_LM_VERSION}",
+            "--with",
+            f"mlx=={MLX_VERSION}",
             "mlx_lm.benchmark",
             "--model",
             args.mlx_model,

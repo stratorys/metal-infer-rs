@@ -34,6 +34,7 @@ pub struct DispatchStats {
 pub enum MatmulBackend {
     #[default]
     Auto,
+    ReferenceMsl,
     NativeMsl,
     Mps,
 }
@@ -42,6 +43,7 @@ impl MatmulBackend {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::ReferenceMsl => "reference-msl",
             Self::NativeMsl => "native-msl",
             Self::Mps => "mps",
         }

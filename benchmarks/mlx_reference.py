@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mlx>=0.30"]
+# dependencies = ["mlx==0.32.2"]
 # ///
 """Manual MLX baseline for metal-infer's row-major FP16 matmul benchmark."""
 

@@ -63,6 +63,11 @@ more families explicitly with `--fuse-qkv`, `--fuse-gate-up`,
 both `metal-infer-bench model` and `benchmarks/compare.py model`; the inference
 CLI is unchanged.
 
+Choose the matrix implementation with `--matmul-backend auto`,
+`--matmul-backend reference-msl`, `--matmul-backend native-msl`, or
+`--matmul-backend mps`. The comparison pins
+`mlx-lm==0.31.3` and `mlx==0.32.2` so successive reports use a stable baseline.
+
 ## Run the fusion microbenchmarks
 
 Compare each fused kernel with its individual operations using Qwen3-0.6B

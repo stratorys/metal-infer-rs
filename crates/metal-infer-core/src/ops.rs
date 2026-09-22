@@ -215,7 +215,8 @@ impl CommandBatch<'_> {
             padding: 0,
         };
         let backend = self.context.matmul_backend();
-        if backend == MatmulBackend::Mps || (backend == MatmulBackend::Auto && m > 1) {
+        let simdgroup_compatible = m % 32 == 0 && n % 32 == 0 && k % 16 == 0;
+        if backend == MatmulBackend::Mps {
             self.matmul_mps(input, weight, &out, m, n, k)?;
         } else if m == 1 {
             let outputs_per_threadgroup = 32;
@@ -226,6 +227,14 @@ impl CommandBatch<'_> {
                 &params,
                 size(checked_mul(groups, 256, "matvec grid")?, 1, 1),
                 size(256, 1, 1),
+            )?;
+        } else if backend == MatmulBackend::NativeMsl && simdgroup_compatible {
+            self.dispatch(
+                "matmul_simd_f16",
+                &[input, weight, &out],
+                &params,
+                size(checked_mul(n / 32, 128, "simd matmul grid")?, m / 32, 1),
+                size(128, 1, 1),
             )?;
         } else {
             self.dispatch(

@@ -1,5 +1,5 @@
 use metal_infer_core::{
-    AttentionConfig, AttentionKind, CoreError, MetalContext, QkNormRopeCacheConfig,
+    AttentionConfig, AttentionKind, CoreError, MatmulBackend, MetalContext, QkNormRopeCacheConfig,
 };
 
 const TOLERANCE: f32 = 0.02;
@@ -12,6 +12,46 @@ fn matmul_matches_cpu() -> Result<(), CoreError> {
     let weight = context.tensor_f16(&[5.0, 6.0, 7.0, 8.0], &[2, 2])?;
     let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
     assert_close(&actual, &[17.0, 23.0, 39.0, 53.0]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn mps_matmul_matches_native_msl() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let input_values: Vec<f32> = (0..17 * 33)
+        .map(|index| (index % 19) as f32 / 19.0 - 0.5)
+        .collect();
+    let weight_values: Vec<f32> = (0..29 * 33)
+        .map(|index| (index % 23) as f32 / 23.0 - 0.5)
+        .collect();
+    let input = context.tensor_f16(&input_values, &[17, 33])?;
+    let weight = context.tensor_f16(&weight_values, &[29, 33])?;
+    context.set_matmul_backend(MatmulBackend::NativeMsl);
+    let expected = context.matmul(&input, &weight)?.to_f32_vec()?;
+    context.set_matmul_backend(MatmulBackend::Mps);
+    let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
+    assert_close(&actual, &expected);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn simdgroup_matmul_matches_reference_msl() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let input_values: Vec<f32> = (0..32 * 32)
+        .map(|index| (index % 19) as f32 / 19.0 - 0.5)
+        .collect();
+    let weight_values: Vec<f32> = (0..32 * 32)
+        .map(|index| (index % 23) as f32 / 23.0 - 0.5)
+        .collect();
+    let input = context.tensor_f16(&input_values, &[32, 32])?;
+    let weight = context.tensor_f16(&weight_values, &[32, 32])?;
+    context.set_matmul_backend(MatmulBackend::ReferenceMsl);
+    let expected = context.matmul(&input, &weight)?.to_f32_vec()?;
+    context.set_matmul_backend(MatmulBackend::NativeMsl);
+    let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
+    assert_close(&actual, &expected);
     Ok(())
 }
 

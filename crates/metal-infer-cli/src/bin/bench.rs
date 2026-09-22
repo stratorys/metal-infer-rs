@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use metal_infer_cli::CliError;
 use metal_infer_core::{
-    AttentionConfig, AttentionKind, DispatchStats, MetalContext, QkNormRopeCacheConfig, Tensor,
+    AttentionConfig, AttentionKind, DispatchStats, MatmulBackend, MetalContext,
+    QkNormRopeCacheConfig, Tensor,
 };
 use metal_infer_models::{FusionOptions, KvCache, Qwen3Model};
 use serde::Serialize;
@@ -31,6 +32,8 @@ enum Command {
         iterations: usize,
         #[arg(long, default_value_t = 3)]
         warmup: usize,
+        #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
+        matmul_backend: MatmulBackendArgument,
     },
     Fusion {
         #[arg(long, value_enum)]
@@ -99,6 +102,8 @@ enum Command {
         fuse_add_rms_norm: bool,
         #[arg(long)]
         fuse_qk_rope_cache: bool,
+        #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
+        matmul_backend: MatmulBackendArgument,
     },
 }
 
@@ -106,6 +111,25 @@ enum Command {
 enum Format {
     Table,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MatmulBackendArgument {
+    Auto,
+    ReferenceMsl,
+    NativeMsl,
+    Mps,
+}
+
+impl From<MatmulBackendArgument> for MatmulBackend {
+    fn from(value: MatmulBackendArgument) -> Self {
+        match value {
+            MatmulBackendArgument::Auto => Self::Auto,
+            MatmulBackendArgument::ReferenceMsl => Self::ReferenceMsl,
+            MatmulBackendArgument::NativeMsl => Self::NativeMsl,
+            MatmulBackendArgument::Mps => Self::Mps,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -141,6 +165,7 @@ struct Report {
     throughput: Option<f64>,
     throughput_unit: Option<&'static str>,
     allocated_bytes: usize,
+    matmul_backend: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     allocation_growth_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,8 +301,10 @@ fn run() -> Result<(), CliError> {
             k,
             iterations,
             warmup,
+            matmul_backend,
         } => {
             require_iterations(iterations)?;
+            context.set_matmul_backend(matmul_backend.into());
             let input = context.tensor_f16(&vec![0.01; m * k], &[m, k])?;
             let weight = context.tensor_f16(&vec![0.02; n * k], &[n, k])?;
             for _ in 0..warmup {
@@ -371,12 +398,14 @@ fn run() -> Result<(), CliError> {
             fuse_gate_up,
             fuse_add_rms_norm,
             fuse_qk_rope_cache,
+            matmul_backend,
         } => {
             if prompt == 0 || generate == 0 || iterations == 0 {
                 return Err(CliError::InvalidArguments(
                     "model prompt, generate, and iterations must be greater than zero".into(),
                 ));
             }
+            context.set_matmul_backend(matmul_backend.into());
             let mut model = Qwen3Model::load(&model, &context)?;
             let fusion_options = FusionOptions {
                 qkv: fuse_qkv,
@@ -415,6 +444,7 @@ fn run() -> Result<(), CliError> {
         Format::Table => {
             println!("benchmark: {}", report.benchmark);
             println!("device: {}", report.device);
+            println!("matmul backend: {}", report.matmul_backend);
             println!(
                 "mean: {:.3} ms, median: {:.3} ms, p95: {:.3} ms",
                 report.mean_ms, report.median_ms, report.p95_ms
@@ -627,6 +657,7 @@ fn run_attention_benchmark(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
+        matmul_backend: context.matmul_backend().name(),
         allocation_growth_bytes: None,
         fusions: None,
         comparison: None,
@@ -908,6 +939,7 @@ fn measure_fusion_pair<E>(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
+        matmul_backend: context.matmul_backend().name(),
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()
@@ -1066,6 +1098,7 @@ fn report(
         throughput,
         throughput_unit,
         allocated_bytes: context.allocated_bytes(),
+        matmul_backend: context.matmul_backend().name(),
         allocation_growth_bytes: None,
         fusions: None,
         comparison: None,
@@ -1126,6 +1159,7 @@ fn model_report(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
+        matmul_backend: context.matmul_backend().name(),
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()

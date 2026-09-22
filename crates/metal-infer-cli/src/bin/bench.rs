@@ -11,6 +11,9 @@ use metal_infer_core::{
 use metal_infer_models::{FusionOptions, KvCache, Qwen3Model};
 use serde::Serialize;
 
+#[path = "inference.rs"]
+mod inference;
+
 #[derive(Parser)]
 #[command(name = "metal-infer-bench", about = "Metal transformer benchmarks")]
 struct Arguments {
@@ -22,6 +25,19 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Measure an actual autoregressive path or an identical forced token trace.
+    Inference {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        workload: PathBuf,
+        #[arg(long, value_enum)]
+        mode: inference::InferenceMode,
+        #[arg(long, default_value_t = 10)]
+        iterations: usize,
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+    },
     Kernel {
         #[arg(long, default_value_t = 512)]
         m: usize,
@@ -380,8 +396,26 @@ fn main() {
 
 fn run() -> Result<(), CliError> {
     let arguments = Arguments::parse();
+    if let Command::Inference {
+        model,
+        workload,
+        mode,
+        iterations,
+        warmup,
+    } = &arguments.command
+    {
+        return inference::run(
+            model,
+            workload,
+            *mode,
+            *iterations,
+            *warmup,
+            arguments.format,
+        );
+    }
     let context = MetalContext::new()?;
     let report = match arguments.command {
+        Command::Inference { .. } => unreachable!("inference is handled before creating a context"),
         Command::Kernel {
             m,
             n,

@@ -916,6 +916,146 @@ kernel void attention_decode_f16(device const half *q [[buffer(0)]],
   }
 }
 
+kernel void attention_flash_decode_partial_f16(
+    device const half *q [[buffer(0)]], device const half *k [[buffer(1)]],
+    device const half *v [[buffer(2)]], device float *scratch [[buffer(3)]],
+    constant AttentionParams &p [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint block_keys = 64;
+  constexpr uint tile_keys = 8;
+  uint available = p.causal != 0 && p.query_offset < p.kv_length
+                       ? p.query_offset + 1
+                       : p.kv_length;
+  uint blocks = (available - 1) / block_keys + 1;
+  uint kvh = group / blocks;
+  uint block = group - kvh * blocks;
+  uint first = block * block_keys;
+  uint block_length = min(block_keys, available - first);
+  uint stride = p.head_dim + 2;
+  float scale = rsqrt(float(p.head_dim));
+
+  threadgroup float partial_max[2][tile_keys];
+  threadgroup float partial_sum[2][tile_keys];
+  threadgroup float partial_values[2][tile_keys][256];
+  float running_max[2] = {-INFINITY, -INFINITY};
+  float running_sum[2] = {0.0f, 0.0f};
+  float accumulator[2][8];
+  for (uint head = 0; head < 2; ++head)
+    for (uint component = 0; component < 8; ++component)
+      accumulator[head][component] = 0.0f;
+
+  for (uint tile_key = simdgroup_index; tile_key < block_length;
+       tile_key += tile_keys) {
+    uint source = ((first + tile_key) * p.kv_heads + kvh) * p.head_dim;
+    float key_values[8];
+    float value_values[8];
+    for (uint component = 0; component < 8; ++component) {
+      uint d = lane + component * 32;
+      key_values[component] = d < p.head_dim ? float(k[source + d]) : 0.0f;
+      value_values[component] = d < p.head_dim ? float(v[source + d]) : 0.0f;
+    }
+    for (uint head = 0; head < 2; ++head) {
+      uint qh = kvh * 2 + head;
+      float dot = 0.0f;
+      for (uint component = 0; component < 8; ++component) {
+        uint d = lane + component * 32;
+        if (d < p.head_dim)
+          dot += float(q[qh * p.head_dim + d]) * key_values[component];
+      }
+      float score = simd_sum(dot) * scale;
+      float next_max = max(running_max[head], score);
+      float previous_scale = exp(running_max[head] - next_max);
+      float current_scale = exp(score - next_max);
+      for (uint component = 0; component < 8; ++component) {
+        uint d = lane + component * 32;
+        if (d < p.head_dim) {
+          accumulator[head][component] =
+              accumulator[head][component] * previous_scale +
+              current_scale * value_values[component];
+        }
+      }
+      running_sum[head] = running_sum[head] * previous_scale + current_scale;
+      running_max[head] = next_max;
+    }
+  }
+
+  for (uint head = 0; head < 2; ++head) {
+    if (lane == 0) {
+      partial_max[head][simdgroup_index] = running_max[head];
+      partial_sum[head][simdgroup_index] = running_sum[head];
+    }
+    for (uint component = 0; component < 8; ++component) {
+      uint d = lane + component * 32;
+      if (d < p.head_dim)
+        partial_values[head][simdgroup_index][d] = accumulator[head][component];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (simdgroup_index == 0) {
+    for (uint head = 0; head < 2; ++head) {
+      float maximum = -INFINITY;
+      for (uint index = 0; index < tile_keys; ++index)
+        maximum = max(maximum, partial_max[head][index]);
+      float denominator = 0.0f;
+      for (uint index = 0; index < tile_keys; ++index)
+        denominator +=
+            partial_sum[head][index] * exp(partial_max[head][index] - maximum);
+      uint destination = ((kvh * blocks + block) * 2 + head) * stride;
+      if (lane == 0) {
+        scratch[destination] = maximum;
+        scratch[destination + 1] = denominator;
+      }
+      for (uint component = 0; component < 8; ++component) {
+        uint d = lane + component * 32;
+        if (d < p.head_dim) {
+          float numerator = 0.0f;
+          for (uint index = 0; index < tile_keys; ++index)
+            numerator += partial_values[head][index][d] *
+                         exp(partial_max[head][index] - maximum);
+          scratch[destination + 2 + d] = numerator;
+        }
+      }
+    }
+  }
+}
+
+kernel void
+attention_flash_decode_reduce_f16(device const float *scratch [[buffer(0)]],
+                                  device half *out [[buffer(1)]],
+                                  constant AttentionParams &p [[buffer(2)]],
+                                  uint qh [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_index_in_threadgroup]]) {
+  constexpr uint block_keys = 64;
+  uint available = p.causal != 0 && p.query_offset < p.kv_length
+                       ? p.query_offset + 1
+                       : p.kv_length;
+  uint blocks = (available - 1) / block_keys + 1;
+  uint kvh = qh / 2;
+  uint head = qh - kvh * 2;
+  uint stride = p.head_dim + 2;
+  float maximum = -INFINITY;
+  for (uint block = 0; block < blocks; ++block) {
+    uint source = ((kvh * blocks + block) * 2 + head) * stride;
+    maximum = max(maximum, scratch[source]);
+  }
+  float denominator = 0.0f;
+  for (uint block = 0; block < blocks; ++block) {
+    uint source = ((kvh * blocks + block) * 2 + head) * stride;
+    denominator += scratch[source + 1] * exp(scratch[source] - maximum);
+  }
+  for (uint d = lane; d < p.head_dim; d += 32) {
+    float numerator = 0.0f;
+    for (uint block = 0; block < blocks; ++block) {
+      uint source = ((kvh * blocks + block) * 2 + head) * stride;
+      numerator += scratch[source + 2 + d] * exp(scratch[source] - maximum);
+    }
+    out[qh * p.head_dim + d] = half(numerator / denominator);
+  }
+}
+
 kernel void copy_kv_f16(device const half *source [[buffer(0)]],
                         device half *cache [[buffer(1)]],
                         constant uint3 &p [[buffer(2)]],

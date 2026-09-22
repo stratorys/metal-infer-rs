@@ -357,6 +357,81 @@ fn tiled_attention_matches_reference() -> Result<(), CoreError> {
         .attention(&query, &key, &value, config, AttentionKind::DecodeSplitKv)?
         .to_f32_vec()?;
     assert_close(&decode, &reference);
+    let flash = context
+        .attention(&query, &key, &value, config, AttentionKind::FlashDecode)?
+        .to_f32_vec()?;
+    assert_close(&flash, &reference);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn flash_decode_matches_reference_across_block_boundaries() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let query_values: Vec<f32> = (0..2 * 128)
+        .map(|index| if index % 3 == 0 { 2.0 } else { -2.0 })
+        .collect();
+    let query = context.tensor_f16(&query_values, &[1, 2, 128])?;
+    for length in [1, 63, 64, 65, 256, 640, 8192] {
+        let key_values: Vec<f32> = (0..length * 128)
+            .map(|index| if index % 7 < 3 { 2.0 } else { -2.0 })
+            .collect();
+        let value_values: Vec<f32> = (0..length * 128)
+            .map(|index| (index % 37) as f32 / 37.0 - 0.5)
+            .collect();
+        let key = context.tensor_f16(&key_values, &[length, 1, 128])?;
+        let value = context.tensor_f16(&value_values, &[length, 1, 128])?;
+        let config = AttentionConfig {
+            query_heads: 2,
+            kv_heads: 1,
+            head_dim: 128,
+            causal: true,
+            query_offset: length - 1,
+        };
+        let reference = context
+            .attention(&query, &key, &value, config, AttentionKind::Reference)?
+            .to_f32_vec()?;
+        let flash = context
+            .attention(&query, &key, &value, config, AttentionKind::FlashDecode)?
+            .to_f32_vec()?;
+        assert_close(&flash, &reference);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn flash_decode_matches_reference_for_multiple_gqa_groups_and_causal_limit() -> Result<(), CoreError>
+{
+    let context = MetalContext::new()?;
+    let query_values: Vec<f32> = (0..16 * 128)
+        .map(|index| (index % 41) as f32 / 41.0 - 0.5)
+        .collect();
+    let key_values: Vec<f32> = (0..65 * 8 * 128)
+        .map(|index| (index % 37) as f32 / 37.0 - 0.5)
+        .collect();
+    let value_values: Vec<f32> = (0..65 * 8 * 128)
+        .map(|index| (index % 29) as f32 / 29.0)
+        .collect();
+    let query = context.tensor_f16(&query_values, &[1, 16, 128])?;
+    let key = context.tensor_f16(&key_values, &[65, 8, 128])?;
+    let value = context.tensor_f16(&value_values, &[65, 8, 128])?;
+    for offset in [62, 64] {
+        let config = AttentionConfig {
+            query_heads: 16,
+            kv_heads: 8,
+            head_dim: 128,
+            causal: true,
+            query_offset: offset,
+        };
+        let reference = context
+            .attention(&query, &key, &value, config, AttentionKind::Reference)?
+            .to_f32_vec()?;
+        let flash = context
+            .attention(&query, &key, &value, config, AttentionKind::FlashDecode)?
+            .to_f32_vec()?;
+        assert_close(&flash, &reference);
+    }
     Ok(())
 }
 

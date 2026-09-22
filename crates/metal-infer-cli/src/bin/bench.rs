@@ -151,6 +151,7 @@ enum AttentionBenchmarkKind {
     Reference,
     Tiled,
     DecodeSplitKv,
+    FlashDecode,
 }
 
 #[derive(Serialize)]
@@ -263,6 +264,8 @@ struct AttentionComparison {
     tiled: AttentionVariantReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     decode_split_kv: Option<AttentionVariantReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flash_decode: Option<AttentionVariantReport>,
 }
 
 #[derive(Serialize)]
@@ -540,6 +543,9 @@ fn run() -> Result<(), CliError> {
                 if let Some(decode) = &comparison.decode_split_kv {
                     print_attention_variant(decode);
                 }
+                if let Some(decode) = &comparison.flash_decode {
+                    print_attention_variant(decode);
+                }
             }
             println!("Metal allocated: {} bytes", report.allocated_bytes);
         }
@@ -629,9 +635,18 @@ fn run_attention_benchmark(
             "attention query-heads must be divisible by kv-heads".into(),
         ));
     }
-    if matches!(selection, AttentionBenchmarkKind::DecodeSplitKv) && tokens != 1 {
+    if matches!(
+        selection,
+        AttentionBenchmarkKind::DecodeSplitKv | AttentionBenchmarkKind::FlashDecode
+    ) && tokens != 1
+    {
         return Err(CliError::InvalidArguments(
-            "decode-split-kv attention requires --tokens 1".into(),
+            "decode attention requires --tokens 1".into(),
+        ));
+    }
+    if matches!(selection, AttentionBenchmarkKind::FlashDecode) && query_heads / kv_heads != 2 {
+        return Err(CliError::InvalidArguments(
+            "flash decode requires two query heads per KV head".into(),
         ));
     }
 
@@ -702,7 +717,23 @@ fn run_attention_benchmark(
     } else {
         None
     };
-    let selected = decode_split_kv.as_ref().unwrap_or(&tiled);
+    let flash_decode = if tokens == 1 && query_heads / kv_heads == 2 {
+        Some(attention_variant_report(
+            case,
+            AttentionKind::FlashDecode,
+            &reference_output,
+            iterations,
+            warmup,
+        )?)
+    } else {
+        None
+    };
+    let selected = if length >= 256 {
+        flash_decode.as_ref().or(decode_split_kv.as_ref())
+    } else {
+        decode_split_kv.as_ref()
+    }
+    .unwrap_or(&tiled);
     Ok(Report {
         benchmark,
         device: context.device_name(),
@@ -724,6 +755,7 @@ fn run_attention_benchmark(
             reference,
             tiled,
             decode_split_kv,
+            flash_decode,
         }),
         prefill: None,
         decode: None,
@@ -789,6 +821,7 @@ const fn attention_kind(selection: AttentionBenchmarkKind) -> AttentionKind {
         AttentionBenchmarkKind::Reference => AttentionKind::Reference,
         AttentionBenchmarkKind::Tiled => AttentionKind::Tiled,
         AttentionBenchmarkKind::DecodeSplitKv => AttentionKind::DecodeSplitKv,
+        AttentionBenchmarkKind::FlashDecode => AttentionKind::FlashDecode,
         AttentionBenchmarkKind::Compare => AttentionKind::Reference,
     }
 }
@@ -798,6 +831,7 @@ const fn attention_kind_name(kind: AttentionKind) -> &'static str {
         AttentionKind::Reference => "reference",
         AttentionKind::Tiled => "tiled",
         AttentionKind::DecodeSplitKv => "decode-split-kv",
+        AttentionKind::FlashDecode => "flash-decode",
     }
 }
 
@@ -1380,6 +1414,11 @@ mod tests {
             attention_kind(AttentionBenchmarkKind::DecodeSplitKv),
             AttentionKind::DecodeSplitKv,
             "split-KV selection mismatch"
+        );
+        assert_eq!(
+            attention_kind(AttentionBenchmarkKind::FlashDecode),
+            AttentionKind::FlashDecode,
+            "flash-decode selection mismatch"
         );
     }
 

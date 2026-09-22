@@ -14,6 +14,7 @@ pub enum AttentionKind {
     Reference,
     Tiled,
     DecodeSplitKv,
+    FlashDecode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -735,15 +736,63 @@ impl CommandBatch<'_> {
             kv_length: to_u32(*kv_length, "kv_length")?,
             padding: 0,
         };
-        if kind == AttentionKind::DecodeSplitKv && *tokens != 1 {
+        if matches!(
+            kind,
+            AttentionKind::DecodeSplitKv | AttentionKind::FlashDecode
+        ) && *tokens != 1
+        {
             return Err(CoreError::Shape(
-                "split-KV decode attention requires exactly one query token".into(),
+                "decode attention requires exactly one query token".into(),
             ));
+        }
+        if kind == AttentionKind::FlashDecode {
+            if config.query_heads / config.kv_heads != 2 {
+                return Err(CoreError::Shape(
+                    "flash decode requires two query heads per KV head".into(),
+                ));
+            }
+            let available = if config.causal {
+                (*kv_length).min(config.query_offset.saturating_add(1))
+            } else {
+                *kv_length
+            };
+            if available == 0 {
+                return Err(CoreError::Shape(
+                    "flash decode requires at least one available key".into(),
+                ));
+            }
+            let blocks = available.div_ceil(64);
+            let partial_width = config
+                .head_dim
+                .checked_add(2)
+                .ok_or_else(|| CoreError::Shape("flash decode partial width overflow".into()))?;
+            let scratch = self.empty(&[config.kv_heads, blocks, 2, partial_width], DType::F32)?;
+            let groups = checked_mul(config.kv_heads, blocks, "flash decode groups")?;
+            self.dispatch(
+                "attention_flash_decode_partial_f16",
+                &[query, key, value, &scratch],
+                &params,
+                size(checked_mul(groups, 256, "flash decode grid")?, 1, 1),
+                size(256, 1, 1),
+            )?;
+            self.dispatch(
+                "attention_flash_decode_reduce_f16",
+                &[&scratch, &out],
+                &params,
+                size(
+                    checked_mul(config.query_heads, 32, "flash decode reduction grid")?,
+                    1,
+                    1,
+                ),
+                size(32, 1, 1),
+            )?;
+            return Ok(out);
         }
         let kernel = match kind {
             AttentionKind::Reference => "attention_reference_f16",
             AttentionKind::Tiled => "attention_tiled_f16",
             AttentionKind::DecodeSplitKv => "attention_decode_f16",
+            AttentionKind::FlashDecode => unreachable!("handled above"),
         };
         let (grid, threadgroup) = match kind {
             AttentionKind::Reference => (
@@ -764,6 +813,7 @@ impl CommandBatch<'_> {
                     size(32, 1, 1),
                 )
             }
+            AttentionKind::FlashDecode => unreachable!("handled above"),
         };
         self.dispatch(
             kernel,

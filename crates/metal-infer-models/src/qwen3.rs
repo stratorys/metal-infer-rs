@@ -462,7 +462,12 @@ impl Qwen3Model {
         batch.copy_into_cache(&value, &cache.value, offset)?;
         let active_key = cache.key.prefix(active_length)?;
         let active_value = cache.value.prefix(active_length)?;
-        let attention_kind = attention_kind_for_tokens(self.attention_kind, tokens);
+        let attention_kind = attention_kind_for_tokens(
+            self.attention_kind,
+            tokens,
+            active_length,
+            self.config.num_attention_heads / self.config.num_key_value_heads,
+        );
         let attention = batch.attention(
             &query,
             &active_key,
@@ -511,11 +516,19 @@ impl Qwen3Model {
 const fn attention_kind_for_tokens(
     configured: AttentionKind,
     tokens: usize,
+    active_length: usize,
+    query_heads_per_kv: usize,
 ) -> AttentionKind {
     match (configured, tokens) {
+        (AttentionKind::Tiled, 1) if active_length >= 256 && query_heads_per_kv == 2 => {
+            AttentionKind::FlashDecode
+        }
         (AttentionKind::Tiled, 1) => AttentionKind::DecodeSplitKv,
         (AttentionKind::DecodeSplitKv, 1) => AttentionKind::DecodeSplitKv,
         (AttentionKind::DecodeSplitKv, _) => AttentionKind::Tiled,
+        (AttentionKind::FlashDecode, 1) if query_heads_per_kv == 2 => AttentionKind::FlashDecode,
+        (AttentionKind::FlashDecode, 1) => AttentionKind::DecodeSplitKv,
+        (AttentionKind::FlashDecode, _) => AttentionKind::Tiled,
         (kind, _) => kind,
     }
 }
@@ -696,19 +709,29 @@ mod tests {
     };
 
     #[test]
-    fn tiled_attention_selects_split_kv_only_for_decode() {
+    fn tiled_attention_selects_flash_decode_for_long_gqa_decode() {
         assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 1),
-            AttentionKind::DecodeSplitKv,
-            "single-token decode should select split-KV attention"
+            attention_kind_for_tokens(AttentionKind::Tiled, 1, 640, 2),
+            AttentionKind::FlashDecode,
+            "long single-token decode should select flash decode"
         );
         assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 512),
+            attention_kind_for_tokens(AttentionKind::Tiled, 1, 255, 2),
+            AttentionKind::DecodeSplitKv,
+            "short single-token decode should select split-KV attention"
+        );
+        assert_eq!(
+            attention_kind_for_tokens(AttentionKind::Tiled, 1, 640, 4),
+            AttentionKind::DecodeSplitKv,
+            "other GQA ratios should select split-KV attention"
+        );
+        assert_eq!(
+            attention_kind_for_tokens(AttentionKind::Tiled, 512, 512, 2),
             AttentionKind::Tiled,
             "multi-token prefill should keep tiled attention"
         );
         assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Reference, 1),
+            attention_kind_for_tokens(AttentionKind::Reference, 1, 640, 2),
             AttentionKind::Reference,
             "reference attention should remain explicitly selectable"
         );

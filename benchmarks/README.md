@@ -86,6 +86,24 @@ Choose the matrix implementation with `--matmul-backend auto`,
 `--matmul-backend mps`. The comparison pins
 `mlx-lm==0.31.3` and `mlx==0.32.2` so successive reports use a stable baseline.
 
+To diagnose the GPU cost by kernel, run the model benchmark with
+`--profile-kernels` after building the release binary:
+
+```sh
+target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
+  --prompt 512 --generate 128 --iterations 1 --warmup 1 \
+  --fuse-qkv --fuse-gate-up --matmul-backend auto \
+  --profile-kernels --format json
+```
+
+The optional `kernel_profile` field groups dispatch counts and GPU timestamp
+durations by kernel, separately for prefill and decode. Warm-up runs are excluded.
+The profiler creates a separate compute pass for each dispatch, so its latency and tokens/s must not be used
+for performance comparisons. Compare throughput with a separate run that omits
+`--profile-kernels`. `unattributed_ms` is the phase GPU time minus the sum of
+timed Metal compute dispatches; it includes work outside those dispatches and
+measurement gaps.
+
 ## Run the fusion microbenchmarks
 
 Compare each fused kernel with its individual operations using Qwen3-0.6B

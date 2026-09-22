@@ -1,11 +1,12 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use metal_infer_cli::CliError;
 use metal_infer_core::{
-    AttentionConfig, AttentionKind, DispatchStats, MatmulBackend, MetalContext,
-    QkNormRopeCacheConfig, Tensor,
+    AttentionConfig, AttentionKind, DispatchStats, KernelDispatchProfile, MatmulBackend,
+    MetalContext, QkNormRopeCacheConfig, Tensor,
 };
 use metal_infer_models::{FusionOptions, KvCache, Qwen3Model};
 use serde::Serialize;
@@ -106,6 +107,8 @@ enum Command {
         fuse_qk_rope_cache: bool,
         #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
         matmul_backend: MatmulBackendArgument,
+        #[arg(long)]
+        profile_kernels: bool,
     },
 }
 
@@ -178,6 +181,31 @@ struct Report {
     attention_comparison: Option<AttentionComparison>,
     prefill: Option<PhaseReport>,
     decode: Option<PhaseReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kernel_profile: Option<KernelProfileReport>,
+}
+
+#[derive(Serialize)]
+struct KernelProfileReport {
+    diagnostic_only: bool,
+    prefill: KernelPhaseProfile,
+    decode: KernelPhaseProfile,
+}
+
+#[derive(Serialize)]
+struct KernelPhaseProfile {
+    gpu_ms: f64,
+    attributed_ms: f64,
+    unattributed_ms: f64,
+    kernels: Vec<KernelProfileRow>,
+}
+
+#[derive(Serialize)]
+struct KernelProfileRow {
+    kernel: String,
+    calls: usize,
+    total_gpu_ms: f64,
+    mean_gpu_ms: f64,
 }
 
 #[derive(Serialize)]
@@ -403,6 +431,7 @@ fn run() -> Result<(), CliError> {
             fuse_add_rms_norm,
             fuse_qk_rope_cache,
             matmul_backend,
+            profile_kernels,
         } => {
             if prompt == 0 || generate == 0 || iterations == 0 {
                 return Err(CliError::InvalidArguments(
@@ -421,17 +450,37 @@ fn run() -> Result<(), CliError> {
             let mut cache = KvCache::new(&context, model.config(), prompt + generate)?;
             let token_ids = vec![1; prompt];
             for _ in 0..warmup {
-                let _ = run_model_iteration(&model, &token_ids, generate, &mut cache)?;
+                let _ =
+                    run_model_iteration(&context, &model, &token_ids, generate, &mut cache, false)?;
+            }
+            if profile_kernels {
+                context.set_kernel_profiling(true)?;
             }
             let allocated_before_measurement = context.allocated_bytes();
             let mut prefill_samples = Vec::with_capacity(iterations);
             let mut decode_samples = Vec::with_capacity(iterations);
+            let mut prefill_kernels = Vec::new();
+            let mut decode_kernels = Vec::new();
             for _ in 0..iterations {
-                let (prefill, decode) =
-                    run_model_iteration(&model, &token_ids, generate, &mut cache)?;
+                let (prefill, decode, prefill_profile, decode_profile) = run_model_iteration(
+                    &context,
+                    &model,
+                    &token_ids,
+                    generate,
+                    &mut cache,
+                    profile_kernels,
+                )?;
                 prefill_samples.push(prefill);
                 decode_samples.push(decode);
+                prefill_kernels.extend(prefill_profile);
+                decode_kernels.extend(decode_profile);
             }
+            context.set_kernel_profiling(false)?;
+            let kernel_profile = profile_kernels.then(|| KernelProfileReport {
+                diagnostic_only: true,
+                prefill: kernel_phase_profile(&prefill_samples, prefill_kernels),
+                decode: kernel_phase_profile(&decode_samples, decode_kernels),
+            });
             model_report(
                 &context,
                 fusion_options,
@@ -440,6 +489,7 @@ fn run() -> Result<(), CliError> {
                 generate,
                 prefill_samples,
                 decode_samples,
+                kernel_profile,
             )
         }
     };
@@ -472,6 +522,11 @@ fn run() -> Result<(), CliError> {
                     "decode: {:.3} ms wall, {:.3} ms GPU, {:.3} tokens/s",
                     decode.wall_mean_ms, decode.gpu_mean_ms, decode.tokens_per_second
                 );
+            }
+            if let Some(profile) = &report.kernel_profile {
+                println!("kernel profiling uses separate compute passes; timings are diagnostic");
+                print_kernel_phase("prefill", &profile.prefill);
+                print_kernel_phase("decode", &profile.decode);
             }
             if let Some(comparison) = &report.comparison {
                 println!(
@@ -672,6 +727,7 @@ fn run_attention_benchmark(
         }),
         prefill: None,
         decode: None,
+        kernel_profile: None,
     })
 }
 
@@ -954,6 +1010,7 @@ fn measure_fusion_pair<E>(
         attention_comparison: None,
         prefill: None,
         decode: None,
+        kernel_profile: None,
     })
 }
 
@@ -1109,20 +1166,36 @@ fn report(
         attention_comparison: None,
         prefill: None,
         decode: None,
+        kernel_profile: None,
     }
 }
 
 fn run_model_iteration(
+    context: &MetalContext,
     model: &Qwen3Model,
     prompt: &[u32],
     decode_tokens: usize,
     cache: &mut KvCache,
-) -> Result<(PhaseSample, PhaseSample), CliError> {
+    profile_kernels: bool,
+) -> Result<
+    (
+        PhaseSample,
+        PhaseSample,
+        Vec<KernelDispatchProfile>,
+        Vec<KernelDispatchProfile>,
+    ),
+    CliError,
+> {
     let started = Instant::now();
     let (_, prefill_stats) = model.prefill_with_stats(prompt, cache)?;
     let prefill = PhaseSample {
         wall: started.elapsed(),
         gpu: prefill_stats.gpu_time,
+    };
+    let prefill_profile = if profile_kernels {
+        context.take_kernel_profiles()
+    } else {
+        Vec::new()
     };
     let started = Instant::now();
     let mut decode_gpu = Duration::ZERO;
@@ -1130,13 +1203,74 @@ fn run_model_iteration(
         let (_, stats) = model.decode_with_stats(1, cache)?;
         decode_gpu += stats.gpu_time;
     }
+    let decode_profile = if profile_kernels {
+        context.take_kernel_profiles()
+    } else {
+        Vec::new()
+    };
     Ok((
         prefill,
         PhaseSample {
             wall: started.elapsed(),
             gpu: decode_gpu,
         },
+        prefill_profile,
+        decode_profile,
     ))
+}
+
+fn kernel_phase_profile(
+    samples: &[PhaseSample],
+    dispatches: Vec<KernelDispatchProfile>,
+) -> KernelPhaseProfile {
+    let gpu_ms = samples
+        .iter()
+        .map(|sample| sample.gpu.as_secs_f64())
+        .sum::<f64>()
+        * 1000.0;
+    let mut totals: HashMap<String, (usize, f64)> = HashMap::new();
+    for dispatch in dispatches {
+        let entry = totals.entry(dispatch.kernel).or_default();
+        entry.0 += 1;
+        entry.1 += dispatch.gpu_time.as_secs_f64() * 1000.0;
+    }
+    let attributed_ms = totals.values().map(|(_, total)| *total).sum::<f64>();
+    let mut kernels: Vec<_> = totals
+        .into_iter()
+        .map(|(kernel, (calls, total_gpu_ms))| KernelProfileRow {
+            kernel,
+            calls,
+            total_gpu_ms,
+            mean_gpu_ms: total_gpu_ms / calls as f64,
+        })
+        .collect();
+    kernels.sort_by(|a, b| {
+        b.total_gpu_ms
+            .total_cmp(&a.total_gpu_ms)
+            .then_with(|| a.kernel.cmp(&b.kernel))
+    });
+    KernelPhaseProfile {
+        gpu_ms,
+        attributed_ms,
+        unattributed_ms: gpu_ms - attributed_ms,
+        kernels,
+    }
+}
+
+fn print_kernel_phase(
+    name: &str,
+    profile: &KernelPhaseProfile,
+) {
+    println!(
+        "{name} kernels: {:.3} ms attributed / {:.3} ms GPU ({:.3} ms unattributed)",
+        profile.attributed_ms, profile.gpu_ms, profile.unattributed_ms
+    );
+    for row in &profile.kernels {
+        println!(
+            "  {:<32} {:>7} calls  {:>9.3} ms total  {:>8.4} ms/call",
+            row.kernel, row.calls, row.total_gpu_ms, row.mean_gpu_ms
+        );
+    }
 }
 
 fn model_report(
@@ -1147,6 +1281,7 @@ fn model_report(
     decode_tokens: usize,
     prefill_samples: Vec<PhaseSample>,
     decode_samples: Vec<PhaseSample>,
+    kernel_profile: Option<KernelProfileReport>,
 ) -> Report {
     let prefill = phase_report(prompt_tokens, &prefill_samples);
     let decode = phase_report(decode_tokens, &decode_samples);
@@ -1174,6 +1309,7 @@ fn model_report(
         attention_comparison: None,
         prefill: Some(prefill),
         decode: Some(decode),
+        kernel_profile,
     }
 }
 

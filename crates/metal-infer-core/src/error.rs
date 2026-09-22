@@ -27,4 +27,6 @@ pub enum CoreError {
     },
     #[error("host data has {actual} elements, expected {expected}")]
     DataLength { expected: usize, actual: usize },
+    #[error("GPU kernel profiling failed: {0}")]
+    Profiling(String),
 }

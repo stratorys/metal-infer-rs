@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use objc2::AnyThread;
-use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+use objc2_metal::{MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize};
 use objc2_metal_performance_shaders::{
     MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication,
 };
@@ -822,7 +822,19 @@ impl CommandBatch<'_> {
         threadgroup: MTLSize,
     ) -> Result<(), CoreError> {
         let pipeline = self.context.pipeline(kernel)?;
-        let encoder = self.encoder()?;
+        let profile_index = self
+            .profile
+            .as_mut()
+            .map(|profile| profile.reserve(kernel))
+            .transpose()?;
+        let profiled_encoder = profile_index
+            .map(|index| self.profiled_encoder(index))
+            .transpose()?;
+        let encoder = if let Some(encoder) = &profiled_encoder {
+            encoder.as_ref()
+        } else {
+            self.encoder()?
+        };
         encoder.setComputePipelineState(&pipeline);
         for (index, tensor) in tensors.iter().enumerate() {
             // SAFETY: tensor resources remain alive through command completion
@@ -841,6 +853,9 @@ impl CommandBatch<'_> {
         // while encoding.
         unsafe { encoder.setBytes_length_atIndex(pointer, length, tensors.len()) };
         encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        if let Some(encoder) = profiled_encoder {
+            encoder.endEncoding();
+        }
         Ok(())
     }
 }

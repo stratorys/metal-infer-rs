@@ -70,6 +70,25 @@ fn matvec_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
+fn kernel_profiler_records_only_enabled_dispatches() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let input = context.tensor_f16(&[1.0, 2.0, 3.0], &[1, 3])?;
+    let weight = context.tensor_f16(&[4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[2, 3])?;
+    context.set_kernel_profiling(true)?;
+    let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
+    assert_close(&actual, &[32.0, 50.0]);
+    let profiles = context.take_kernel_profiles();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].kernel, "matvec_f16");
+    assert!(profiles[0].gpu_time > std::time::Duration::ZERO);
+    context.set_kernel_profiling(false)?;
+    let _ = context.matmul(&input, &weight)?;
+    assert!(context.take_kernel_profiles().is_empty());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
 fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let input_values: Vec<f32> = (0..128).map(|index| index as f32 / 128.0 - 0.5).collect();

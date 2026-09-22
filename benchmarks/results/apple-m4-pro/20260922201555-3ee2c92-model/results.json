@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "kind": "model",
+  "generated_at": "2026-09-22T20:15:55.526398+00:00",
+  "system": {
+    "chip": "Apple M4 Pro",
+    "machine": "arm64",
+    "macos": "26.7",
+    "metal_infer_commit": "3ee2c92e7854d0283323d8bd4c47246485ed0c04",
+    "metal_infer_dirty": false,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  },
+  "suite": {
+    "warmup": 1,
+    "iterations": 5,
+    "prompt_tokens": 512,
+    "generation_tokens": 128
+  },
+  "results": [
+    {
+      "benchmark": "qwen3_model",
+      "device": "Apple M4 Pro",
+      "iterations": 5,
+      "mean_ms": 1199.7437333999999,
+      "median_ms": 1198.971417,
+      "p95_ms": 1208.436958,
+      "gpu_mean_ms": 1149.7567760000002,
+      "gpu_median_ms": 1150.126918,
+      "gpu_p95_ms": 1155.082793,
+      "throughput": null,
+      "throughput_unit": null,
+      "allocated_bytes": 1265975296,
+      "matmul_backend": "auto",
+      "allocation_growth_bytes": 0,
+      "fusions": {
+        "qkv": true,
+        "gate_up": true,
+        "add_rms_norm": true,
+        "qk_rope_cache": true
+      },
+      "prefill": {
+        "tokens": 512,
+        "wall_mean_ms": 203.20666680000002,
+        "wall_median_ms": 202.800209,
+        "wall_p95_ms": 206.285041,
+        "gpu_mean_ms": 202.2968332,
+        "gpu_median_ms": 201.92775,
+        "gpu_p95_ms": 205.177458,
+        "tokens_per_second": 2519.6023735969275
+      },
+      "decode": {
+        "tokens": 128,
+        "wall_mean_ms": 996.5370665999999,
+        "wall_median_ms": 996.171208,
+        "wall_p95_ms": 1002.1519169999999,
+        "gpu_mean_ms": 947.4599428000001,
+        "gpu_median_ms": 948.199168,
+        "gpu_p95_ms": 949.9053349999999,
+        "tokens_per_second": 128.4447957733397
+      },
+      "backend": "metal-infer"
+    },
+    {
+      "backend": "mlx-lm",
+      "benchmark": "qwen3_model",
+      "prefill": {
+        "tokens": 512,
+        "tokens_per_second": 4685.106
+      },
+      "decode": {
+        "tokens": 128,
+        "tokens_per_second": 168.691
+      },
+      "peak_memory_gb": 1.96,
+      "mlx_lm_version": "0.31.3",
+      "mlx_version": "0.32.2"
+    }
+  ]
+}

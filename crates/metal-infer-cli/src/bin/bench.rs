@@ -132,6 +132,9 @@ enum Command {
         /// Fixed decode GEMV configuration for a same-binary A/B comparison.
         #[arg(long, value_enum)]
         gemv_config: Option<DecodeGemvConfigArgument>,
+        /// Reuse normalized gate/up input in the fused K=1024 decode GEMV.
+        #[arg(long)]
+        shared_gate_up_input: bool,
         #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
         matmul_backend: MatmulBackendArgument,
         #[arg(long)]
@@ -219,6 +222,8 @@ struct Report {
     matmul_backend: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     decode_gemv_config: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_gate_up_input: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allocation_growth_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,6 +553,7 @@ fn run() -> Result<(), CliError> {
             qkv_rms_rows,
             gate_up_add_rms_rows,
             gemv_config,
+            shared_gate_up_input,
             matmul_backend,
             profile_kernels,
         } => {
@@ -570,8 +576,32 @@ fn run() -> Result<(), CliError> {
                     "--gemv-config requires auto matmul on Apple M4 Pro".into(),
                 ));
             }
+            if shared_gate_up_input && !(fuse_gate_up && fuse_add_rms_norm) {
+                return Err(CliError::InvalidArguments(
+                    "--shared-gate-up-input requires --fuse-gate-up and --fuse-add-rms-norm".into(),
+                ));
+            }
+            if shared_gate_up_input
+                && matches!(gemv_config, Some(DecodeGemvConfigArgument::Baseline))
+            {
+                return Err(CliError::InvalidArguments(
+                    "--shared-gate-up-input requires the tuned GEMV configuration".into(),
+                ));
+            }
             context.set_matmul_backend(matmul_backend.into());
             let mut model = Qwen3Model::load(&model, &context)?;
+            if shared_gate_up_input {
+                if context.device_name() != "Apple M4 Pro"
+                    || model.config().hidden_size != 1024
+                    || model.config().intermediate_size != 3072
+                    || matmul_backend != MatmulBackendArgument::Auto
+                {
+                    return Err(CliError::InvalidArguments(
+                        "--shared-gate-up-input requires Qwen3-0.6B dimensions and auto matmul on Apple M4 Pro".into(),
+                    ));
+                }
+                context.set_shared_gate_up_input(true);
+            }
             if let Some(config) = gemv_config {
                 context.set_decode_gemv_config(config.into());
             }
@@ -647,6 +677,9 @@ fn run() -> Result<(), CliError> {
             println!("benchmark: {}", report.benchmark);
             println!("device: {}", report.device);
             println!("matmul backend: {}", report.matmul_backend);
+            if let Some(shared) = report.shared_gate_up_input {
+                println!("shared gate/up input: {shared}");
+            }
             println!(
                 "mean: {:.3} ms, median: {:.3} ms, p95: {:.3} ms",
                 report.mean_ms, report.median_ms, report.p95_ms
@@ -980,6 +1013,7 @@ fn run_attention_benchmark(
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
         decode_gemv_config: None,
+        shared_gate_up_input: None,
         allocation_growth_bytes: None,
         fusions: None,
         comparison: None,
@@ -1428,6 +1462,7 @@ fn measure_fusion_pair<E>(
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
         decode_gemv_config: None,
+        shared_gate_up_input: None,
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()
@@ -1589,6 +1624,7 @@ fn report(
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
         decode_gemv_config: None,
+        shared_gate_up_input: None,
         allocation_growth_bytes: None,
         fusions: None,
         comparison: None,
@@ -1730,6 +1766,7 @@ fn model_report(
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
         decode_gemv_config: None,
+        shared_gate_up_input: Some(context.shared_gate_up_input()),
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()

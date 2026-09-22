@@ -134,6 +134,41 @@ done
 result is indicative: the two existing model benchmarks use different token
 sequences, despite matching the checkpoint and prompt/decode lengths.
 
+To test whether reusing the normalized gate/up input within each threadgroup
+improves the fused decode kernel, compare the model benchmark with and without
+`--shared-gate-up-input`. Keep all other arguments the same, including
+`--fuse-gate-up --fuse-add-rms-norm`. The existing kernel remains the default.
+The JSON field `shared_gate_up_input` records which path ran. For example:
+
+```sh
+target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
+  --prompt 512 --generate 128 --warmup 1 --iterations 5 \
+  --fuse-qkv --fuse-gate-up --fuse-add-rms-norm --fuse-qk-rope-cache \
+  --shared-gate-up-input --format json
+```
+
+The same flag is available on `benchmarks/compare.py model` when comparing the
+experimental path with MLX-LM. The variant requires Qwen3-0.6B dimensions and
+auto matmul on Apple M4 Pro. Use unprofiled runs for throughput comparisons.
+
+For small differences, `model_ab.py` repeats the complete model benchmark in
+alternating A/B and B/A order. It builds the release binary once, runs both
+variants with the same four fusions and workload, and reports the median of
+paired decode differences. Save the commands and raw benchmark JSON with
+`--output`:
+
+```sh
+uv run python benchmarks/model_ab.py --model ./models/Qwen3-0.6B \
+  --candidate-args=--shared-gate-up-input --rounds 4 \
+  --output /tmp/qwen3-model-ab.json
+```
+
+`--baseline-args` defaults to an empty string. Both variant arguments are
+split as shell words without invoking a shell. For example, compare two GEMV
+configurations with `--baseline-args='--gemv-config baseline'` and
+`--candidate-args='--gemv-config tuned'`. Pass `--skip-build` when the release
+binary has already been built.
+
 Choose the matrix implementation with `--matmul-backend auto`,
 `--matmul-backend reference-msl`, `--matmul-backend native-msl`, or
 `--matmul-backend mps`. The comparison pins

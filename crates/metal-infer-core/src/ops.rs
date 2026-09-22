@@ -682,6 +682,9 @@ impl CommandBatch<'_> {
         let groups = n0.max(n1).div_ceil(rows * simdgroups);
         self.dispatch(
             match rows {
+                1 if width == 1024 && self.context.shared_gate_up_input() => {
+                    "matvec2_add_rms_shared_r1_f16"
+                }
                 1 => "matvec2_add_rms_r1_f16",
                 4 => "matvec2_add_rms_r4_f16",
                 8 => "matvec2_add_rms_r8_f16",

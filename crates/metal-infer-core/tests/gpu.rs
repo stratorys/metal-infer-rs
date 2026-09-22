@@ -378,6 +378,58 @@ fn fused_decode_norm_projections_match_separate_ops() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
+fn shared_gate_up_input_matches_fused_decode() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    if context.device_name() != "Apple M4 Pro" {
+        return Ok(());
+    }
+    let width = 1024;
+    let input_values: Vec<f32> = (0..width).map(|i| (i % 29) as f32 / 29.0 - 0.5).collect();
+    let right_values: Vec<f32> = (0..width).map(|i| (i % 19) as f32 / 38.0 - 0.25).collect();
+    let norm_values: Vec<f32> = (0..width).map(|i| 0.5 + (i % 17) as f32 / 34.0).collect();
+    let make_weight = |rows: usize, modulus: usize| {
+        let values: Vec<f32> = (0..rows * width)
+            .map(|i| (i % modulus) as f32 / modulus as f32 - 0.5)
+            .collect();
+        context.tensor_f16(&values, &[rows, width])
+    };
+    let input = context.tensor_f16(&input_values, &[1, width])?;
+    let right = context.tensor_f16(&right_values, &[1, width])?;
+    let norm_weight = context.tensor_f16(&norm_values, &[width])?;
+    let weight0 = make_weight(40, 31)?;
+    let weight1 = make_weight(24, 37)?;
+    context.set_fused_norm_matvec_rows(1, 1)?;
+    let mut batch = context.begin_batch()?;
+    let (reference_residual, normalized) =
+        batch.add_rms_norm(&input, &right, &norm_weight, 1.0e-6)?;
+    let (reference_gate, reference_up) = batch.matmul2(&normalized, &weight0, &weight1)?;
+    batch.finish()?;
+    let mut batch = context.begin_batch()?;
+    let (expected_residual, expected_gate, expected_up) =
+        batch.add_rms_norm_matmul2(&input, &right, &norm_weight, &weight0, &weight1, 1.0e-6)?;
+    batch.finish()?;
+    assert_close(
+        &expected_residual.to_f32_vec()?,
+        &reference_residual.to_f32_vec()?,
+    );
+    assert_close(&expected_gate.to_f32_vec()?, &reference_gate.to_f32_vec()?);
+    assert_close(&expected_up.to_f32_vec()?, &reference_up.to_f32_vec()?);
+    context.set_shared_gate_up_input(true);
+    let mut batch = context.begin_batch()?;
+    let (actual_residual, actual_gate, actual_up) =
+        batch.add_rms_norm_matmul2(&input, &right, &norm_weight, &weight0, &weight1, 1.0e-6)?;
+    batch.finish()?;
+    assert_close(
+        &actual_residual.to_f32_vec()?,
+        &expected_residual.to_f32_vec()?,
+    );
+    assert_close(&actual_gate.to_f32_vec()?, &expected_gate.to_f32_vec()?);
+    assert_close(&actual_up.to_f32_vec()?, &expected_up.to_f32_vec()?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
 fn auto_matvec_row_variants_match_reference() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     if !context.device_name().contains("M4 Pro") {

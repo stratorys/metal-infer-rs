@@ -193,6 +193,7 @@ pub struct MetalContext {
     auto_matvec_split_k: Rc<Cell<usize>>,
     auto_matvec_half8: Rc<Cell<bool>>,
     fused_norm_matvec_rows: Rc<Cell<(usize, usize)>>,
+    shared_gate_up_input: Rc<Cell<bool>>,
     decode_gemv_config: Rc<Cell<Option<DecodeGemvConfig>>>,
     profile_tick_nanoseconds: Rc<Cell<Option<f64>>>,
     kernel_profiles: Rc<RefCell<Vec<KernelDispatchProfile>>>,
@@ -225,6 +226,7 @@ impl MetalContext {
             auto_matvec_split_k: Rc::new(Cell::new(1)),
             auto_matvec_half8: Rc::new(Cell::new(false)),
             fused_norm_matvec_rows: Rc::new(Cell::new((2, 2))),
+            shared_gate_up_input: Rc::new(Cell::new(false)),
             decode_gemv_config: Rc::new(Cell::new(None)),
             profile_tick_nanoseconds: Rc::new(Cell::new(None)),
             kernel_profiles: Rc::new(RefCell::new(Vec::new())),
@@ -428,6 +430,18 @@ impl MetalContext {
         }
         self.fused_norm_matvec_rows.set((qkv, gate_up));
         Ok(())
+    }
+
+    /// Reuse normalized gate/up input within each threadgroup of the fused decode GEMV.
+    pub fn set_shared_gate_up_input(
+        &self,
+        enabled: bool,
+    ) {
+        self.shared_gate_up_input.set(enabled);
+    }
+
+    pub fn shared_gate_up_input(&self) -> bool {
+        self.shared_gate_up_input.get()
     }
 
     pub(crate) fn fused_norm_matvec_rows_for_shape(

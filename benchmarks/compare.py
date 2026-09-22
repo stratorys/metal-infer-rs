@@ -138,6 +138,7 @@ def arguments() -> argparse.Namespace:
     model.add_argument("--fuse-gate-up", action="store_true")
     model.add_argument("--fuse-add-rms-norm", action="store_true")
     model.add_argument("--fuse-qk-rope-cache", action="store_true")
+    model.add_argument("--shared-gate-up-input", action="store_true")
     model.add_argument(
         "--matmul-backend",
         choices=("auto", "reference-msl", "native-msl", "mps"),
@@ -339,6 +340,7 @@ def model_results(
             (args.fuse_gate_up, "--fuse-gate-up"),
             (args.fuse_add_rms_norm, "--fuse-add-rms-norm"),
             (args.fuse_qk_rope_cache, "--fuse-qk-rope-cache"),
+            (args.shared_gate_up_input, "--shared-gate-up-input"),
         )
         if enabled
     ]

@@ -829,6 +829,163 @@ kernel void attention_tiled_f16(device const half *q [[buffer(0)]],
   }
 }
 
+// Four SIMD-groups own eight query rows each. The score and probability tiles
+// bridge matrix fragments and the row-wise online softmax.
+kernel void attention_flash_prefill_f16(
+    device const half *q [[buffer(0)]], device const half *k [[buffer(1)]],
+    device const half *v [[buffer(2)]], device half *out [[buffer(3)]],
+    constant AttentionParams &p [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]],
+    ushort simd_lane [[thread_index_in_simdgroup]]) {
+  constexpr uint tile = 32;
+  constexpr uint matrix_width = 8;
+  threadgroup half q_tile[tile * matrix_width];
+  threadgroup half kv_tile[tile * matrix_width];
+  threadgroup float scores[tile * tile];
+  threadgroup half probabilities[tile * tile];
+  threadgroup float row_max[tile];
+  threadgroup float row_sum[tile];
+  threadgroup float row_scale[tile];
+
+  uint query_base = group.x * tile;
+  uint head = group.y;
+  uint kv_head = head / (p.q_heads / p.kv_heads);
+  uint query_row = simdgroup_index * matrix_width;
+  uint matrix_row = ((simd_lane / 4) & 4) + (simd_lane / 2) % 4;
+  uint matrix_column = ((simd_lane / 4) & 2) * 2 + (simd_lane % 2) * 2;
+  uint dimensions = (p.head_dim + matrix_width - 1) / matrix_width;
+  simdgroup_float8x8 output_tiles[32];
+  for (uint d = 0; d < dimensions; ++d)
+    output_tiles[d] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+  if (thread_index < tile) {
+    row_max[thread_index] = -INFINITY;
+    row_sum[thread_index] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint last_query = min(query_base + tile, p.tokens) - 1;
+  uint key_limit = p.causal != 0
+                       ? min(p.kv_length, p.query_offset + last_query + 1)
+                       : p.kv_length;
+  float score_scale = rsqrt(float(p.head_dim));
+  for (uint key_base = 0; key_base < key_limit; key_base += tile) {
+    simdgroup_float8x8 score_tiles[4];
+    for (uint n = 0; n < 4; ++n)
+      score_tiles[n] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (uint d = 0; d < dimensions; ++d) {
+      for (uint slot = thread_index; slot < tile * matrix_width; slot += 128) {
+        uint row = slot / matrix_width;
+        uint component = d * matrix_width + slot % matrix_width;
+        q_tile[slot] =
+            query_base + row < p.tokens && component < p.head_dim
+                ? q[((query_base + row) * p.q_heads + head) * p.head_dim +
+                    component]
+                : half(0.0f);
+        kv_tile[slot] =
+            key_base + row < p.kv_length && component < p.head_dim
+                ? k[((key_base + row) * p.kv_heads + kv_head) * p.head_dim +
+                    component]
+                : half(0.0f);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_half8x8 q_matrix;
+      simdgroup_load(q_matrix, q_tile + query_row * matrix_width, matrix_width);
+      for (uint n = 0; n < 4; ++n) {
+        simdgroup_half8x8 k_matrix;
+        simdgroup_load(k_matrix, kv_tile + n * matrix_width * matrix_width,
+                       matrix_width, ulong2(0), true);
+        simdgroup_multiply_accumulate(score_tiles[n], q_matrix, k_matrix,
+                                      score_tiles[n]);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint n = 0; n < 4; ++n) {
+      uint offset =
+          (query_row + matrix_row) * tile + n * matrix_width + matrix_column;
+      scores[offset] = score_tiles[n].thread_elements()[0] * score_scale;
+      scores[offset + 1] = score_tiles[n].thread_elements()[1] * score_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (thread_index < tile) {
+      uint query = query_base + thread_index;
+      uint available = p.causal != 0
+                           ? min(p.kv_length, p.query_offset + query + 1)
+                           : p.kv_length;
+      float block_max = -INFINITY;
+      if (query < p.tokens) {
+        for (uint column = 0; column < tile; ++column) {
+          if (key_base + column < available)
+            block_max = max(block_max, scores[thread_index * tile + column]);
+        }
+      }
+      float next_max = max(row_max[thread_index], block_max);
+      float alpha = isinf(row_max[thread_index])
+                        ? 0.0f
+                        : exp(row_max[thread_index] - next_max);
+      row_scale[thread_index] = alpha;
+      float block_sum = 0.0f;
+      for (uint column = 0; column < tile; ++column) {
+        float weight =
+            query < p.tokens && key_base + column < available
+                ? exp(scores[thread_index * tile + column] - next_max)
+                : 0.0f;
+        probabilities[thread_index * tile + column] = half(weight);
+        block_sum += weight;
+      }
+      row_sum[thread_index] = row_sum[thread_index] * alpha + block_sum;
+      row_max[thread_index] = next_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float alpha = row_scale[query_row + matrix_row];
+    for (uint d = 0; d < dimensions; ++d) {
+      output_tiles[d].thread_elements()[0] *= alpha;
+      output_tiles[d].thread_elements()[1] *= alpha;
+      for (uint slot = thread_index; slot < tile * matrix_width; slot += 128) {
+        uint row = slot / matrix_width;
+        uint component = d * matrix_width + slot % matrix_width;
+        kv_tile[slot] =
+            key_base + row < p.kv_length && component < p.head_dim
+                ? v[((key_base + row) * p.kv_heads + kv_head) * p.head_dim +
+                    component]
+                : half(0.0f);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint n = 0; n < 4; ++n) {
+        simdgroup_half8x8 p_matrix;
+        simdgroup_half8x8 v_matrix;
+        simdgroup_load(p_matrix,
+                       probabilities + query_row * tile + n * matrix_width,
+                       tile);
+        simdgroup_load(v_matrix, kv_tile + n * matrix_width * matrix_width,
+                       matrix_width);
+        simdgroup_multiply_accumulate(output_tiles[d], p_matrix, v_matrix,
+                                      output_tiles[d]);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  uint query = query_base + query_row + matrix_row;
+  if (query < p.tokens) {
+    float denominator = row_sum[query_row + matrix_row];
+    for (uint d = 0; d < dimensions; ++d) {
+      uint component = d * matrix_width + matrix_column;
+      uint offset = (query * p.q_heads + head) * p.head_dim + component;
+      if (component < p.head_dim)
+        out[offset] = half(output_tiles[d].thread_elements()[0] / denominator);
+      if (component + 1 < p.head_dim)
+        out[offset + 1] =
+            half(output_tiles[d].thread_elements()[1] / denominator);
+    }
+  }
+}
+
 kernel void attention_decode_f16(device const half *q [[buffer(0)]],
                                  device const half *k [[buffer(1)]],
                                  device const half *v [[buffer(2)]],

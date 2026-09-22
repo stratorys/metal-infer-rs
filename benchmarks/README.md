@@ -130,10 +130,11 @@ Measure decode attention independently at the target cache length with:
 target/release/metal-infer-bench attention --tokens 1 --length 512
 ```
 
-`--kind compare` reports the reference, tiled, split-KV, and flash-decode
-variants when there are two query heads per KV head. The model selects
-flash-decode for single-token attention from 256 active KV tokens onward and
-split-KV for shorter contexts. QKV and QK+RoPE+cache are the default model
+For prefill, run `attention --tokens 512 --length 512`; `--kind compare` also
+reports flash-prefill for multiple query tokens. The model selects flash-prefill
+from 32 query tokens onward, flash-decode for single-token attention from 256
+active KV tokens onward when there are two query heads per KV head, and split-KV
+for shorter decode contexts. QKV and QK+RoPE+cache are the default model
 fusions; benchmark flags still select an explicit fusion set so unfused
 baselines remain reproducible.
 

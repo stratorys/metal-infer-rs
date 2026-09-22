@@ -409,6 +409,54 @@ fn tiled_attention_matches_reference() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
+fn flash_prefill_matches_reference_at_tile_edges() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    for head_dim in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
+        for (tokens, length) in [
+            (1, 1),
+            (31, 31),
+            (32, 32),
+            (33, 33),
+            (63, 63),
+            (64, 64),
+            (65, 65),
+            (33, 65),
+        ] {
+            let query_heads = 4;
+            let kv_heads = 2;
+            let query_values: Vec<f32> = (0..tokens * query_heads * head_dim)
+                .map(|index| (index % 43) as f32 / 43.0 - 0.5)
+                .collect();
+            let key_values: Vec<f32> = (0..length * kv_heads * head_dim)
+                .map(|index| (index % 37) as f32 / 37.0 - 0.25)
+                .collect();
+            let value_values: Vec<f32> = (0..length * kv_heads * head_dim)
+                .map(|index| (index % 29) as f32 / 29.0 - 0.5)
+                .collect();
+            let query = context.tensor_f16(&query_values, &[tokens, query_heads, head_dim])?;
+            let key = context.tensor_f16(&key_values, &[length, kv_heads, head_dim])?;
+            let value = context.tensor_f16(&value_values, &[length, kv_heads, head_dim])?;
+            let config = AttentionConfig {
+                query_heads,
+                kv_heads,
+                head_dim,
+                causal: true,
+                query_offset: length - tokens,
+            };
+            let expected = context
+                .attention(&query, &key, &value, config, AttentionKind::Reference)?
+                .to_f32_vec()?;
+            let actual = context
+                .attention(&query, &key, &value, config, AttentionKind::FlashPrefill)?
+                .to_f32_vec()?;
+            assert_close(&actual, &expected);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
 fn flash_decode_matches_reference_across_block_boundaries() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let query_values: Vec<f32> = (0..2 * 128)

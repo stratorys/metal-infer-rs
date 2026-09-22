@@ -520,6 +520,7 @@ const fn attention_kind_for_tokens(
     query_heads_per_kv: usize,
 ) -> AttentionKind {
     match (configured, tokens) {
+        (AttentionKind::Tiled, 32..) => AttentionKind::FlashPrefill,
         (AttentionKind::Tiled, 1) if active_length >= 256 && query_heads_per_kv == 2 => {
             AttentionKind::FlashDecode
         }
@@ -529,6 +530,10 @@ const fn attention_kind_for_tokens(
         (AttentionKind::FlashDecode, 1) if query_heads_per_kv == 2 => AttentionKind::FlashDecode,
         (AttentionKind::FlashDecode, 1) => AttentionKind::DecodeSplitKv,
         (AttentionKind::FlashDecode, _) => AttentionKind::Tiled,
+        (AttentionKind::FlashPrefill, 1) if active_length >= 256 && query_heads_per_kv == 2 => {
+            AttentionKind::FlashDecode
+        }
+        (AttentionKind::FlashPrefill, 1) => AttentionKind::DecodeSplitKv,
         (kind, _) => kind,
     }
 }
@@ -726,9 +731,19 @@ mod tests {
             "other GQA ratios should select split-KV attention"
         );
         assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 512, 512, 2),
+            attention_kind_for_tokens(AttentionKind::Tiled, 31, 31, 2),
             AttentionKind::Tiled,
-            "multi-token prefill should keep tiled attention"
+            "short prefill should keep tiled attention"
+        );
+        assert_eq!(
+            attention_kind_for_tokens(AttentionKind::Tiled, 32, 32, 2),
+            AttentionKind::FlashPrefill,
+            "32-token prefill should select flash prefill"
+        );
+        assert_eq!(
+            attention_kind_for_tokens(AttentionKind::Tiled, 512, 512, 2),
+            AttentionKind::FlashPrefill,
+            "long prefill should select flash prefill"
         );
         assert_eq!(
             attention_kind_for_tokens(AttentionKind::Reference, 1, 640, 2),

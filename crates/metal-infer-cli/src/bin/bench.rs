@@ -150,6 +150,7 @@ enum AttentionBenchmarkKind {
     Compare,
     Reference,
     Tiled,
+    FlashPrefill,
     DecodeSplitKv,
     FlashDecode,
 }
@@ -262,6 +263,8 @@ struct TimingReport {
 struct AttentionComparison {
     reference: AttentionVariantReport,
     tiled: AttentionVariantReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flash_prefill: Option<AttentionVariantReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     decode_split_kv: Option<AttentionVariantReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -540,6 +543,9 @@ fn run() -> Result<(), CliError> {
             if let Some(comparison) = &report.attention_comparison {
                 print_attention_variant(&comparison.reference);
                 print_attention_variant(&comparison.tiled);
+                if let Some(prefill) = &comparison.flash_prefill {
+                    print_attention_variant(prefill);
+                }
                 if let Some(decode) = &comparison.decode_split_kv {
                     print_attention_variant(decode);
                 }
@@ -706,6 +712,17 @@ fn run_attention_benchmark(
         iterations,
         warmup,
     )?;
+    let flash_prefill = if tokens > 1 {
+        Some(attention_variant_report(
+            case,
+            AttentionKind::FlashPrefill,
+            &reference_output,
+            iterations,
+            warmup,
+        )?)
+    } else {
+        None
+    };
     let decode_split_kv = if tokens == 1 {
         Some(attention_variant_report(
             case,
@@ -733,7 +750,13 @@ fn run_attention_benchmark(
     } else {
         decode_split_kv.as_ref()
     }
-    .unwrap_or(&tiled);
+    .unwrap_or_else(|| {
+        if tokens >= 32 {
+            flash_prefill.as_ref().unwrap_or(&tiled)
+        } else {
+            &tiled
+        }
+    });
     Ok(Report {
         benchmark,
         device: context.device_name(),
@@ -754,6 +777,7 @@ fn run_attention_benchmark(
         attention_comparison: Some(AttentionComparison {
             reference,
             tiled,
+            flash_prefill,
             decode_split_kv,
             flash_decode,
         }),
@@ -820,6 +844,7 @@ const fn attention_kind(selection: AttentionBenchmarkKind) -> AttentionKind {
     match selection {
         AttentionBenchmarkKind::Reference => AttentionKind::Reference,
         AttentionBenchmarkKind::Tiled => AttentionKind::Tiled,
+        AttentionBenchmarkKind::FlashPrefill => AttentionKind::FlashPrefill,
         AttentionBenchmarkKind::DecodeSplitKv => AttentionKind::DecodeSplitKv,
         AttentionBenchmarkKind::FlashDecode => AttentionKind::FlashDecode,
         AttentionBenchmarkKind::Compare => AttentionKind::Reference,
@@ -830,6 +855,7 @@ const fn attention_kind_name(kind: AttentionKind) -> &'static str {
     match kind {
         AttentionKind::Reference => "reference",
         AttentionKind::Tiled => "tiled",
+        AttentionKind::FlashPrefill => "flash-prefill",
         AttentionKind::DecodeSplitKv => "decode-split-kv",
         AttentionKind::FlashDecode => "flash-decode",
     }
@@ -1409,6 +1435,11 @@ mod tests {
             attention_kind(AttentionBenchmarkKind::Tiled),
             AttentionKind::Tiled,
             "tiled selection mismatch"
+        );
+        assert_eq!(
+            attention_kind(AttentionBenchmarkKind::FlashPrefill),
+            AttentionKind::FlashPrefill,
+            "flash-prefill selection mismatch"
         );
         assert_eq!(
             attention_kind(AttentionBenchmarkKind::DecodeSplitKv),

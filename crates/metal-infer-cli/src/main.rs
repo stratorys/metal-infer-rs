@@ -60,6 +60,7 @@ struct ServeArguments {
 enum Attention {
     Reference,
     Tiled,
+    FlashPrefill,
 }
 
 fn main() {
@@ -92,6 +93,7 @@ fn generate(arguments: GenerateArguments) -> Result<(), CliError> {
     model.set_attention_kind(match arguments.attention {
         Attention::Reference => AttentionKind::Reference,
         Attention::Tiled => AttentionKind::Tiled,
+        Attention::FlashPrefill => AttentionKind::FlashPrefill,
     });
     let required = prompt.len().saturating_add(arguments.max_tokens);
     if required > arguments.context {

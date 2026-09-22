@@ -13,6 +13,7 @@ use crate::{CommandBatch, CoreError, DType, MatmulBackend, MetalContext, Tensor}
 pub enum AttentionKind {
     Reference,
     Tiled,
+    FlashPrefill,
     DecodeSplitKv,
     FlashDecode,
 }
@@ -795,6 +796,7 @@ impl CommandBatch<'_> {
         let kernel = match kind {
             AttentionKind::Reference => "attention_reference_f16",
             AttentionKind::Tiled => "attention_tiled_f16",
+            AttentionKind::FlashPrefill => "attention_flash_prefill_f16",
             AttentionKind::DecodeSplitKv => "attention_decode_f16",
             AttentionKind::FlashDecode => unreachable!("handled above"),
         };
@@ -817,6 +819,14 @@ impl CommandBatch<'_> {
                     size(32, 1, 1),
                 )
             }
+            AttentionKind::FlashPrefill => (
+                size(
+                    checked_mul(tokens.div_ceil(32), 128, "flash prefill grid")?,
+                    config.query_heads,
+                    1,
+                ),
+                size(128, 1, 1),
+            ),
             AttentionKind::FlashDecode => unreachable!("handled above"),
         };
         self.dispatch(

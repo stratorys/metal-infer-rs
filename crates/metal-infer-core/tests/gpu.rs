@@ -268,6 +268,90 @@ fn fused_add_rms_norm_matches_individual_ops() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
+fn fused_decode_norm_projections_match_separate_ops() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let input_values: Vec<f32> = (0..256).map(|i| (i % 29) as f32 / 29.0 - 0.5).collect();
+    let right_values: Vec<f32> = (0..256).map(|i| (i % 19) as f32 / 38.0 - 0.25).collect();
+    let norm_values: Vec<f32> = (0..256).map(|i| 0.5 + (i % 17) as f32 / 34.0).collect();
+    let make_weight = |rows: usize, modulus: usize| {
+        let values: Vec<f32> = (0..rows * 256)
+            .map(|i| (i % modulus) as f32 / modulus as f32 - 0.5)
+            .collect();
+        context.tensor_f16(&values, &[rows, 256])
+    };
+    let input = context.tensor_f16(&input_values, &[1, 256])?;
+    let right = context.tensor_f16(&right_values, &[1, 256])?;
+    let norm_weight = context.tensor_f16(&norm_values, &[256])?;
+    let weight0 = make_weight(40, 31)?;
+    let weight1 = make_weight(24, 37)?;
+    let weight2 = make_weight(16, 41)?;
+    let normalized = context.rms_norm(&input, &norm_weight, 1.0e-6)?;
+    let mut batch = context.begin_batch()?;
+    let (expected0, expected1, expected2) =
+        batch.matmul3(&normalized, &weight0, &weight1, &weight2)?;
+    let (actual0, actual1, actual2) =
+        batch.rms_norm_matmul3(&input, &norm_weight, &weight0, &weight1, &weight2, 1.0e-6)?;
+    batch.finish()?;
+    assert_close(&actual0.to_f32_vec()?, &expected0.to_f32_vec()?);
+    assert_close(&actual1.to_f32_vec()?, &expected1.to_f32_vec()?);
+    assert_close(&actual2.to_f32_vec()?, &expected2.to_f32_vec()?);
+    let mut batch = context.begin_batch()?;
+    let (expected_residual, expected_normalized) =
+        batch.add_rms_norm(&input, &right, &norm_weight, 1.0e-6)?;
+    let (expected_gate, expected_up) = batch.matmul2(&expected_normalized, &weight0, &weight1)?;
+    let (actual_residual, actual_gate, actual_up) =
+        batch.add_rms_norm_matmul2(&input, &right, &norm_weight, &weight0, &weight1, 1.0e-6)?;
+    batch.finish()?;
+    assert_close(
+        &actual_residual.to_f32_vec()?,
+        &expected_residual.to_f32_vec()?,
+    );
+    assert_close(&actual_gate.to_f32_vec()?, &expected_gate.to_f32_vec()?);
+    assert_close(&actual_up.to_f32_vec()?, &expected_up.to_f32_vec()?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn auto_matvec_row_variants_match_reference() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    if !context.device_name().contains("M4 Pro") {
+        return Ok(());
+    }
+    let input_values: Vec<f32> = (0..256).map(|i| (i % 23) as f32 / 23.0 - 0.5).collect();
+    let input = context.tensor_f16(&input_values, &[1, 256])?;
+    let make_weight = |rows: usize, modulus: usize| {
+        let values: Vec<f32> = (0..rows * 256)
+            .map(|i| (i % modulus) as f32 / modulus as f32 - 0.5)
+            .collect();
+        context.tensor_f16(&values, &[rows, 256])
+    };
+    let weight0 = make_weight(40, 19)?;
+    let weight1 = make_weight(24, 29)?;
+    let weight2 = make_weight(16, 31)?;
+    context.set_matmul_backend(MatmulBackend::ReferenceMsl);
+    let expected0 = context.matmul(&input, &weight0)?.to_f32_vec()?;
+    let expected1 = context.matmul(&input, &weight1)?.to_f32_vec()?;
+    let expected2 = context.matmul(&input, &weight2)?.to_f32_vec()?;
+    context.set_matmul_backend(MatmulBackend::Auto);
+    for rows in [0, 2, 4, 8] {
+        context.set_auto_matvec_rows(rows, rows, rows, 0)?;
+        assert_close(&context.matmul(&input, &weight0)?.to_f32_vec()?, &expected0);
+        let mut batch = context.begin_batch()?;
+        let (two0, two1) = batch.matmul2(&input, &weight0, &weight1)?;
+        let (three0, three1, three2) = batch.matmul3(&input, &weight0, &weight1, &weight2)?;
+        batch.finish()?;
+        assert_close(&two0.to_f32_vec()?, &expected0);
+        assert_close(&two1.to_f32_vec()?, &expected1);
+        assert_close(&three0.to_f32_vec()?, &expected0);
+        assert_close(&three1.to_f32_vec()?, &expected1);
+        assert_close(&three2.to_f32_vec()?, &expected2);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
 fn fused_qk_transform_matches_individual_ops() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let query_values: Vec<f32> = (0..32).map(|index| index as f32 / 16.0 - 1.0).collect();
@@ -482,10 +566,16 @@ fn flash_decode_matches_reference_across_block_boundaries() -> Result<(), CoreEr
         let reference = context
             .attention(&query, &key, &value, config, AttentionKind::Reference)?
             .to_f32_vec()?;
-        let flash = context
-            .attention(&query, &key, &value, config, AttentionKind::FlashDecode)?
-            .to_f32_vec()?;
-        assert_close(&flash, &reference);
+        for block in [32, 64, 128, 256] {
+            for threads in [128, 256] {
+                let flash = context
+                    .attention_flash_decode_with_configuration(
+                        &query, &key, &value, config, block, threads,
+                    )?
+                    .to_f32_vec()?;
+                assert_close(&flash, &reference);
+            }
+        }
     }
     Ok(())
 }
@@ -518,10 +608,14 @@ fn flash_decode_matches_reference_for_multiple_gqa_groups_and_causal_limit() -> 
         let reference = context
             .attention(&query, &key, &value, config, AttentionKind::Reference)?
             .to_f32_vec()?;
-        let flash = context
-            .attention(&query, &key, &value, config, AttentionKind::FlashDecode)?
-            .to_f32_vec()?;
-        assert_close(&flash, &reference);
+        for threads in [128, 256] {
+            let flash = context
+                .attention_flash_decode_with_configuration(
+                    &query, &key, &value, config, 64, threads,
+                )?
+                .to_f32_vec()?;
+            assert_close(&flash, &reference);
+        }
     }
     Ok(())
 }

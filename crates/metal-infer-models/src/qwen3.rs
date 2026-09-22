@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use metal_infer_core::{
-    AttentionConfig, AttentionKind, CommandBatch, DType, DispatchStats, MetalContext,
-    QkNormRopeCacheConfig, Tensor,
+    AttentionConfig, AttentionKind, CommandBatch, DType, DispatchStats, MatmulBackend,
+    MetalContext, QkNormRopeCacheConfig, Tensor,
 };
 
 use crate::weights::WeightMap;
@@ -31,6 +31,7 @@ struct LayerWeights {
     mlp: MlpWeights,
 }
 
+#[derive(Clone)]
 struct LayerCache {
     key: Tensor,
     value: Tensor,
@@ -67,6 +68,7 @@ impl FusionOptions {
     };
 }
 
+#[derive(Clone)]
 pub struct KvCache {
     layers: Vec<LayerCache>,
     capacity: usize,
@@ -124,6 +126,7 @@ pub struct Qwen3Model {
     layers: Vec<LayerWeights>,
     final_norm: Tensor,
     lm_head: Tensor,
+    use_fused_decode_norm: bool,
     attention_kind: AttentionKind,
     fusion_options: FusionOptions,
 }
@@ -203,20 +206,113 @@ impl Qwen3Model {
             &[config.vocab_size, config.hidden_size],
             "LM head",
         )?;
-        Ok(Self {
+        if let Some(first) = layers.first() {
+            context.tune_auto_matvec_variants(
+                &first.attention.output,
+                [&first.mlp.gate, &first.mlp.up],
+                [
+                    &first.attention.query,
+                    &first.attention.key,
+                    &first.attention.value,
+                ],
+                &lm_head,
+            )?;
+        }
+        let _ = context.tune_flash_decode(
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+        );
+        let mut model = Self {
             context: context.clone(),
             config,
             embedding,
             layers,
             final_norm,
             lm_head,
+            use_fused_decode_norm: false,
             attention_kind: AttentionKind::Tiled,
             fusion_options: FusionOptions::RECOMMENDED,
-        })
+        };
+        model.tune_matvec_path()?;
+        model.tune_fused_decode_norm()?;
+        Ok(model)
     }
 
     pub const fn config(&self) -> &Qwen3Config {
         &self.config
+    }
+
+    fn tune_matvec_path(&mut self) -> Result<(), ModelError> {
+        if self.context.matmul_backend() != MatmulBackend::Auto
+            || !self.context.device_name().contains("M4 Pro")
+        {
+            return Ok(());
+        }
+        let saved_fusions = self.fusion_options;
+        self.fusion_options = FusionOptions::ALL;
+        let mut cache = KvCache::new(&self.context, &self.config, 516)?;
+        self.prefill(&vec![1; 512], &mut cache)?;
+        let mut normal = [0_u128; 3];
+        let mut tuned = [0_u128; 3];
+        for index in 0..3 {
+            for enabled in if index % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                self.context.set_auto_matvec_enabled(enabled);
+                let mut trial_cache = cache.clone();
+                let (_, stats) = self.decode_with_stats(1, &mut trial_cache)?;
+                if enabled {
+                    tuned[index] = stats.gpu_time.as_nanos();
+                } else {
+                    normal[index] = stats.gpu_time.as_nanos();
+                }
+            }
+        }
+        normal.sort_unstable();
+        tuned.sort_unstable();
+        self.context
+            .set_auto_matvec_enabled(tuned[1].saturating_mul(100) < normal[1].saturating_mul(99));
+        self.fusion_options = saved_fusions;
+        Ok(())
+    }
+
+    fn tune_fused_decode_norm(&mut self) -> Result<(), ModelError> {
+        if self.context.matmul_backend() != MatmulBackend::Auto
+            || !self.context.device_name().contains("M4 Pro")
+            || !self.config.hidden_size.is_multiple_of(256)
+        {
+            return Ok(());
+        }
+        let saved_fusions = self.fusion_options;
+        self.fusion_options = FusionOptions::ALL;
+        let mut cache = KvCache::new(&self.context, &self.config, 516)?;
+        self.prefill(&vec![1; 512], &mut cache)?;
+        let mut normal = [0_u128; 3];
+        let mut fused = [0_u128; 3];
+        for index in 0..3 {
+            for enabled in if index % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                self.use_fused_decode_norm = enabled;
+                let mut trial_cache = cache.clone();
+                let (_, stats) = self.decode_with_stats(1, &mut trial_cache)?;
+                if enabled {
+                    fused[index] = stats.gpu_time.as_nanos();
+                } else {
+                    normal[index] = stats.gpu_time.as_nanos();
+                }
+            }
+        }
+        normal.sort_unstable();
+        fused.sort_unstable();
+        self.use_fused_decode_norm = fused[1].saturating_mul(100) < normal[1].saturating_mul(99);
+        self.fusion_options = saved_fusions;
+        Ok(())
     }
 
     pub fn set_attention_kind(
@@ -404,20 +500,33 @@ impl Qwen3Model {
             .first()
             .copied()
             .ok_or_else(|| ModelError::Config("hidden state has no token dimension".into()))?;
-        let normalized = batch.rms_norm(&hidden, &layer.input_norm, self.config.rms_norm_eps)?;
-        let (query, key, value) = if self.fusion_options.qkv {
-            batch.matmul3(
-                &normalized,
+        let fused_qkv = tokens == 1 && self.use_fused_decode_norm && self.fusion_options.qkv;
+        let (query, key, value) = if fused_qkv {
+            batch.rms_norm_matmul3(
+                &hidden,
+                &layer.input_norm,
                 &layer.attention.query,
                 &layer.attention.key,
                 &layer.attention.value,
+                self.config.rms_norm_eps,
             )?
         } else {
-            (
-                batch.matmul(&normalized, &layer.attention.query)?,
-                batch.matmul(&normalized, &layer.attention.key)?,
-                batch.matmul(&normalized, &layer.attention.value)?,
-            )
+            let normalized =
+                batch.rms_norm(&hidden, &layer.input_norm, self.config.rms_norm_eps)?;
+            if self.fusion_options.qkv {
+                batch.matmul3(
+                    &normalized,
+                    &layer.attention.query,
+                    &layer.attention.key,
+                    &layer.attention.value,
+                )?
+            } else {
+                (
+                    batch.matmul(&normalized, &layer.attention.query)?,
+                    batch.matmul(&normalized, &layer.attention.key)?,
+                    batch.matmul(&normalized, &layer.attention.value)?,
+                )
+            }
         };
         let query = query.reshape(&[
             tokens,
@@ -483,29 +592,45 @@ impl Qwen3Model {
         )?;
         let attention = attention.reshape(&[tokens, self.config.query_width()])?;
         let attention = batch.matmul(&attention, &layer.attention.output)?;
-        let (residual, normalized) = if self.fusion_options.add_rms_norm {
-            batch.add_rms_norm(
+        let fused_gate_up = tokens == 1
+            && self.use_fused_decode_norm
+            && self.fusion_options.add_rms_norm
+            && self.fusion_options.gate_up;
+        let (residual, gate, up) = if fused_gate_up {
+            batch.add_rms_norm_matmul2(
                 &hidden,
                 &attention,
                 &layer.post_attention_norm,
+                &layer.mlp.gate,
+                &layer.mlp.up,
                 self.config.rms_norm_eps,
             )?
         } else {
-            let residual = batch.add(&hidden, &attention)?;
-            let normalized = batch.rms_norm(
-                &residual,
-                &layer.post_attention_norm,
-                self.config.rms_norm_eps,
-            )?;
-            (residual, normalized)
-        };
-        let (gate, up) = if self.fusion_options.gate_up {
-            batch.matmul2(&normalized, &layer.mlp.gate, &layer.mlp.up)?
-        } else {
-            (
-                batch.matmul(&normalized, &layer.mlp.gate)?,
-                batch.matmul(&normalized, &layer.mlp.up)?,
-            )
+            let (residual, normalized) = if self.fusion_options.add_rms_norm {
+                batch.add_rms_norm(
+                    &hidden,
+                    &attention,
+                    &layer.post_attention_norm,
+                    self.config.rms_norm_eps,
+                )?
+            } else {
+                let residual = batch.add(&hidden, &attention)?;
+                let normalized = batch.rms_norm(
+                    &residual,
+                    &layer.post_attention_norm,
+                    self.config.rms_norm_eps,
+                )?;
+                (residual, normalized)
+            };
+            let (gate, up) = if self.fusion_options.gate_up {
+                batch.matmul2(&normalized, &layer.mlp.gate, &layer.mlp.up)?
+            } else {
+                (
+                    batch.matmul(&normalized, &layer.mlp.gate)?,
+                    batch.matmul(&normalized, &layer.mlp.up)?,
+                )
+            };
+            (residual, gate, up)
         };
         let activated = batch.swiglu(&gate, &up)?;
         let down = batch.matmul(&activated, &layer.mlp.down)?;

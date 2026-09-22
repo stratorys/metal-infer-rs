@@ -20,6 +20,13 @@ struct MultiMatrixParams {
   uint n2;
   uint k;
 };
+struct NormMultiMatrixParams {
+  uint n0;
+  uint n1;
+  uint n2;
+  uint k;
+  float epsilon;
+};
 struct QkTransformParams {
   uint tokens;
   uint q_heads;
@@ -48,7 +55,7 @@ struct AttentionParams {
   uint causal;
   uint query_offset;
   uint kv_length;
-  uint _pad;
+  uint padding;
 };
 
 kernel void add_f16(device const half *a [[buffer(0)]],
@@ -350,6 +357,26 @@ kernel void matvec_tuned_f16(device const half *x [[buffer(0)]],
   matvec_tuned_impl<4>(x, weight, out, p, group, lane, simdgroup_index);
 }
 
+kernel void matvec_tuned2_f16(device const half *x [[buffer(0)]],
+                              device const half *weight [[buffer(1)]],
+                              device half *out [[buffer(2)]],
+                              constant MatrixParams &p [[buffer(3)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+  matvec_tuned_impl<2>(x, weight, out, p, group, lane, simdgroup_index);
+}
+
+kernel void matvec_tuned8_f16(device const half *x [[buffer(0)]],
+                              device const half *weight [[buffer(1)]],
+                              device half *out [[buffer(2)]],
+                              constant MatrixParams &p [[buffer(3)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+  matvec_tuned_impl<8>(x, weight, out, p, group, lane, simdgroup_index);
+}
+
 kernel void matvec_vocab_f16(device const half *x [[buffer(0)]],
                              device const half *weight [[buffer(1)]],
                              device half *out [[buffer(2)]],
@@ -598,6 +625,372 @@ kernel void matvec3_tuned_f16(device const half *x [[buffer(0)]],
         out1[row] = half(total1);
       if (row < p.n2)
         out2[row] = half(total2);
+    }
+  }
+}
+
+kernel void matvec2_tuned4_f16(device const half *x [[buffer(0)]],
+                              device const half *weight0 [[buffer(1)]],
+                              device const half *weight1 [[buffer(2)]],
+                              device half *out0 [[buffer(3)]],
+                              device half *out1 [[buffer(4)]],
+                              constant MultiMatrixParams &p [[buffer(5)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint simdgroup_index
+                              [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint rows = 4;
+  uint first_row = (group * 4 + simdgroup_index) * rows;
+  device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
+  float sums0[rows] = {};
+  float sums1[rows] = {};
+  for (uint i = lane * 2; i < p.k / 4; i += 64) {
+    float4 input0 = float4(x4[i]);
+    float4 input1 = float4(x4[i + 1]);
+    for (uint output = 0; output < rows; ++output) {
+      uint row = first_row + output;
+      if (row < p.n0) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight0 + row * p.k);
+        sums0[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n1) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight1 + row * p.k);
+        sums1[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+    }
+  }
+  for (uint output = 0; output < rows; ++output) {
+    uint row = first_row + output;
+    float total0 = simd_sum(sums0[output]);
+    float total1 = simd_sum(sums1[output]);
+    if (lane == 0) {
+      if (row < p.n0)
+        out0[row] = half(total0);
+      if (row < p.n1)
+        out1[row] = half(total1);
+    }
+  }
+}
+
+kernel void matvec3_tuned4_f16(device const half *x [[buffer(0)]],
+                              device const half *weight0 [[buffer(1)]],
+                              device const half *weight1 [[buffer(2)]],
+                              device const half *weight2 [[buffer(3)]],
+                              device half *out0 [[buffer(4)]],
+                              device half *out1 [[buffer(5)]],
+                              device half *out2 [[buffer(6)]],
+                              constant MultiMatrixParams &p [[buffer(7)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint simdgroup_index
+                              [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint rows = 4;
+  uint first_row = (group * 4 + simdgroup_index) * rows;
+  device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
+  float sums0[rows] = {};
+  float sums1[rows] = {};
+  float sums2[rows] = {};
+  for (uint i = lane * 2; i < p.k / 4; i += 64) {
+    float4 input0 = float4(x4[i]);
+    float4 input1 = float4(x4[i + 1]);
+    for (uint output = 0; output < rows; ++output) {
+      uint row = first_row + output;
+      if (row < p.n0) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight0 + row * p.k);
+        sums0[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n1) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight1 + row * p.k);
+        sums1[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n2) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight2 + row * p.k);
+        sums2[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+    }
+  }
+  for (uint output = 0; output < rows; ++output) {
+    uint row = first_row + output;
+    float total0 = simd_sum(sums0[output]);
+    float total1 = simd_sum(sums1[output]);
+    float total2 = simd_sum(sums2[output]);
+    if (lane == 0) {
+      if (row < p.n0)
+        out0[row] = half(total0);
+      if (row < p.n1)
+        out1[row] = half(total1);
+      if (row < p.n2)
+        out2[row] = half(total2);
+    }
+  }
+}
+
+kernel void matvec2_tuned8_f16(device const half *x [[buffer(0)]],
+                              device const half *weight0 [[buffer(1)]],
+                              device const half *weight1 [[buffer(2)]],
+                              device half *out0 [[buffer(3)]],
+                              device half *out1 [[buffer(4)]],
+                              constant MultiMatrixParams &p [[buffer(5)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint simdgroup_index
+                              [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint rows = 8;
+  uint first_row = (group * 4 + simdgroup_index) * rows;
+  device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
+  float sums0[rows] = {};
+  float sums1[rows] = {};
+  for (uint i = lane * 2; i < p.k / 4; i += 64) {
+    float4 input0 = float4(x4[i]);
+    float4 input1 = float4(x4[i + 1]);
+    for (uint output = 0; output < rows; ++output) {
+      uint row = first_row + output;
+      if (row < p.n0) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight0 + row * p.k);
+        sums0[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n1) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight1 + row * p.k);
+        sums1[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+    }
+  }
+  for (uint output = 0; output < rows; ++output) {
+    uint row = first_row + output;
+    float total0 = simd_sum(sums0[output]);
+    float total1 = simd_sum(sums1[output]);
+    if (lane == 0) {
+      if (row < p.n0)
+        out0[row] = half(total0);
+      if (row < p.n1)
+        out1[row] = half(total1);
+    }
+  }
+}
+
+kernel void matvec3_tuned8_f16(device const half *x [[buffer(0)]],
+                              device const half *weight0 [[buffer(1)]],
+                              device const half *weight1 [[buffer(2)]],
+                              device const half *weight2 [[buffer(3)]],
+                              device half *out0 [[buffer(4)]],
+                              device half *out1 [[buffer(5)]],
+                              device half *out2 [[buffer(6)]],
+                              constant MultiMatrixParams &p [[buffer(7)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint simdgroup_index
+                              [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint rows = 8;
+  uint first_row = (group * 4 + simdgroup_index) * rows;
+  device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
+  float sums0[rows] = {};
+  float sums1[rows] = {};
+  float sums2[rows] = {};
+  for (uint i = lane * 2; i < p.k / 4; i += 64) {
+    float4 input0 = float4(x4[i]);
+    float4 input1 = float4(x4[i + 1]);
+    for (uint output = 0; output < rows; ++output) {
+      uint row = first_row + output;
+      if (row < p.n0) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight0 + row * p.k);
+        sums0[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n1) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight1 + row * p.k);
+        sums1[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n2) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight2 + row * p.k);
+        sums2[output] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+    }
+  }
+  for (uint output = 0; output < rows; ++output) {
+    uint row = first_row + output;
+    float total0 = simd_sum(sums0[output]);
+    float total1 = simd_sum(sums1[output]);
+    float total2 = simd_sum(sums2[output]);
+    if (lane == 0) {
+      if (row < p.n0)
+        out0[row] = half(total0);
+      if (row < p.n1)
+        out1[row] = half(total1);
+      if (row < p.n2)
+        out2[row] = half(total2);
+    }
+  }
+}
+
+
+kernel void matvec3_rms_f16(device const half *x [[buffer(0)]],
+                            device const half *norm_weight [[buffer(1)]],
+                            device const half *weight0 [[buffer(2)]],
+                            device const half *weight1 [[buffer(3)]],
+                            device const half *weight2 [[buffer(4)]],
+                            device half *out0 [[buffer(5)]],
+                            device half *out1 [[buffer(6)]],
+                            device half *out2 [[buffer(7)]],
+                            constant NormMultiMatrixParams &p [[buffer(8)]],
+                            uint group [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint simdgroup_index
+                            [[simdgroup_index_in_threadgroup]]) {
+  uint thread_id = simdgroup_index * 32 + lane;
+  threadgroup float partial[4];
+  threadgroup float scale;
+  float square_sum = 0.0f;
+  for (uint i = thread_id; i < p.k; i += 128) {
+    float value = float(x[i]);
+    square_sum += value * value;
+  }
+  float simd_total = simd_sum(square_sum);
+  if (lane == 0)
+    partial[simdgroup_index] = simd_total;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_id == 0)
+    scale =
+        rsqrt((partial[0] + partial[1] + partial[2] + partial[3]) / float(p.k) +
+              p.epsilon);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint first_row = (group * 4 + simdgroup_index) * 2;
+  device const half4 *x4 = reinterpret_cast<device const half4 *>(x);
+  device const half4 *norm4 =
+      reinterpret_cast<device const half4 *>(norm_weight);
+  float sums0[2] = {};
+  float sums1[2] = {};
+  float sums2[2] = {};
+  for (uint i = lane * 2; i < p.k / 4; i += 64) {
+    float4 input0 = float4(half4(float4(x4[i]) * scale * float4(norm4[i])));
+    float4 input1 =
+        float4(half4(float4(x4[i + 1]) * scale * float4(norm4[i + 1])));
+    for (uint row_offset = 0; row_offset < 2; ++row_offset) {
+      uint row = first_row + row_offset;
+      if (row < p.n0) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight0 + row * p.k);
+        sums0[row_offset] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n1) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight1 + row * p.k);
+        sums1[row_offset] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n2) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight2 + row * p.k);
+        sums2[row_offset] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+    }
+  }
+  for (uint row_offset = 0; row_offset < 2; ++row_offset) {
+    uint row = first_row + row_offset;
+    float total0 = simd_sum(sums0[row_offset]);
+    float total1 = simd_sum(sums1[row_offset]);
+    float total2 = simd_sum(sums2[row_offset]);
+    if (lane == 0) {
+      if (row < p.n0)
+        out0[row] = half(total0);
+      if (row < p.n1)
+        out1[row] = half(total1);
+      if (row < p.n2)
+        out2[row] = half(total2);
+    }
+  }
+}
+
+kernel void matvec2_add_rms_f16(device const half *left [[buffer(0)]],
+                                device const half *right [[buffer(1)]],
+                                device const half *norm_weight [[buffer(2)]],
+                                device const half *weight0 [[buffer(3)]],
+                                device const half *weight1 [[buffer(4)]],
+                                device half *residual [[buffer(5)]],
+                                device half *out0 [[buffer(6)]],
+                                device half *out1 [[buffer(7)]],
+                                constant NormMultiMatrixParams &p [[buffer(8)]],
+                                uint group [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint simdgroup_index
+                                [[simdgroup_index_in_threadgroup]]) {
+  uint thread_id = simdgroup_index * 32 + lane;
+  threadgroup float partial[4];
+  threadgroup float scale;
+  float square_sum = 0.0f;
+  for (uint i = thread_id; i < p.k; i += 128) {
+    float value = float(left[i]) + float(right[i]);
+    square_sum += value * value;
+    if (group == 0)
+      residual[i] = half(value);
+  }
+  float simd_total = simd_sum(square_sum);
+  if (lane == 0)
+    partial[simdgroup_index] = simd_total;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_id == 0)
+    scale =
+        rsqrt((partial[0] + partial[1] + partial[2] + partial[3]) / float(p.k) +
+              p.epsilon);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint first_row = (group * 4 + simdgroup_index) * 2;
+  device const half4 *left4 = reinterpret_cast<device const half4 *>(left);
+  device const half4 *right4 = reinterpret_cast<device const half4 *>(right);
+  device const half4 *norm4 =
+      reinterpret_cast<device const half4 *>(norm_weight);
+  float sums0[2] = {};
+  float sums1[2] = {};
+  for (uint i = lane * 2; i < p.k / 4; i += 64) {
+    float4 residual0 = float4(half4(float4(left4[i]) + float4(right4[i])));
+    float4 residual1 =
+        float4(half4(float4(left4[i + 1]) + float4(right4[i + 1])));
+    float4 input0 = float4(half4(residual0 * scale * float4(norm4[i])));
+    float4 input1 = float4(half4(residual1 * scale * float4(norm4[i + 1])));
+    for (uint row_offset = 0; row_offset < 2; ++row_offset) {
+      uint row = first_row + row_offset;
+      if (row < p.n0) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight0 + row * p.k);
+        sums0[row_offset] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+      if (row < p.n1) {
+        device const half4 *w =
+            reinterpret_cast<device const half4 *>(weight1 + row * p.k);
+        sums1[row_offset] +=
+            dot(input0, float4(w[i])) + dot(input1, float4(w[i + 1]));
+      }
+    }
+  }
+  for (uint row_offset = 0; row_offset < 2; ++row_offset) {
+    uint row = first_row + row_offset;
+    float total0 = simd_sum(sums0[row_offset]);
+    float total1 = simd_sum(sums1[row_offset]);
+    if (lane == 0) {
+      if (row < p.n0)
+        out0[row] = half(total0);
+      if (row < p.n1)
+        out1[row] = half(total1);
     }
   }
 }
@@ -1080,7 +1473,7 @@ kernel void attention_flash_decode_partial_f16(
     uint group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint block_keys = 64;
+  uint block_keys = p.padding;
   constexpr uint tile_keys = 8;
   uint available = p.causal != 0 && p.query_offset < p.kv_length
                        ? p.query_offset + 1
@@ -1179,13 +1572,120 @@ kernel void attention_flash_decode_partial_f16(
   }
 }
 
+kernel void attention_flash_decode_partial_128_f16(
+    device const half *q [[buffer(0)]], device const half *k [[buffer(1)]],
+    device const half *v [[buffer(2)]], device float *scratch [[buffer(3)]],
+    constant AttentionParams &p [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+  uint block_keys = p.padding;
+  constexpr uint tile_keys = 4;
+  uint available = p.causal != 0 && p.query_offset < p.kv_length
+                       ? p.query_offset + 1
+                       : p.kv_length;
+  uint blocks = (available - 1) / block_keys + 1;
+  uint kvh = group / blocks;
+  uint block = group - kvh * blocks;
+  uint first = block * block_keys;
+  uint block_length = min(block_keys, available - first);
+  uint stride = p.head_dim + 2;
+  float scale = rsqrt(float(p.head_dim));
+
+  threadgroup float partial_max[2][tile_keys];
+  threadgroup float partial_sum[2][tile_keys];
+  threadgroup float partial_values[2][tile_keys][256];
+  float running_max[2] = {-INFINITY, -INFINITY};
+  float running_sum[2] = {0.0f, 0.0f};
+  float accumulator[2][8];
+  for (uint head = 0; head < 2; ++head)
+    for (uint component = 0; component < 8; ++component)
+      accumulator[head][component] = 0.0f;
+
+  for (uint tile_key = simdgroup_index; tile_key < block_length;
+       tile_key += tile_keys) {
+    uint source = ((first + tile_key) * p.kv_heads + kvh) * p.head_dim;
+    float key_values[8];
+    float value_values[8];
+    for (uint component = 0; component < 8; ++component) {
+      uint d = lane + component * 32;
+      key_values[component] = d < p.head_dim ? float(k[source + d]) : 0.0f;
+      value_values[component] = d < p.head_dim ? float(v[source + d]) : 0.0f;
+    }
+    for (uint head = 0; head < 2; ++head) {
+      uint qh = kvh * 2 + head;
+      float dot = 0.0f;
+      for (uint component = 0; component < 8; ++component) {
+        uint d = lane + component * 32;
+        if (d < p.head_dim)
+          dot += float(q[qh * p.head_dim + d]) * key_values[component];
+      }
+      float score = simd_sum(dot) * scale;
+      float next_max = max(running_max[head], score);
+      float previous_scale = exp(running_max[head] - next_max);
+      float current_scale = exp(score - next_max);
+      for (uint component = 0; component < 8; ++component) {
+        uint d = lane + component * 32;
+        if (d < p.head_dim) {
+          accumulator[head][component] =
+              accumulator[head][component] * previous_scale +
+              current_scale * value_values[component];
+        }
+      }
+      running_sum[head] = running_sum[head] * previous_scale + current_scale;
+      running_max[head] = next_max;
+    }
+  }
+
+  for (uint head = 0; head < 2; ++head) {
+    if (lane == 0) {
+      partial_max[head][simdgroup_index] = running_max[head];
+      partial_sum[head][simdgroup_index] = running_sum[head];
+    }
+    for (uint component = 0; component < 8; ++component) {
+      uint d = lane + component * 32;
+      if (d < p.head_dim)
+        partial_values[head][simdgroup_index][d] = accumulator[head][component];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (simdgroup_index == 0) {
+    for (uint head = 0; head < 2; ++head) {
+      float maximum = -INFINITY;
+      for (uint index = 0; index < tile_keys; ++index)
+        maximum = max(maximum, partial_max[head][index]);
+      float denominator = 0.0f;
+      for (uint index = 0; index < tile_keys; ++index)
+        denominator +=
+            partial_sum[head][index] * exp(partial_max[head][index] - maximum);
+      uint destination = ((kvh * blocks + block) * 2 + head) * stride;
+      if (lane == 0) {
+        scratch[destination] = maximum;
+        scratch[destination + 1] = denominator;
+      }
+      for (uint component = 0; component < 8; ++component) {
+        uint d = lane + component * 32;
+        if (d < p.head_dim) {
+          float numerator = 0.0f;
+          for (uint index = 0; index < tile_keys; ++index)
+            numerator += partial_values[head][index][d] *
+                         exp(partial_max[head][index] - maximum);
+          scratch[destination + 2 + d] = numerator;
+        }
+      }
+    }
+  }
+}
+
+
 kernel void
 attention_flash_decode_reduce_f16(device const float *scratch [[buffer(0)]],
                                   device half *out [[buffer(1)]],
                                   constant AttentionParams &p [[buffer(2)]],
                                   uint qh [[threadgroup_position_in_grid]],
                                   uint lane [[thread_index_in_threadgroup]]) {
-  constexpr uint block_keys = 64;
+  uint block_keys = p.padding;
   uint available = p.causal != 0 && p.query_offset < p.kv_length
                        ? p.query_offset + 1
                        : p.kv_length;
@@ -1199,17 +1699,21 @@ attention_flash_decode_reduce_f16(device const float *scratch [[buffer(0)]],
     maximum = max(maximum, scratch[source]);
   }
   float denominator = 0.0f;
+  float numerator[8] = {};
   for (uint block = 0; block < blocks; ++block) {
     uint source = ((kvh * blocks + block) * 2 + head) * stride;
-    denominator += scratch[source + 1] * exp(scratch[source] - maximum);
-  }
-  for (uint d = lane; d < p.head_dim; d += 32) {
-    float numerator = 0.0f;
-    for (uint block = 0; block < blocks; ++block) {
-      uint source = ((kvh * blocks + block) * 2 + head) * stride;
-      numerator += scratch[source + 2 + d] * exp(scratch[source] - maximum);
+    float factor = exp(scratch[source] - maximum);
+    denominator += scratch[source + 1] * factor;
+    for (uint component = 0; component < 8; ++component) {
+      uint d = lane + component * 32;
+      if (d < p.head_dim)
+        numerator[component] += scratch[source + 2 + d] * factor;
     }
-    out[qh * p.head_dim + d] = half(numerator / denominator);
+  }
+  for (uint component = 0; component < 8; ++component) {
+    uint d = lane + component * 32;
+    if (d < p.head_dim)
+      out[qh * p.head_dim + d] = half(numerator[component] / denominator);
   }
 }
 

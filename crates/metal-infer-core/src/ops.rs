@@ -59,6 +59,15 @@ struct MultiMatrixParams {
 }
 
 #[repr(C)]
+struct NormMultiMatrixParams {
+    n0: u32,
+    n1: u32,
+    n2: u32,
+    k: u32,
+    epsilon: f32,
+}
+
+#[repr(C)]
 struct QkTransformParams {
     tokens: u32,
     query_heads: u32,
@@ -164,6 +173,33 @@ impl MetalContext {
         self.immediate(|batch| batch.attention(query, key, value, config, kind))
     }
 
+    pub fn attention_flash_decode_with_block(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        config: AttentionConfig,
+        block_keys: usize,
+    ) -> Result<Tensor, CoreError> {
+        self.attention_flash_decode_with_configuration(query, key, value, config, block_keys, 256)
+    }
+
+    pub fn attention_flash_decode_with_configuration(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        config: AttentionConfig,
+        block_keys: usize,
+        threads: usize,
+    ) -> Result<Tensor, CoreError> {
+        self.immediate(|batch| {
+            batch.attention_flash_decode_with_configuration(
+                query, key, value, config, block_keys, threads,
+            )
+        })
+    }
+
     pub fn copy_into_cache(
         &self,
         source: &Tensor,
@@ -223,23 +259,29 @@ impl CommandBatch<'_> {
         if backend == MatmulBackend::Mps {
             self.matmul_mps(input, weight, &out, m, n, k)?;
         } else if m == 1 {
-            let tuned = native && k.is_multiple_of(256) && (!auto_m4 || n < 65_536);
             let vocabulary = n >= 65_536;
-            let outputs_per_threadgroup = if tuned {
-                if vocabulary { 8 } else { 16 }
+            let rows = if auto_m4 && k.is_multiple_of(256) {
+                let selected = self.context.auto_matvec_rows();
+                if vocabulary {
+                    selected.vocab
+                } else {
+                    selected.single
+                }
+            } else if native && k.is_multiple_of(256) {
+                if vocabulary { 2 } else { 4 }
             } else {
-                32
+                0
             };
+            let tuned = rows != 0;
+            let outputs_per_threadgroup = if tuned { rows * 4 } else { 32 };
             let groups = n.div_ceil(outputs_per_threadgroup);
             self.dispatch(
-                if tuned {
-                    if vocabulary {
-                        "matvec_vocab_f16"
-                    } else {
-                        "matvec_tuned_f16"
-                    }
-                } else {
-                    "matvec_f16"
+                match rows {
+                    2 if vocabulary => "matvec_vocab_f16",
+                    2 => "matvec_tuned2_f16",
+                    4 => "matvec_tuned_f16",
+                    8 => "matvec_tuned8_f16",
+                    _ => "matvec_f16",
                 },
                 &[input, weight, &out],
                 &params,
@@ -388,17 +430,27 @@ impl CommandBatch<'_> {
         };
         let outputs = n0.max(n1);
         let backend = self.context.matmul_backend();
-        let tuned = k.is_multiple_of(256)
-            && (backend == MatmulBackend::NativeMsl
-                || (backend == MatmulBackend::Auto && self.context.is_m4_pro()));
-        let rows_per_group = if tuned { 8 } else { 32 };
+        let rows = if k.is_multiple_of(256) {
+            if backend == MatmulBackend::NativeMsl {
+                2
+            } else if backend == MatmulBackend::Auto && self.context.is_m4_pro() {
+                self.context.auto_matvec_rows().fused2
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let tuned = rows != 0;
+        let rows_per_group = if tuned { rows * 4 } else { 32 };
         let threads = if tuned { 128 } else { 256 };
         let groups = outputs.div_ceil(rows_per_group);
         self.dispatch(
-            if tuned {
-                "matvec2_tuned_f16"
-            } else {
-                "matvec2_f16"
+            match rows {
+                2 => "matvec2_tuned_f16",
+                4 => "matvec2_tuned4_f16",
+                8 => "matvec2_tuned8_f16",
+                _ => "matvec2_f16",
             },
             &[input, weight0, weight1, &out0, &out1],
             &params,
@@ -444,17 +496,27 @@ impl CommandBatch<'_> {
         };
         let outputs = n0.max(n1).max(n2);
         let backend = self.context.matmul_backend();
-        let tuned = k.is_multiple_of(256)
-            && (backend == MatmulBackend::NativeMsl
-                || (backend == MatmulBackend::Auto && self.context.is_m4_pro()));
-        let rows_per_group = if tuned { 8 } else { 32 };
+        let rows = if k.is_multiple_of(256) {
+            if backend == MatmulBackend::NativeMsl {
+                2
+            } else if backend == MatmulBackend::Auto && self.context.is_m4_pro() {
+                self.context.auto_matvec_rows().fused3
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let tuned = rows != 0;
+        let rows_per_group = if tuned { rows * 4 } else { 32 };
         let threads = if tuned { 128 } else { 256 };
         let groups = outputs.div_ceil(rows_per_group);
         self.dispatch(
-            if tuned {
-                "matvec3_tuned_f16"
-            } else {
-                "matvec3_f16"
+            match rows {
+                2 => "matvec3_tuned_f16",
+                4 => "matvec3_tuned4_f16",
+                8 => "matvec3_tuned8_f16",
+                _ => "matvec3_f16",
             },
             &[input, weight0, weight1, weight2, &out0, &out1, &out2],
             &params,
@@ -462,6 +524,123 @@ impl CommandBatch<'_> {
             size(threads, 1, 1),
         )?;
         Ok((out0, out1, out2))
+    }
+
+    pub fn rms_norm_matmul3(
+        &mut self,
+        input: &Tensor,
+        norm_weight: &Tensor,
+        weight0: &Tensor,
+        weight1: &Tensor,
+        weight2: &Tensor,
+        epsilon: f32,
+    ) -> Result<(Tensor, Tensor, Tensor), CoreError> {
+        require_f16(input)?;
+        require_f16(norm_weight)?;
+        require_f16(weight0)?;
+        require_f16(weight1)?;
+        require_f16(weight2)?;
+        let [rows, width] = matrix_shape(input)?;
+        let [n0, k0] = matrix_shape(weight0)?;
+        let [n1, k1] = matrix_shape(weight1)?;
+        let [n2, k2] = matrix_shape(weight2)?;
+        if rows != 1
+            || !width.is_multiple_of(256)
+            || norm_weight.shape() != [width]
+            || k0 != width
+            || k1 != width
+            || k2 != width
+        {
+            return Err(CoreError::Shape(
+                "rms_norm_matmul3 requires one row and matching widths divisible by 256".into(),
+            ));
+        }
+        let out0 = self.empty(&[1, n0], DType::F16)?;
+        let out1 = self.empty(&[1, n1], DType::F16)?;
+        let out2 = self.empty(&[1, n2], DType::F16)?;
+        let params = NormMultiMatrixParams {
+            n0: to_u32(n0, "n0")?,
+            n1: to_u32(n1, "n1")?,
+            n2: to_u32(n2, "n2")?,
+            k: to_u32(width, "width")?,
+            epsilon,
+        };
+        let groups = n0.max(n1).max(n2).div_ceil(8);
+        self.dispatch(
+            "matvec3_rms_f16",
+            &[
+                input,
+                norm_weight,
+                weight0,
+                weight1,
+                weight2,
+                &out0,
+                &out1,
+                &out2,
+            ],
+            &params,
+            size(checked_mul(groups, 128, "rms matmul3 grid")?, 1, 1),
+            size(128, 1, 1),
+        )?;
+        Ok((out0, out1, out2))
+    }
+
+    pub fn add_rms_norm_matmul2(
+        &mut self,
+        left: &Tensor,
+        right: &Tensor,
+        norm_weight: &Tensor,
+        weight0: &Tensor,
+        weight1: &Tensor,
+        epsilon: f32,
+    ) -> Result<(Tensor, Tensor, Tensor), CoreError> {
+        require_f16(left)?;
+        require_f16(right)?;
+        require_f16(norm_weight)?;
+        require_f16(weight0)?;
+        require_f16(weight1)?;
+        require_same_shape(left, right)?;
+        let [rows, width] = matrix_shape(left)?;
+        let [n0, k0] = matrix_shape(weight0)?;
+        let [n1, k1] = matrix_shape(weight1)?;
+        if rows != 1
+            || !width.is_multiple_of(256)
+            || norm_weight.shape() != [width]
+            || k0 != width
+            || k1 != width
+        {
+            return Err(CoreError::Shape(
+                "add_rms_norm_matmul2 requires one row and matching widths divisible by 256".into(),
+            ));
+        }
+        let residual = self.empty(&[1, width], DType::F16)?;
+        let out0 = self.empty(&[1, n0], DType::F16)?;
+        let out1 = self.empty(&[1, n1], DType::F16)?;
+        let params = NormMultiMatrixParams {
+            n0: to_u32(n0, "n0")?,
+            n1: to_u32(n1, "n1")?,
+            n2: 0,
+            k: to_u32(width, "width")?,
+            epsilon,
+        };
+        let groups = n0.max(n1).div_ceil(8);
+        self.dispatch(
+            "matvec2_add_rms_f16",
+            &[
+                left,
+                right,
+                norm_weight,
+                weight0,
+                weight1,
+                &residual,
+                &out0,
+                &out1,
+            ],
+            &params,
+            size(checked_mul(groups, 128, "add rms matmul2 grid")?, 1, 1),
+            size(128, 1, 1),
+        )?;
+        Ok((residual, out0, out1))
     }
 
     pub fn rms_norm(
@@ -694,6 +873,48 @@ impl CommandBatch<'_> {
         config: AttentionConfig,
         kind: AttentionKind,
     ) -> Result<Tensor, CoreError> {
+        self.attention_with_flash_configuration(query, key, value, config, kind, None)
+    }
+
+    pub fn attention_flash_decode_with_block(
+        &mut self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        config: AttentionConfig,
+        block_keys: usize,
+    ) -> Result<Tensor, CoreError> {
+        self.attention_flash_decode_with_configuration(query, key, value, config, block_keys, 256)
+    }
+
+    pub fn attention_flash_decode_with_configuration(
+        &mut self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        config: AttentionConfig,
+        block_keys: usize,
+        threads: usize,
+    ) -> Result<Tensor, CoreError> {
+        self.attention_with_flash_configuration(
+            query,
+            key,
+            value,
+            config,
+            AttentionKind::FlashDecode,
+            Some((block_keys, threads)),
+        )
+    }
+
+    fn attention_with_flash_configuration(
+        &mut self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        config: AttentionConfig,
+        kind: AttentionKind,
+        flash_configuration: Option<(usize, usize)>,
+    ) -> Result<Tensor, CoreError> {
         require_f16(query)?;
         require_f16(key)?;
         require_f16(value)?;
@@ -730,6 +951,25 @@ impl CommandBatch<'_> {
                 "tiled attention requires a power-of-two head_dim <= 256".into(),
             ));
         }
+        let (flash_block_keys, flash_threads) = if kind == AttentionKind::FlashDecode {
+            let (block, threads) = flash_configuration.unwrap_or_else(|| {
+                self.context
+                    .flash_decode_configuration_for_length(*kv_length)
+            });
+            if !matches!(block, 32 | 64 | 128 | 256) {
+                return Err(CoreError::Shape(
+                    "flash decode block size must be 32, 64, 128, or 256".into(),
+                ));
+            }
+            if !matches!(threads, 128 | 256) {
+                return Err(CoreError::Shape(
+                    "flash decode threadgroup size must be 128 or 256".into(),
+                ));
+            }
+            (block, threads)
+        } else {
+            (0, 0)
+        };
         let out = self.empty(query.shape(), DType::F16)?;
         let params = AttentionParams {
             tokens: to_u32(*tokens, "tokens")?,
@@ -739,7 +979,7 @@ impl CommandBatch<'_> {
             causal: u32::from(config.causal),
             query_offset: to_u32(config.query_offset, "query_offset")?,
             kv_length: to_u32(*kv_length, "kv_length")?,
-            padding: 0,
+            padding: to_u32(flash_block_keys, "flash decode block size")?,
         };
         if matches!(
             kind,
@@ -766,7 +1006,7 @@ impl CommandBatch<'_> {
                     "flash decode requires at least one available key".into(),
                 ));
             }
-            let blocks = available.div_ceil(64);
+            let blocks = available.div_ceil(flash_block_keys);
             let partial_width = config
                 .head_dim
                 .checked_add(2)
@@ -774,11 +1014,19 @@ impl CommandBatch<'_> {
             let scratch = self.empty(&[config.kv_heads, blocks, 2, partial_width], DType::F32)?;
             let groups = checked_mul(config.kv_heads, blocks, "flash decode groups")?;
             self.dispatch(
-                "attention_flash_decode_partial_f16",
+                if flash_threads == 128 {
+                    "attention_flash_decode_partial_128_f16"
+                } else {
+                    "attention_flash_decode_partial_f16"
+                },
                 &[query, key, value, &scratch],
                 &params,
-                size(checked_mul(groups, 256, "flash decode grid")?, 1, 1),
-                size(256, 1, 1),
+                size(
+                    checked_mul(groups, flash_threads, "flash decode grid")?,
+                    1,
+                    1,
+                ),
+                size(flash_threads, 1, 1),
             )?;
             self.dispatch(
                 "attention_flash_decode_reduce_f16",

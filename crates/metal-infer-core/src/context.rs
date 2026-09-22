@@ -20,7 +20,7 @@ use objc2_metal::{
     MTLLibrary, MTLResourceOptions, MTLStorageMode,
 };
 
-use crate::{CoreError, DType, Tensor};
+use crate::{AttentionConfig, CoreError, DType, Tensor};
 
 const SHADERS: &str = include_str!("kernels/transformer.metal");
 const PROFILE_SAMPLE_CAPACITY: usize = 2048;
@@ -117,6 +117,25 @@ pub enum MatmulBackend {
     Mps,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AutoMatvecRows {
+    pub(crate) single: usize,
+    pub(crate) fused2: usize,
+    pub(crate) fused3: usize,
+    pub(crate) vocab: usize,
+}
+
+impl Default for AutoMatvecRows {
+    fn default() -> Self {
+        Self {
+            single: 4,
+            fused2: 2,
+            fused3: 2,
+            vocab: 0,
+        }
+    }
+}
+
 impl MatmulBackend {
     pub const fn name(self) -> &'static str {
         match self {
@@ -162,8 +181,11 @@ pub struct MetalContext {
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: RefCell<HashMap<String, Pipeline>>,
     matmul_backend: Rc<Cell<MatmulBackend>>,
+    auto_matvec_rows: Rc<Cell<AutoMatvecRows>>,
+    auto_matvec_enabled: Rc<Cell<bool>>,
     profile_tick_nanoseconds: Rc<Cell<Option<f64>>>,
     kernel_profiles: Rc<RefCell<Vec<KernelDispatchProfile>>>,
+    flash_decode_blocks: Rc<RefCell<Vec<(usize, usize, usize)>>>,
 }
 
 impl MetalContext {
@@ -184,8 +206,11 @@ impl MetalContext {
             library,
             pipelines: RefCell::new(HashMap::new()),
             matmul_backend: Rc::new(Cell::new(MatmulBackend::Auto)),
+            auto_matvec_rows: Rc::new(Cell::new(AutoMatvecRows::default())),
+            auto_matvec_enabled: Rc::new(Cell::new(true)),
             profile_tick_nanoseconds: Rc::new(Cell::new(None)),
             kernel_profiles: Rc::new(RefCell::new(Vec::new())),
+            flash_decode_blocks: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -195,6 +220,88 @@ impl MetalContext {
 
     pub(crate) fn is_m4_pro(&self) -> bool {
         self.is_m4_pro
+    }
+
+    pub(crate) fn flash_decode_configuration_for_length(
+        &self,
+        length: usize,
+    ) -> (usize, usize) {
+        self.flash_decode_blocks
+            .borrow()
+            .iter()
+            .find(|(limit, _, _)| length <= *limit)
+            .map_or((64, 256), |(_, block, threads)| (*block, *threads))
+    }
+
+    pub fn tune_flash_decode(
+        &self,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), CoreError> {
+        if !self.is_m4_pro || query_heads != kv_heads * 2 || head_dim == 0 {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let lengths = [512, 640, 1024, 2048, 4096, 8192];
+        let maximum = *lengths.last().unwrap();
+        let query = self.tensor_f16_bits(
+            &vec![0x3c00; query_heads * head_dim],
+            &[1, query_heads, head_dim],
+        )?;
+        let cache_values = vec![0x3800; maximum * kv_heads * head_dim];
+        let key = self.tensor_f16_bits(&cache_values, &[maximum, kv_heads, head_dim])?;
+        let value = self.tensor_f16_bits(&cache_values, &[maximum, kv_heads, head_dim])?;
+        let mut chosen = Vec::with_capacity(lengths.len());
+        for length in lengths {
+            if started.elapsed() >= Duration::from_secs(2) {
+                break;
+            }
+            let active_key = key.prefix(length)?;
+            let active_value = value.prefix(length)?;
+            let config = AttentionConfig {
+                query_heads,
+                kv_heads,
+                head_dim,
+                causal: true,
+                query_offset: length - 1,
+            };
+            let mut best = (u128::MAX, 64, 256);
+            for (block, threads) in [
+                (64, 256),
+                (32, 256),
+                (128, 256),
+                (256, 256),
+                (64, 128),
+                (32, 128),
+                (128, 128),
+                (256, 128),
+            ] {
+                if started.elapsed() >= Duration::from_secs(2) {
+                    break;
+                }
+                let mut samples = [0_u128; 3];
+                for sample in &mut samples {
+                    let mut batch = self.begin_batch()?;
+                    batch.attention_flash_decode_with_configuration(
+                        &query,
+                        &active_key,
+                        &active_value,
+                        config,
+                        block,
+                        threads,
+                    )?;
+                    *sample = batch.finish()?.gpu_time.as_nanos();
+                }
+                samples.sort_unstable();
+                if samples[1] < best.0 {
+                    best = (samples[1], block, threads);
+                }
+            }
+            chosen.push((length, best.1, best.2));
+        }
+        *self.flash_decode_blocks.borrow_mut() = chosen;
+        Ok(())
     }
 
     pub fn allocated_bytes(&self) -> usize {
@@ -210,6 +317,137 @@ impl MetalContext {
 
     pub fn matmul_backend(&self) -> MatmulBackend {
         self.matmul_backend.get()
+    }
+
+    pub(crate) fn auto_matvec_rows(&self) -> AutoMatvecRows {
+        if self.auto_matvec_enabled.get() {
+            self.auto_matvec_rows.get()
+        } else {
+            AutoMatvecRows::default()
+        }
+    }
+
+    pub fn set_auto_matvec_enabled(
+        &self,
+        enabled: bool,
+    ) {
+        self.auto_matvec_enabled.set(enabled);
+    }
+
+    pub fn set_auto_matvec_rows(
+        &self,
+        single: usize,
+        fused2: usize,
+        fused3: usize,
+        vocab: usize,
+    ) -> Result<(), CoreError> {
+        if !matches!(single, 0 | 2 | 4 | 8)
+            || !matches!(fused2, 0 | 2 | 4 | 8)
+            || !matches!(fused3, 0 | 2 | 4 | 8)
+            || !matches!(vocab, 0 | 2 | 4 | 8)
+        {
+            return Err(CoreError::Shape("invalid auto matvec row count".into()));
+        }
+        self.auto_matvec_rows.set(AutoMatvecRows {
+            single,
+            fused2,
+            fused3,
+            vocab,
+        });
+        Ok(())
+    }
+
+    fn measure_matvec_variant(
+        &self,
+        mut dispatch: impl FnMut(&mut CommandBatch<'_>) -> Result<(), CoreError>,
+    ) -> Result<u128, CoreError> {
+        let mut samples = [0_u128; 3];
+        for sample in &mut samples {
+            let mut batch = self.begin_batch()?;
+            dispatch(&mut batch)?;
+            *sample = batch.finish()?.gpu_time.as_nanos();
+        }
+        samples.sort_unstable();
+        Ok(samples[1])
+    }
+
+    pub fn tune_auto_matvec_variants(
+        &self,
+        single: &Tensor,
+        fused2: [&Tensor; 2],
+        fused3: [&Tensor; 3],
+        vocab: &Tensor,
+    ) -> Result<(), CoreError> {
+        if !self.is_m4_pro || self.matmul_backend() != MatmulBackend::Auto {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let input_for = |weight: &Tensor| -> Result<Tensor, CoreError> {
+            let width = *weight
+                .shape()
+                .get(1)
+                .ok_or_else(|| CoreError::Shape("matvec tuning requires matrix weights".into()))?;
+            self.tensor_f16_bits(&vec![0x3800; width], &[1, width])
+        };
+        let single_input = input_for(single)?;
+        let fused2_input = input_for(fused2[0])?;
+        let fused3_input = input_for(fused3[0])?;
+        let vocab_input = input_for(vocab)?;
+        let mut selected = AutoMatvecRows::default();
+        for family in 0..4 {
+            let candidates: &[usize] = if family == 3 {
+                &[0, 2, 4, 8]
+            } else if family == 0 {
+                &[4, 0, 2, 8]
+            } else {
+                &[2, 0, 4, 8]
+            };
+            let mut best = (u128::MAX, candidates[0]);
+            for &rows in candidates {
+                if started.elapsed() >= Duration::from_secs(3) {
+                    break;
+                }
+                match family {
+                    0 => selected.single = rows,
+                    1 => selected.fused2 = rows,
+                    2 => selected.fused3 = rows,
+                    _ => selected.vocab = rows,
+                }
+                self.auto_matvec_rows.set(selected);
+                let elapsed = match family {
+                    0 => self.measure_matvec_variant(|batch| {
+                        batch.matmul(&single_input, single)?;
+                        Ok(())
+                    }),
+                    1 => self.measure_matvec_variant(|batch| {
+                        batch.matmul2(&fused2_input, fused2[0], fused2[1])?;
+                        Ok(())
+                    }),
+                    2 => self.measure_matvec_variant(|batch| {
+                        batch.matmul3(&fused3_input, fused3[0], fused3[1], fused3[2])?;
+                        Ok(())
+                    }),
+                    _ => self.measure_matvec_variant(|batch| {
+                        batch.matmul(&vocab_input, vocab)?;
+                        Ok(())
+                    }),
+                };
+                let Ok(elapsed) = elapsed else {
+                    continue;
+                };
+                if elapsed < best.0 {
+                    best = (elapsed, rows);
+                }
+            }
+            match family {
+                0 => selected.single = best.1,
+                1 => selected.fused2 = best.1,
+                2 => selected.fused3 = best.1,
+                _ => selected.vocab = best.1,
+            }
+            self.auto_matvec_rows.set(selected);
+        }
+        Ok(())
     }
 
     /// Enables timestamp sampling for subsequent batches. Each profiled dispatch

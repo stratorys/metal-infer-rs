@@ -60,12 +60,7 @@ impl FusionOptions {
         qk_rope_cache: true,
     };
 
-    pub const RECOMMENDED: Self = Self {
-        qkv: true,
-        gate_up: false,
-        add_rms_norm: false,
-        qk_rope_cache: true,
-    };
+    pub const RECOMMENDED: Self = Self::ALL;
 }
 
 #[derive(Clone)]

@@ -4,6 +4,7 @@ Generated benchmark runs, grouped by machine and execution.
 
 | Generated | Device | Type | Report |
 |---|---|---|---|
+| `2026-09-22T23:44:34.489872+00:00` | Apple M4 Pro | model | [open](apple-m4-pro/20260922234434-9b90abb-model/README.md) |
 | `2026-09-22T22:22:54.184102+00:00` | Apple M4 Pro | model | [open](apple-m4-pro/20260922222254-b3b0eb5-model/README.md) |
 | `2026-09-22T21:09:36.383762+00:00` | Apple M4 Pro | model | [open](apple-m4-pro/20260922210936-2c53017-model/README.md) |
 | `2026-09-22T20:39:16.916617+00:00` | Apple M4 Pro | model | [open](apple-m4-pro/20260922203916-00d7ac8-model/README.md) |

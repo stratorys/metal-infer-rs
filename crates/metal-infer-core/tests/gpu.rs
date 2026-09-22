@@ -1,8 +1,78 @@
+use half::f16;
 use metal_infer_core::{
     AttentionConfig, AttentionKind, CoreError, MatmulBackend, MetalContext, QkNormRopeCacheConfig,
 };
 
 const TOLERANCE: f32 = 0.02;
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn argmax_f16_matches_cpu() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    for size in [1, 2, 31, 32, 33, 2048, 2049, 151_936] {
+        let mut bits: Vec<u16> = (0..size)
+            .map(|index| ((index as u32 * 1103 + 17) & 0xffff) as u16)
+            .collect();
+        *bits.first_mut().expect("nonempty logits") = 0x7c00; // infinity is ignored
+        if size > 1 {
+            *bits.get_mut(1).expect("second logit") = 0x7e00; // NaN is ignored
+            *bits.get_mut(size / 2).expect("middle logit") = 0x7bff;
+            *bits.last_mut().expect("last logit") = 0x7bff; // the last equal maximum wins
+        } else {
+            *bits.first_mut().expect("only logit") = 0;
+        }
+        let expected = bits
+            .iter()
+            .enumerate()
+            .map(|(index, bits)| (index, f16::from_bits(*bits).to_f32()))
+            .filter(|(_, value)| value.is_finite())
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(index, _)| index as u32)
+            .unwrap_or(u32::MAX);
+        let logits = context.tensor_f16_bits(&bits, &[size])?;
+        let output = context.tensor_u32(&[0], &[1])?;
+        let mut batch = context.begin_batch()?;
+        batch.argmax(&logits, &output)?;
+        batch.finish()?;
+        assert_eq!(output.to_u32_vec()?, vec![expected], "size {size}");
+    }
+    for bits in [[0x8000, 0], [0x7c00, 0x7e00]] {
+        let logits = context.tensor_f16_bits(&bits, &[2])?;
+        let output = context.tensor_u32(&[0], &[1])?;
+        let mut batch = context.begin_batch()?;
+        batch.argmax(&logits, &output)?;
+        batch.finish()?;
+        assert_eq!(
+            *output.to_u32_vec()?.first().expect("argmax output"),
+            if bits.first().copied() == Some(0x8000) {
+                1
+            } else {
+                u32::MAX
+            }
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn speculative_embedding_handles_missing_argmax() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let logits = context.tensor_f16_bits(&[0x7c00, 0x7e00], &[2])?;
+    let token = context.tensor_u32(&[0], &[1])?;
+    let table = context.tensor_f16(&[1.0, 2.0], &[1, 2])?;
+    let mut first = context.begin_batch()?;
+    first.argmax(&logits, &token)?;
+    let first = first.commit()?;
+    let mut second = context.begin_batch()?;
+    let embedded = second.embedding(&token, &table)?;
+    let second = second.commit()?;
+    first.wait()?;
+    second.wait()?;
+    assert_eq!(token.to_u32_vec()?, vec![u32::MAX]);
+    assert_eq!(embedded.to_f32_vec()?, vec![0.0, 0.0]);
+    Ok(())
+}
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]

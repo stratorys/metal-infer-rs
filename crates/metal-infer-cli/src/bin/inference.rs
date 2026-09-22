@@ -63,12 +63,12 @@ struct Sample {
 }
 
 #[derive(Serialize)]
-struct InferenceReport<'a> {
+struct InferenceReport<'workload> {
     schema_version: u32,
     kind: &'static str,
     backend: &'static str,
     mode: &'static str,
-    case_id: &'a str,
+    case_id: &'workload str,
     device: String,
     prompt_tokens: usize,
     output_tokens: usize,
@@ -160,14 +160,17 @@ fn run_sample(
         token_times_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         if step + 1 < workload.output_tokens {
             let input = match mode {
-                InferenceMode::Fixed => workload.forced_decode_ids[step],
+                InferenceMode::Fixed => *workload
+                    .forced_decode_ids
+                    .get(step)
+                    .expect("validated forced token trace"),
                 InferenceMode::Autoregressive => token,
             };
             fed_token_ids.push(input);
             logits = model.decode(input, cache)?;
         }
     }
-    let ttft_ms = token_times_ms[0];
+    let ttft_ms = *token_times_ms.first().expect("at least two output tokens");
     let total_ms = *token_times_ms.last().expect("at least two output tokens");
     Ok(Sample {
         ttft_ms,
@@ -193,7 +196,7 @@ fn argmax(values: &[f32]) -> Result<u32, CliError> {
 
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
-    values[values.len() / 2]
+    *values.get(values.len() / 2).expect("nonempty samples")
 }
 
 #[cfg(test)]

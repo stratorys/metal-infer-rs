@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::Path;
 
+use half::f16;
+
 use metal_infer_core::{
     AttentionConfig, AttentionKind, CommandBatch, DType, DispatchStats, MatmulBackend,
-    MetalContext, QkNormRopeCacheConfig, Tensor,
+    MetalContext, PendingBatch, QkNormRopeCacheConfig, Tensor,
 };
 
 use crate::weights::WeightMap;
@@ -383,6 +385,42 @@ impl Qwen3Model {
         self.forward_with_stats(&[token], cache)
     }
 
+    pub fn prefill_argmax(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        output: &Tensor,
+    ) -> Result<(Tensor, DispatchStats), ModelError> {
+        if tokens.is_empty() {
+            return Err(ModelError::Config(
+                "prefill requires at least one token".into(),
+            ));
+        }
+        cache.reset();
+        let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
+        let previous = cache.filled;
+        let (logits, pending) = self.forward_async(&token_tensor, cache, Some(output))?;
+        match pending.wait() {
+            Ok(stats) => Ok((logits, stats)),
+            Err(error) => {
+                cache.filled = previous;
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn decode_argmax<'model>(
+        &'model self,
+        token: &Tensor,
+        cache: &mut KvCache,
+        output: &Tensor,
+    ) -> Result<(Tensor, PendingBatch<'model>), ModelError> {
+        if token.shape() != [1] || token.dtype() != DType::U32 {
+            return Err(ModelError::Config("decode token must be one u32".into()));
+        }
+        self.forward_async(token, cache, Some(output))
+    }
+
     pub fn generate(
         &self,
         prompt: &[u32],
@@ -411,12 +449,15 @@ impl Qwen3Model {
         if options.max_tokens == 0 {
             return Ok(Vec::new());
         }
+        if options.temperature == 0.0 {
+            return self.generate_greedy(prompt, options, cache, on_token);
+        }
         let mut logits = self.prefill(prompt, cache)?;
         let mut generated = Vec::with_capacity(options.max_tokens);
         let mut random = XorShift64::new(options.seed);
         for step in 0..options.max_tokens {
-            let values = logits.to_f32_vec()?;
-            let token = sample_token(&values, options, &mut random)?;
+            let token =
+                logits.with_f16_bits(|bits| sample_token_f16(bits, options, &mut random))??;
             if options.stop_token_ids.contains(&token) {
                 break;
             }
@@ -426,6 +467,88 @@ impl Qwen3Model {
             }
             if step + 1 < options.max_tokens {
                 logits = self.decode(token, cache)?;
+            }
+        }
+        Ok(generated)
+    }
+
+    fn generate_greedy(
+        &self,
+        prompt: &[u32],
+        options: &GenerationOptions,
+        cache: &mut KvCache,
+        mut on_token: impl FnMut(u32) -> bool,
+    ) -> Result<Vec<u32>, ModelError> {
+        let slots = self
+            .context
+            .tensor_u32(&vec![u32::MAX; options.max_tokens], &[options.max_tokens])?;
+        let first = slots.slice_1d(0, 1)?;
+        let _ = self.prefill_argmax(prompt, cache, &first)?;
+        let mut generated = Vec::with_capacity(options.max_tokens);
+        let mut prefetched: Option<(PendingBatch<'_>, usize)> = None;
+        for step in 0..options.max_tokens {
+            let input = slots.slice_1d(step, 1)?;
+            let token = input
+                .to_u32_vec()?
+                .first()
+                .copied()
+                .ok_or_else(|| ModelError::Config("missing argmax token".into()))?;
+            if token == u32::MAX {
+                if let Some((pending, previous)) = prefetched.take() {
+                    let result = pending.wait();
+                    cache.filled = previous;
+                    result?;
+                }
+                return Err(ModelError::Config("logits contain no finite value".into()));
+            }
+            let pending = if step + 1 < options.max_tokens {
+                if let Some(pending) = prefetched.take() {
+                    Some(pending)
+                } else {
+                    let output = slots.slice_1d(step + 1, 1)?;
+                    let previous = cache.filled;
+                    Some((self.decode_argmax(&input, cache, &output)?.1, previous))
+                }
+            } else {
+                None
+            };
+            let stopped = options.stop_token_ids.contains(&token);
+            let continued = if stopped {
+                false
+            } else {
+                generated.push(token);
+                on_token(token)
+            };
+            if !continued {
+                if let Some((pending, previous)) = pending {
+                    let result = pending.wait();
+                    cache.filled = previous;
+                    result?;
+                }
+                break;
+            }
+            if let Some((pending, previous)) = pending {
+                let next = if step + 2 < options.max_tokens {
+                    let next_input = slots.slice_1d(step + 1, 1)?;
+                    let next_output = slots.slice_1d(step + 2, 1)?;
+                    let next_previous = cache.filled;
+                    match self.decode_argmax(&next_input, cache, &next_output) {
+                        Ok((_, batch)) => Some((batch, next_previous)),
+                        Err(error) => {
+                            let _ = pending.wait();
+                            cache.filled = previous;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Err(error) = pending.wait() {
+                    drop(next);
+                    cache.filled = previous;
+                    return Err(error.into());
+                }
+                prefetched = next;
             }
         }
         Ok(generated)
@@ -464,6 +587,29 @@ impl Qwen3Model {
         tokens: &[u32],
         cache: &mut KvCache,
     ) -> Result<(Tensor, DispatchStats), ModelError> {
+        let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
+        let previous = cache.filled;
+        let (logits, pending) = self.forward_async(&token_tensor, cache, None)?;
+        match pending.wait() {
+            Ok(stats) => Ok((logits, stats)),
+            Err(error) => {
+                cache.filled = previous;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn forward_async<'model>(
+        &'model self,
+        tokens: &Tensor,
+        cache: &mut KvCache,
+        argmax_output: Option<&Tensor>,
+    ) -> Result<(Tensor, PendingBatch<'model>), ModelError> {
+        if tokens.dtype() != DType::U32 || tokens.shape().len() != 1 || tokens.is_empty() {
+            return Err(ModelError::Config(
+                "tokens must be a nonempty u32 vector".into(),
+            ));
+        }
         if cache.layers.len() != self.layers.len() {
             return Err(ModelError::Config(
                 "KV cache layer count differs from model".into(),
@@ -476,9 +622,8 @@ impl Qwen3Model {
                 requested,
             });
         }
-        let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
         let mut batch = self.context.begin_batch()?;
-        let mut hidden = batch.embedding(&token_tensor, &self.embedding)?;
+        let mut hidden = batch.embedding(tokens, &self.embedding)?;
         let offset = cache.filled;
         for (layer_index, layer) in self.layers.iter().enumerate() {
             let layer_cache = cache
@@ -491,9 +636,12 @@ impl Qwen3Model {
         let normalized = batch.rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)?;
         let last = normalized.row(tokens.len() - 1)?;
         let logits = batch.matmul(&last, &self.lm_head)?;
-        let stats = batch.finish()?;
+        if let Some(output) = argmax_output {
+            batch.argmax(&logits.reshape(&[logits.len()])?, output)?;
+        }
+        let pending = batch.commit()?;
         cache.filled = requested;
-        Ok((logits, stats))
+        Ok((logits, pending))
     }
 
     fn forward_layer(
@@ -733,6 +881,7 @@ fn expect_shape(
     }
 }
 
+#[cfg(test)]
 fn argmax(values: &[f32]) -> Result<u32, ModelError> {
     let (index, _) = values
         .iter()
@@ -757,6 +906,7 @@ fn validate_generation_options(options: &GenerationOptions) -> Result<(), ModelE
     Ok(())
 }
 
+#[cfg(test)]
 fn sample_token(
     values: &[f32],
     options: &GenerationOptions,
@@ -765,18 +915,59 @@ fn sample_token(
     if options.temperature == 0.0 {
         return argmax(values);
     }
-    let mut candidates: Vec<(usize, f32)> = values
+    let candidates: Vec<(usize, f32)> = values
         .iter()
         .copied()
         .enumerate()
         .filter(|(_, value)| value.is_finite())
         .collect();
+    sample_candidates(candidates, options, random)
+}
+
+fn sample_token_f16(
+    bits: &[u16],
+    options: &GenerationOptions,
+    random: &mut XorShift64,
+) -> Result<u32, ModelError> {
+    let candidates: Vec<(usize, f32)> = bits
+        .iter()
+        .enumerate()
+        .map(|(index, bits)| (index, f16::from_bits(*bits).to_f32()))
+        .filter(|(_, value)| value.is_finite())
+        .collect();
+    sample_candidates(candidates, options, random)
+}
+
+fn sample_candidates(
+    mut candidates: Vec<(usize, f32)>,
+    options: &GenerationOptions,
+    random: &mut XorShift64,
+) -> Result<u32, ModelError> {
     if candidates.is_empty() {
         return Err(ModelError::Config("logits contain no finite value".into()));
     }
-    candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
     if options.top_k > 0 && candidates.len() > options.top_k {
-        candidates.truncate(options.top_k);
+        let mut original = candidates.clone();
+        candidates.select_nth_unstable_by(options.top_k, |left, right| right.1.total_cmp(&left.1));
+        let (top, rest) = candidates.split_at_mut(options.top_k);
+        top.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+        let has_tie = top.windows(2).any(|pair| {
+            pair.first()
+                .zip(pair.get(1))
+                .is_some_and(|(left, right)| left.1 == right.1)
+        }) || top
+            .last()
+            .zip(rest.first())
+            .is_some_and(|(last, next)| last.1 == next.1);
+        if has_tie {
+            original.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+            original.truncate(options.top_k);
+            candidates = original;
+        } else {
+            candidates.truncate(options.top_k);
+        }
+    } else {
+        candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
     }
     let max_logit = candidates
         .first()
@@ -845,8 +1036,10 @@ impl XorShift64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttentionKind, GenerationOptions, XorShift64, attention_kind_for_tokens, sample_token,
+        AttentionKind, GenerationOptions, KvCache, Qwen3Model, XorShift64, argmax,
+        attention_kind_for_tokens, sample_token,
     };
+    use metal_infer_core::MetalContext;
 
     #[test]
     fn tiled_attention_selects_flash_decode_for_long_gqa_decode() {
@@ -903,5 +1096,131 @@ mod tests {
         };
         let token = sample_token(&[1.0, 4.0, 2.0], &options, &mut XorShift64::new(1));
         assert_eq!(token.expect("sampling should succeed"), 1);
+    }
+
+    #[test]
+    #[ignore = "requires QWEN3_MODEL and direct access to an Apple Metal device"]
+    fn pipelined_greedy_matches_synchronous_bits() {
+        let model_path = std::env::var("QWEN3_MODEL").expect("set QWEN3_MODEL");
+        let context = MetalContext::new().expect("Metal device");
+        let model = Qwen3Model::load(std::path::Path::new(&model_path), &context).expect("model");
+        let prompt = vec![1; 512];
+        let mut synchronous_cache = KvCache::new(&context, model.config(), 576).expect("cache");
+        let mut pipelined_cache = KvCache::new(&context, model.config(), 576).expect("cache");
+        let mut synchronous = model
+            .prefill(&prompt, &mut synchronous_cache)
+            .expect("prefill");
+        let slots = context
+            .tensor_u32(&vec![u32::MAX; 64], &[64])
+            .expect("slots");
+        let (mut pipelined, _) = model
+            .prefill_argmax(
+                &prompt,
+                &mut pipelined_cache,
+                &slots.slice_1d(0, 1).expect("slot"),
+            )
+            .expect("prefill argmax");
+        let mut tokens = Vec::new();
+        let mut queued = None;
+        for step in 0..64 {
+            let expected_bits = synchronous
+                .with_f16_bits(|bits| bits.to_vec())
+                .expect("synchronous bits");
+            let actual_bits = pipelined
+                .with_f16_bits(|bits| bits.to_vec())
+                .expect("pipelined bits");
+            assert_eq!(actual_bits, expected_bits, "logits at step {step}");
+            let expected = argmax(&synchronous.to_f32_vec().expect("logits")).expect("CPU argmax");
+            let input = slots.slice_1d(step, 1).expect("slot");
+            let actual = input
+                .to_u32_vec()
+                .expect("GPU argmax")
+                .first()
+                .copied()
+                .expect("one token");
+            assert_eq!(actual, expected, "token at step {step}");
+            tokens.push(actual);
+            if step < 63 {
+                let (next, current) = if let Some(batch) = queued.take() {
+                    batch
+                } else {
+                    let output = slots.slice_1d(step + 1, 1).expect("next slot");
+                    model
+                        .decode_argmax(&input, &mut pipelined_cache, &output)
+                        .expect("pipelined decode")
+                };
+                let following = if step < 62 {
+                    let following_input = slots.slice_1d(step + 1, 1).expect("following slot");
+                    let following_output = slots.slice_1d(step + 2, 1).expect("following output");
+                    Some(
+                        model
+                            .decode_argmax(
+                                &following_input,
+                                &mut pipelined_cache,
+                                &following_output,
+                            )
+                            .expect("overlapped decode"),
+                    )
+                } else {
+                    None
+                };
+                synchronous = model
+                    .decode(expected, &mut synchronous_cache)
+                    .expect("synchronous decode");
+                current.wait().expect("decode completion");
+                pipelined = next;
+                queued = following;
+            }
+        }
+        let mut generation_cache = KvCache::new(&context, model.config(), 576).expect("cache");
+        let generated = model
+            .generate_with(
+                &prompt,
+                &GenerationOptions {
+                    max_tokens: 64,
+                    ..GenerationOptions::default()
+                },
+                &mut generation_cache,
+                |_| true,
+            )
+            .expect("generation");
+        assert_eq!(generated, tokens, "generate_with tokens");
+        let mut early_stop_cache = KvCache::new(&context, model.config(), 576).expect("cache");
+        let mut seen = 0;
+        let early = model
+            .generate_with(
+                &prompt,
+                &GenerationOptions {
+                    max_tokens: 64,
+                    ..GenerationOptions::default()
+                },
+                &mut early_stop_cache,
+                |_| {
+                    seen += 1;
+                    seen < 2
+                },
+            )
+            .expect("early stop");
+        assert_eq!(
+            early,
+            tokens.get(..2).expect("two tokens"),
+            "callback keeps emitted tokens"
+        );
+        assert_eq!(early_stop_cache.len(), 513, "speculative cache rolls back");
+        let mut stop_token_cache = KvCache::new(&context, model.config(), 576).expect("cache");
+        let stopped = model
+            .generate_with(
+                &prompt,
+                &GenerationOptions {
+                    max_tokens: 64,
+                    stop_token_ids: vec![*tokens.first().expect("first token")],
+                    ..GenerationOptions::default()
+                },
+                &mut stop_token_cache,
+                |_| true,
+            )
+            .expect("stop token");
+        assert!(stopped.is_empty(), "stop token is not emitted");
+        assert_eq!(stop_token_cache.len(), 512, "prefill length restored");
     }
 }

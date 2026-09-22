@@ -155,6 +155,8 @@ enum Command {
         matmul_backend: MatmulBackendArgument,
         #[arg(long)]
         profile_kernels: bool,
+        #[arg(long, value_enum, default_value_t = DecodeMode::Pipelined)]
+        decode_mode: DecodeMode,
     },
 }
 
@@ -162,6 +164,21 @@ enum Command {
 enum Format {
     Table,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DecodeMode {
+    Pipelined,
+    Synchronous,
+}
+
+impl DecodeMode {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Pipelined => "pipelined",
+            Self::Synchronous => "synchronous",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -238,6 +255,8 @@ struct Report {
     matmul_backend: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     decode_gemv_config: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decode_mode: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     shared_gate_up_input: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -590,6 +609,7 @@ fn run() -> Result<(), CliError> {
             shared_gate_up_input,
             matmul_backend,
             profile_kernels,
+            decode_mode,
         } => {
             if prompt == 0 || generate == 0 || iterations == 0 {
                 return Err(CliError::InvalidArguments(
@@ -657,11 +677,23 @@ fn run() -> Result<(), CliError> {
                 qk_rope_cache: fuse_qk_rope_cache,
             };
             model.set_fusion_options(fusion_options);
+            let effective_decode_mode = if profile_kernels {
+                DecodeMode::Synchronous
+            } else {
+                decode_mode
+            };
             let mut cache = KvCache::new(&context, model.config(), prompt + generate)?;
             let token_ids = vec![1; prompt];
             for _ in 0..warmup {
-                let _ =
-                    run_model_iteration(&context, &model, &token_ids, generate, &mut cache, false)?;
+                let _ = run_model_iteration(
+                    &context,
+                    &model,
+                    &token_ids,
+                    generate,
+                    &mut cache,
+                    false,
+                    effective_decode_mode,
+                )?;
             }
             if profile_kernels {
                 context.set_kernel_profiling(true)?;
@@ -679,6 +711,7 @@ fn run() -> Result<(), CliError> {
                     generate,
                     &mut cache,
                     profile_kernels,
+                    effective_decode_mode,
                 )?;
                 prefill_samples.push(prefill);
                 decode_samples.push(decode);
@@ -702,6 +735,7 @@ fn run() -> Result<(), CliError> {
                 kernel_profile,
             );
             report.decode_gemv_config = context.decode_gemv_config().map(DecodeGemvConfig::name);
+            report.decode_mode = Some(effective_decode_mode.name());
             report
         }
     };
@@ -1047,6 +1081,7 @@ fn run_attention_benchmark(
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
         decode_gemv_config: None,
+        decode_mode: None,
         shared_gate_up_input: None,
         allocation_growth_bytes: None,
         fusions: None,
@@ -1496,6 +1531,7 @@ fn measure_fusion_pair<E>(
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
         decode_gemv_config: None,
+        decode_mode: None,
         shared_gate_up_input: None,
         allocation_growth_bytes: Some(
             context
@@ -1658,6 +1694,7 @@ fn report(
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
         decode_gemv_config: None,
+        decode_mode: None,
         shared_gate_up_input: None,
         allocation_growth_bytes: None,
         fusions: None,
@@ -1676,6 +1713,7 @@ fn run_model_iteration(
     decode_tokens: usize,
     cache: &mut KvCache,
     profile_kernels: bool,
+    decode_mode: DecodeMode,
 ) -> Result<
     (
         PhaseSample,
@@ -1686,7 +1724,16 @@ fn run_model_iteration(
     CliError,
 > {
     let started = Instant::now();
-    let (_, prefill_stats) = model.prefill_with_stats(prompt, cache)?;
+    let slots = if decode_mode == DecodeMode::Pipelined {
+        Some(context.tensor_u32(&vec![u32::MAX; decode_tokens + 1], &[decode_tokens + 1])?)
+    } else {
+        None
+    };
+    let (mut logits, prefill_stats) = if let Some(slots) = &slots {
+        model.prefill_argmax(prompt, cache, &slots.slice_1d(0, 1)?)?
+    } else {
+        model.prefill_with_stats(prompt, cache)?
+    };
     let prefill = PhaseSample {
         wall: started.elapsed(),
         gpu: prefill_stats.gpu_time,
@@ -1697,11 +1744,26 @@ fn run_model_iteration(
         Vec::new()
     };
     let started = Instant::now();
-    let mut decode_gpu = Duration::ZERO;
-    for _ in 0..decode_tokens {
-        let (_, stats) = model.decode_with_stats(1, cache)?;
-        decode_gpu += stats.gpu_time;
-    }
+    let decode_gpu = if let Some(slots) = &slots {
+        run_pipelined_decode(model, slots, decode_tokens, cache)?
+    } else {
+        let mut gpu = Duration::ZERO;
+        for _ in 0..decode_tokens {
+            let values = logits.to_f32_vec()?;
+            let (token, _) = values
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .ok_or_else(|| {
+                    CliError::InvalidArguments("logits contain no finite value".into())
+                })?;
+            let (next_logits, stats) = model.decode_with_stats(token as u32, cache)?;
+            logits = next_logits;
+            gpu += stats.gpu_time;
+        }
+        gpu
+    };
     let decode_profile = if profile_kernels {
         context.take_kernel_profiles()
     } else {
@@ -1716,6 +1778,53 @@ fn run_model_iteration(
         prefill_profile,
         decode_profile,
     ))
+}
+
+fn run_pipelined_decode(
+    model: &Qwen3Model,
+    slots: &Tensor,
+    decode_tokens: usize,
+    cache: &mut KvCache,
+) -> Result<Duration, CliError> {
+    let mut gpu = Duration::ZERO;
+    let mut queued = None;
+    for step in 0..decode_tokens {
+        let current = if let Some(batch) = queued.take() {
+            batch
+        } else {
+            let input = slots.slice_1d(step, 1)?;
+            let output = slots.slice_1d(step + 1, 1)?;
+            model.decode_argmax(&input, cache, &output)?.1
+        };
+        let next = if step + 1 < decode_tokens {
+            let input = slots.slice_1d(step + 1, 1)?;
+            let output = slots.slice_1d(step + 2, 1)?;
+            match model.decode_argmax(&input, cache, &output) {
+                Ok((_, batch)) => Some(batch),
+                Err(error) => {
+                    let _ = current.wait();
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
+        match current.wait() {
+            Ok(stats) => gpu += stats.gpu_time,
+            Err(error) => {
+                drop(next);
+                return Err(error.into());
+            }
+        }
+        if slots.slice_1d(step + 1, 1)?.to_u32_vec()?.first().copied() == Some(u32::MAX) {
+            drop(next);
+            return Err(CliError::InvalidArguments(
+                "logits contain no finite value".into(),
+            ));
+        }
+        queued = next;
+    }
+    Ok(gpu)
 }
 
 fn kernel_phase_profile(
@@ -1800,6 +1909,7 @@ fn model_report(
         allocated_bytes: context.allocated_bytes(),
         matmul_backend: context.matmul_backend().name(),
         decode_gemv_config: None,
+        decode_mode: None,
         shared_gate_up_input: Some(context.shared_gate_up_input()),
         allocation_growth_bytes: Some(
             context

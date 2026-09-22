@@ -7,7 +7,7 @@ mod ops;
 mod tensor;
 
 pub use context::{
-    CommandBatch, DispatchStats, KernelDispatchProfile, MatmulBackend, MetalContext,
+    CommandBatch, DispatchStats, KernelDispatchProfile, MatmulBackend, MetalContext, PendingBatch,
 };
 pub use error::CoreError;
 pub use gemv_dispatch::DecodeGemvConfig;

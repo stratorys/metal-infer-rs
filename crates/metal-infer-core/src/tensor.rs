@@ -181,6 +181,50 @@ impl Tensor {
         })
     }
 
+    pub fn slice_1d(
+        &self,
+        start: usize,
+        len: usize,
+    ) -> Result<Self, CoreError> {
+        let [capacity] = self.shape.as_slice() else {
+            return Err(CoreError::Shape("slice_1d requires a rank-1 tensor".into()));
+        };
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| CoreError::Shape("slice_1d range overflow".into()))?;
+        if len == 0 || end > *capacity {
+            return Err(CoreError::Shape(format!(
+                "slice_1d range {start}..{end} is outside {:?}",
+                self.shape
+            )));
+        }
+        Ok(Self {
+            buffer: self.buffer.clone(),
+            offset_bytes: self.offset_bytes + start * self.dtype.size(),
+            shape: vec![len],
+            dtype: self.dtype,
+            scratch: self.scratch.clone(),
+        })
+    }
+
+    pub fn with_f16_bits<T>(
+        &self,
+        read: impl FnOnce(&[u16]) -> T,
+    ) -> Result<T, CoreError> {
+        if self.dtype != DType::F16 {
+            return Err(CoreError::DType {
+                expected: "f16",
+                actual: self.dtype.name(),
+            });
+        }
+        // SAFETY: the caller reads only after command completion; Tensor owns
+        // the shared buffer and checked views remain within its allocation.
+        let pointer =
+            unsafe { self.buffer.contents().as_ptr().add(self.offset_bytes) }.cast::<u16>();
+        let values = unsafe { std::slice::from_raw_parts(pointer, self.len()) };
+        Ok(read(values))
+    }
+
     pub fn to_f32_vec(&self) -> Result<Vec<f32>, CoreError> {
         if self.dtype != DType::F16 {
             return Err(CoreError::DType {

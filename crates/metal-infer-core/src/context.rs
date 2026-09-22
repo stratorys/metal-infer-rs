@@ -158,6 +158,16 @@ pub struct CommandBatch<'context> {
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     scratch: Rc<RefCell<ScratchState>>,
     pub(crate) profile: Option<KernelBatchProfile>,
+    committed: bool,
+}
+
+pub struct PendingBatch<'context> {
+    context: &'context MetalContext,
+    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    scratch: Rc<RefCell<ScratchState>>,
+    profile: Option<KernelBatchProfile>,
+    started: Instant,
+    completed: bool,
 }
 
 const SCRATCH_ALIGNMENT: usize = 256;
@@ -170,6 +180,7 @@ struct ScratchChunk {
 
 struct ScratchState {
     chunks: Vec<ScratchChunk>,
+    busy: bool,
 }
 
 pub(crate) struct ScratchLease {
@@ -198,6 +209,7 @@ pub struct MetalContext {
     profile_tick_nanoseconds: Rc<Cell<Option<f64>>>,
     kernel_profiles: Rc<RefCell<Vec<KernelDispatchProfile>>>,
     flash_decode_blocks: Rc<RefCell<Vec<(usize, usize, usize)>>>,
+    scratch_pools: Rc<RefCell<Vec<Rc<RefCell<ScratchState>>>>>,
 }
 
 impl MetalContext {
@@ -231,6 +243,7 @@ impl MetalContext {
             profile_tick_nanoseconds: Rc::new(Cell::new(None)),
             kernel_profiles: Rc::new(RefCell::new(Vec::new())),
             flash_decode_blocks: Rc::new(RefCell::new(Vec::new())),
+            scratch_pools: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -699,12 +712,28 @@ impl MetalContext {
                     .ok_or(CoreError::Resource("compute encoder"))?,
             )
         };
+        let scratch = {
+            let mut pools = self.scratch_pools.borrow_mut();
+            if let Some(state) = pools.iter().find(|state| !state.borrow().busy) {
+                let state = state.clone();
+                state.borrow_mut().busy = true;
+                state
+            } else {
+                let state = Rc::new(RefCell::new(ScratchState {
+                    chunks: Vec::new(),
+                    busy: true,
+                }));
+                pools.push(state.clone());
+                state
+            }
+        };
         Ok(CommandBatch {
             context: self,
             command_buffer,
             encoder,
-            scratch: Rc::new(RefCell::new(ScratchState { chunks: Vec::new() })),
+            scratch,
             profile,
+            committed: false,
         })
     }
 
@@ -878,7 +907,7 @@ impl MetalContext {
     }
 }
 
-impl CommandBatch<'_> {
+impl<'context> CommandBatch<'context> {
     pub(crate) fn end_compute_encoding(&mut self) -> Result<(), CoreError> {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
@@ -1000,12 +1029,32 @@ impl CommandBatch<'_> {
             .ok_or(CoreError::Resource("finished compute encoder"))
     }
 
-    pub fn finish(mut self) -> Result<DispatchStats, CoreError> {
+    pub fn commit(mut self) -> Result<PendingBatch<'context>, CoreError> {
         self.end_compute_encoding()?;
         let started = Instant::now();
         self.command_buffer.commit();
+        self.committed = true;
+        Ok(PendingBatch {
+            context: self.context,
+            command_buffer: self.command_buffer.clone(),
+            scratch: self.scratch.clone(),
+            profile: self.profile.take(),
+            started,
+            completed: false,
+        })
+    }
+
+    pub fn finish(self) -> Result<DispatchStats, CoreError> {
+        self.commit()?.wait()
+    }
+}
+
+impl PendingBatch<'_> {
+    pub fn wait(mut self) -> Result<DispatchStats, CoreError> {
         self.command_buffer.waitUntilCompleted();
-        let wall_time = started.elapsed();
+        self.completed = true;
+        self.scratch.borrow_mut().busy = false;
+        let wall_time = self.started.elapsed();
         if self.command_buffer.status() == MTLCommandBufferStatus::Error {
             return Err(self
                 .command_buffer
@@ -1030,6 +1079,15 @@ impl CommandBatch<'_> {
             gpu_time: Duration::from_secs_f64(gpu_seconds),
             wall_time,
         })
+    }
+}
+
+impl Drop for PendingBatch<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.command_buffer.waitUntilCompleted();
+            self.scratch.borrow_mut().busy = false;
+        }
     }
 }
 
@@ -1062,6 +1120,9 @@ impl Drop for CommandBatch<'_> {
     fn drop(&mut self) {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
+        }
+        if !self.committed {
+            self.scratch.borrow_mut().busy = false;
         }
     }
 }

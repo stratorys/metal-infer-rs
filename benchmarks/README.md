@@ -116,8 +116,9 @@ target/release/metal-infer-bench fusion --kind add-rms-norm
 target/release/metal-infer-bench fusion --kind qk-rope-cache
 ```
 
-The projection fusion commands accept `--matmul-backend native-msl` to measure
-candidate decode GEMV kernels before selecting them in `auto`.
+On M4 Pro, `--matmul-backend auto` selects the tuned fused decode GEMV kernels
+when `k` is divisible by 256. Use `--matmul-backend native-msl` to select them
+explicitly.
 
 Projection benchmarks default to the vectorized `K=1024` path. Pass `--k 1023`
 to QKV or gate/up to measure the scalar fallback. Reports contain separate GPU

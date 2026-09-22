@@ -386,8 +386,10 @@ impl CommandBatch<'_> {
             k: to_u32(k, "k")?,
         };
         let outputs = n0.max(n1);
-        let tuned =
-            k.is_multiple_of(256) && self.context.matmul_backend() == MatmulBackend::NativeMsl;
+        let backend = self.context.matmul_backend();
+        let tuned = k.is_multiple_of(256)
+            && (backend == MatmulBackend::NativeMsl
+                || (backend == MatmulBackend::Auto && self.context.is_m4_pro()));
         let rows_per_group = if tuned { 8 } else { 32 };
         let threads = if tuned { 128 } else { 256 };
         let groups = outputs.div_ceil(rows_per_group);
@@ -440,8 +442,10 @@ impl CommandBatch<'_> {
             k: to_u32(k, "k")?,
         };
         let outputs = n0.max(n1).max(n2);
-        let tuned =
-            k.is_multiple_of(256) && self.context.matmul_backend() == MatmulBackend::NativeMsl;
+        let backend = self.context.matmul_backend();
+        let tuned = k.is_multiple_of(256)
+            && (backend == MatmulBackend::NativeMsl
+                || (backend == MatmulBackend::Auto && self.context.is_m4_pro()));
         let rows_per_group = if tuned { 8 } else { 32 };
         let threads = if tuned { 128 } else { 256 };
         let groups = outputs.div_ceil(rows_per_group);

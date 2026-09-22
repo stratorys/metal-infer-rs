@@ -184,21 +184,64 @@ fn fused_projections_match_individual_matvecs() -> Result<(), CoreError> {
         let expected0 = context.matmul(&input, &weight0)?.to_f32_vec()?;
         let expected1 = context.matmul(&input, &weight1)?.to_f32_vec()?;
         let expected2 = context.matmul(&input, &weight2)?.to_f32_vec()?;
-        context.set_matmul_backend(MatmulBackend::NativeMsl);
+        for backend in [MatmulBackend::NativeMsl, MatmulBackend::Auto] {
+            context.set_matmul_backend(backend);
 
-        let mut batch = context.begin_batch()?;
-        let (actual0, actual1, actual2) = batch.matmul3(&input, &weight0, &weight1, &weight2)?;
-        batch.finish()?;
-        assert_close(&actual0.to_f32_vec()?, &expected0);
-        assert_close(&actual1.to_f32_vec()?, &expected1);
-        assert_close(&actual2.to_f32_vec()?, &expected2);
+            let mut batch = context.begin_batch()?;
+            let (actual0, actual1, actual2) =
+                batch.matmul3(&input, &weight0, &weight1, &weight2)?;
+            batch.finish()?;
+            assert_close(&actual0.to_f32_vec()?, &expected0);
+            assert_close(&actual1.to_f32_vec()?, &expected1);
+            assert_close(&actual2.to_f32_vec()?, &expected2);
 
-        let mut batch = context.begin_batch()?;
-        let (actual0, actual1) = batch.matmul2(&input, &weight0, &weight1)?;
-        batch.finish()?;
-        assert_close(&actual0.to_f32_vec()?, &expected0);
-        assert_close(&actual1.to_f32_vec()?, &expected1);
+            let mut batch = context.begin_batch()?;
+            let (actual0, actual1) = batch.matmul2(&input, &weight0, &weight1)?;
+            batch.finish()?;
+            assert_close(&actual0.to_f32_vec()?, &expected0);
+            assert_close(&actual1.to_f32_vec()?, &expected1);
+        }
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
+fn auto_fused_projections_match_reference_at_qwen_dimensions() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    let input_values: Vec<f32> = (0..1024)
+        .map(|index| (index % 31) as f32 / 31.0 - 0.5)
+        .collect();
+    let input = context.tensor_f16(&input_values, &[1, 1024])?;
+    let make_weight = |rows: usize, modulus: usize| {
+        let values: Vec<f32> = (0..rows * 1024)
+            .map(|index| (index % modulus) as f32 / modulus as f32 - 0.5)
+            .collect();
+        context.tensor_f16(&values, &[rows, 1024])
+    };
+    let query = make_weight(2048, 37)?;
+    let key = make_weight(1024, 41)?;
+    let value = make_weight(1024, 43)?;
+    let gate = make_weight(3072, 47)?;
+    let up = make_weight(3072, 53)?;
+
+    context.set_matmul_backend(MatmulBackend::ReferenceMsl);
+    let expected_query = context.matmul(&input, &query)?.to_f32_vec()?;
+    let expected_key = context.matmul(&input, &key)?.to_f32_vec()?;
+    let expected_value = context.matmul(&input, &value)?.to_f32_vec()?;
+    let expected_gate = context.matmul(&input, &gate)?.to_f32_vec()?;
+    let expected_up = context.matmul(&input, &up)?.to_f32_vec()?;
+
+    context.set_matmul_backend(MatmulBackend::Auto);
+    let mut batch = context.begin_batch()?;
+    let (actual_query, actual_key, actual_value) = batch.matmul3(&input, &query, &key, &value)?;
+    let (actual_gate, actual_up) = batch.matmul2(&input, &gate, &up)?;
+    batch.finish()?;
+    assert_close(&actual_query.to_f32_vec()?, &expected_query);
+    assert_close(&actual_key.to_f32_vec()?, &expected_key);
+    assert_close(&actual_value.to_f32_vec()?, &expected_value);
+    assert_close(&actual_gate.to_f32_vec()?, &expected_gate);
+    assert_close(&actual_up.to_f32_vec()?, &expected_up);
     Ok(())
 }
 

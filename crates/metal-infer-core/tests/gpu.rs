@@ -39,19 +39,21 @@ fn mps_matmul_matches_native_msl() -> Result<(), CoreError> {
 #[ignore = "requires direct access to an Apple Metal device"]
 fn simdgroup_matmul_matches_reference_msl() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
-    let input_values: Vec<f32> = (0..32 * 32)
-        .map(|index| (index % 19) as f32 / 19.0 - 0.5)
-        .collect();
-    let weight_values: Vec<f32> = (0..32 * 32)
-        .map(|index| (index % 23) as f32 / 23.0 - 0.5)
-        .collect();
-    let input = context.tensor_f16(&input_values, &[32, 32])?;
-    let weight = context.tensor_f16(&weight_values, &[32, 32])?;
-    context.set_matmul_backend(MatmulBackend::ReferenceMsl);
-    let expected = context.matmul(&input, &weight)?.to_f32_vec()?;
-    context.set_matmul_backend(MatmulBackend::NativeMsl);
-    let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
-    assert_close(&actual, &expected);
+    for (m, n, k) in [(32, 32, 32), (64, 96, 64), (31, 35, 37)] {
+        let input_values: Vec<f32> = (0..m * k)
+            .map(|index| (index % 19) as f32 / 19.0 - 0.5)
+            .collect();
+        let weight_values: Vec<f32> = (0..n * k)
+            .map(|index| (index % 23) as f32 / 23.0 - 0.5)
+            .collect();
+        let input = context.tensor_f16(&input_values, &[m, k])?;
+        let weight = context.tensor_f16(&weight_values, &[n, k])?;
+        context.set_matmul_backend(MatmulBackend::ReferenceMsl);
+        let expected = context.matmul(&input, &weight)?.to_f32_vec()?;
+        context.set_matmul_backend(MatmulBackend::NativeMsl);
+        let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
+        assert_close(&actual, &expected);
+    }
     Ok(())
 }
 
@@ -94,6 +96,31 @@ fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
+fn tuned_matvec_matches_reference_across_qwen_shapes() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    for (n, k) in [(1024, 1024), (1024, 3072), (65_537, 256)] {
+        let input_values: Vec<f32> = (0..k)
+            .map(|index| (index % 17) as f32 / 34.0 - 0.25)
+            .collect();
+        let weight_values: Vec<f32> = (0..n * k)
+            .map(|index| (index % 29) as f32 / 58.0 - 0.25)
+            .collect();
+        let input = context.tensor_f16(&input_values, &[1, k])?;
+        let weight = context.tensor_f16(&weight_values, &[n, k])?;
+        context.set_matmul_backend(MatmulBackend::ReferenceMsl);
+        let expected = context.matmul(&input, &weight)?.to_f32_vec()?;
+        context.set_matmul_backend(MatmulBackend::NativeMsl);
+        let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
+        assert_close(&actual, &expected);
+        context.set_matmul_backend(MatmulBackend::Auto);
+        let auto = context.matmul(&input, &weight)?.to_f32_vec()?;
+        assert_close(&auto, &expected);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple Metal device"]
 fn simd_rms_norm_matches_cpu() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let input_values: Vec<f32> = (0..3 * 65)
@@ -121,7 +148,7 @@ fn simd_rms_norm_matches_cpu() -> Result<(), CoreError> {
 #[ignore = "requires direct access to an Apple Metal device"]
 fn fused_projections_match_individual_matvecs() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
-    for k in [128, 127] {
+    for k in [1024, 128, 127] {
         let input_values: Vec<f32> = (0..k)
             .map(|index| (index % 17) as f32 / 17.0 - 0.5)
             .collect();
@@ -134,9 +161,11 @@ fn fused_projections_match_individual_matvecs() -> Result<(), CoreError> {
         let weight0 = context.tensor_f16(&weights(35, 19), &[35, k])?;
         let weight1 = context.tensor_f16(&weights(17, 23), &[17, k])?;
         let weight2 = context.tensor_f16(&weights(6, 29), &[6, k])?;
+        context.set_matmul_backend(MatmulBackend::ReferenceMsl);
         let expected0 = context.matmul(&input, &weight0)?.to_f32_vec()?;
         let expected1 = context.matmul(&input, &weight1)?.to_f32_vec()?;
         let expected2 = context.matmul(&input, &weight2)?.to_f32_vec()?;
+        context.set_matmul_backend(MatmulBackend::NativeMsl);
 
         let mut batch = context.begin_batch()?;
         let (actual0, actual1, actual2) = batch.matmul3(&input, &weight0, &weight1, &weight2)?;

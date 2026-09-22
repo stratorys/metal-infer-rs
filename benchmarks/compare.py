@@ -130,6 +130,8 @@ def arguments() -> argparse.Namespace:
     model = subparsers.add_parser("model")
     model.add_argument("--metal-model", type=pathlib.Path, required=True)
     model.add_argument("--mlx-model", required=True)
+    model.add_argument("--prompt", type=int, help="override suite prompt tokens")
+    model.add_argument("--generate", type=int, help="override suite decode tokens")
     model.add_argument("--gguf", type=pathlib.Path)
     model.add_argument("--llama-bench", type=pathlib.Path)
     model.add_argument("--fuse-qkv", action="store_true")
@@ -477,6 +479,14 @@ def main() -> None:
         if args.command == "kernels":
             results = kernel_results(suite["kernel"], runner)
         else:
+            if args.prompt is not None and args.prompt <= 0:
+                raise BenchmarkError("--prompt must be greater than zero")
+            if args.generate is not None and args.generate <= 0:
+                raise BenchmarkError("--generate must be greater than zero")
+            if args.prompt is not None:
+                suite["model"]["prompt_tokens"] = args.prompt
+            if args.generate is not None:
+                suite["model"]["generation_tokens"] = args.generate
             results = model_results(suite["model"], args, runner)
         write_results(args.result_dir, args.command, suite, results)
         print(

@@ -54,6 +54,8 @@ enum Command {
         iterations: usize,
         #[arg(long, default_value_t = 3)]
         warmup: usize,
+        #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
+        matmul_backend: MatmulBackendArgument,
     },
     Attention {
         #[arg(long, value_enum, default_value_t = AttentionBenchmarkKind::Compare)]
@@ -333,8 +335,10 @@ fn run() -> Result<(), CliError> {
             cache_capacity,
             iterations,
             warmup,
+            matmul_backend,
         } => {
             require_iterations(iterations)?;
+            context.set_matmul_backend(matmul_backend.into());
             run_fusion_benchmark(
                 &context,
                 kind,

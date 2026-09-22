@@ -215,18 +215,59 @@ impl CommandBatch<'_> {
             padding: 0,
         };
         let backend = self.context.matmul_backend();
+        let auto_m4 = backend == MatmulBackend::Auto && self.context.is_m4_pro();
+        let native = backend == MatmulBackend::NativeMsl || auto_m4;
         let simdgroup_compatible = m % 32 == 0 && n % 32 == 0 && k % 16 == 0;
         if backend == MatmulBackend::Mps {
             self.matmul_mps(input, weight, &out, m, n, k)?;
         } else if m == 1 {
-            let outputs_per_threadgroup = 32;
+            let tuned = native && k.is_multiple_of(256) && (!auto_m4 || n < 65_536);
+            let vocabulary = n >= 65_536;
+            let outputs_per_threadgroup = if tuned {
+                if vocabulary { 8 } else { 16 }
+            } else {
+                32
+            };
             let groups = n.div_ceil(outputs_per_threadgroup);
             self.dispatch(
-                "matvec_f16",
+                if tuned {
+                    if vocabulary {
+                        "matvec_vocab_f16"
+                    } else {
+                        "matvec_tuned_f16"
+                    }
+                } else {
+                    "matvec_f16"
+                },
                 &[input, weight, &out],
                 &params,
-                size(checked_mul(groups, 256, "matvec grid")?, 1, 1),
-                size(256, 1, 1),
+                size(
+                    checked_mul(groups, if tuned { 128 } else { 256 }, "matvec grid")?,
+                    1,
+                    1,
+                ),
+                size(if tuned { 128 } else { 256 }, 1, 1),
+            )?;
+        } else if native
+            && m % 32 == 0
+            && n % 32 == 0
+            && k % 32 == 0
+            && (!auto_m4 || (m >= 128 && n >= 256 && k >= 256))
+        {
+            self.dispatch(
+                "matmul_simd_db_f16",
+                &[input, weight, &out],
+                &params,
+                size(
+                    checked_mul(
+                        checked_mul(n / 32, m / 32, "simd matmul groups")?,
+                        128,
+                        "simd matmul grid",
+                    )?,
+                    1,
+                    1,
+                ),
+                size(128, 1, 1),
             )?;
         } else if backend == MatmulBackend::NativeMsl && simdgroup_compatible {
             self.dispatch(
@@ -344,13 +385,21 @@ impl CommandBatch<'_> {
             k: to_u32(k, "k")?,
         };
         let outputs = n0.max(n1);
-        let groups = outputs.div_ceil(32);
+        let tuned =
+            k.is_multiple_of(256) && self.context.matmul_backend() == MatmulBackend::NativeMsl;
+        let rows_per_group = if tuned { 8 } else { 32 };
+        let threads = if tuned { 128 } else { 256 };
+        let groups = outputs.div_ceil(rows_per_group);
         self.dispatch(
-            "matvec2_f16",
+            if tuned {
+                "matvec2_tuned_f16"
+            } else {
+                "matvec2_f16"
+            },
             &[input, weight0, weight1, &out0, &out1],
             &params,
-            size(checked_mul(groups, 256, "matmul2 grid")?, 1, 1),
-            size(256, 1, 1),
+            size(checked_mul(groups, threads, "matmul2 grid")?, 1, 1),
+            size(threads, 1, 1),
         )?;
         Ok((out0, out1))
     }
@@ -390,13 +439,21 @@ impl CommandBatch<'_> {
             k: to_u32(k, "k")?,
         };
         let outputs = n0.max(n1).max(n2);
-        let groups = outputs.div_ceil(32);
+        let tuned =
+            k.is_multiple_of(256) && self.context.matmul_backend() == MatmulBackend::NativeMsl;
+        let rows_per_group = if tuned { 8 } else { 32 };
+        let threads = if tuned { 128 } else { 256 };
+        let groups = outputs.div_ceil(rows_per_group);
         self.dispatch(
-            "matvec3_f16",
+            if tuned {
+                "matvec3_tuned_f16"
+            } else {
+                "matvec3_f16"
+            },
             &[input, weight0, weight1, weight2, &out0, &out1, &out2],
             &params,
-            size(checked_mul(groups, 256, "matmul3 grid")?, 1, 1),
-            size(256, 1, 1),
+            size(checked_mul(groups, threads, "matmul3 grid")?, 1, 1),
+            size(threads, 1, 1),
         )?;
         Ok((out0, out1, out2))
     }

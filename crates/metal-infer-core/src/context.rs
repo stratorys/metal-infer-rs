@@ -79,6 +79,7 @@ pub(crate) struct ScratchLease {
 pub struct MetalContext {
     pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(crate) queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    is_m4_pro: bool,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: RefCell<HashMap<String, Pipeline>>,
     matmul_backend: Rc<Cell<MatmulBackend>>,
@@ -94,9 +95,11 @@ impl MetalContext {
         let library = device
             .newLibraryWithSource_options_error(&source, None)
             .map_err(CoreError::Shader)?;
+        let is_m4_pro = device.name().to_string().contains("M4 Pro");
         Ok(Self {
             device,
             queue,
+            is_m4_pro,
             library,
             pipelines: RefCell::new(HashMap::new()),
             matmul_backend: Rc::new(Cell::new(MatmulBackend::Auto)),
@@ -105,6 +108,10 @@ impl MetalContext {
 
     pub fn device_name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    pub(crate) fn is_m4_pro(&self) -> bool {
+        self.is_m4_pro
     }
 
     pub fn allocated_bytes(&self) -> usize {

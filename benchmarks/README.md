@@ -18,6 +18,20 @@ JSON, an SVG graph, and a standalone README. Commands and their complete output
 are displayed as they run; each step ends with its elapsed time and primary
 metrics.
 
+For dispatch tuning, build the release binary and run repeated, alternating
+`reference-msl`, `native-msl`, and `auto` measurements. This reports median
+GPU and wall latency across rounds and can save every raw sample:
+
+```sh
+cargo build --release --bin metal-infer-bench
+uv run benchmarks/tune.py --rounds 3 --iterations 100 --warmup 10 \
+  --output /tmp/metal-infer-tuning.json
+```
+
+Pass `--model-config /path/to/Qwen3-0.6B` (repeatable for other Qwen3 model
+directories) to derive GEMM and GEMV shapes from each `config.json`.
+`--prompt-lengths 32 128 512` selects prefill M values.
+
 For automation, suppress child output and progress messages with:
 
 ```sh
@@ -57,6 +71,10 @@ prompt length, generation length, and power conditions match. llama.cpp is not
 included in the kernel table because `llama-bench` measures model execution,
 not an isolated generic matrix multiplication.
 
+Use `--prompt` and `--generate` to override the model suite's default lengths.
+Repeat with `--matmul-backend reference-msl` and `--matmul-backend auto` to
+measure the full-model effect of the dispatch selection.
+
 The model benchmark starts with every optional fusion disabled. Enable one or
 more families explicitly with `--fuse-qkv`, `--fuse-gate-up`,
 `--fuse-add-rms-norm`, and `--fuse-qk-rope-cache`. These flags are available on
@@ -79,6 +97,9 @@ target/release/metal-infer-bench fusion --kind gate-up
 target/release/metal-infer-bench fusion --kind add-rms-norm
 target/release/metal-infer-bench fusion --kind qk-rope-cache
 ```
+
+The projection fusion commands accept `--matmul-backend native-msl` to measure
+candidate decode GEMV kernels before selecting them in `auto`.
 
 Projection benchmarks default to the vectorized `K=1024` path. Pass `--k 1023`
 to QKV or gate/up to measure the scalar fallback. Reports contain separate GPU

@@ -33,6 +33,18 @@ enum Command {
         iterations: usize,
         #[arg(long, default_value_t = 3)]
         warmup: usize,
+        /// Distinct weight matrices dispatched in one command buffer.
+        #[arg(long)]
+        rotate: Option<usize>,
+        /// Force rows per SIMD group for the single-matrix auto GEMV path.
+        #[arg(long)]
+        rows: Option<usize>,
+        /// Divide K into this many partial GEMV dispatches, then reduce.
+        #[arg(long)]
+        split_k: Option<usize>,
+        /// Compare 16-byte vector loads in the one-row GEMV kernel.
+        #[arg(long)]
+        half8: bool,
         #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
         matmul_backend: MatmulBackendArgument,
     },
@@ -55,6 +67,12 @@ enum Command {
         iterations: usize,
         #[arg(long, default_value_t = 3)]
         warmup: usize,
+        /// Distinct sets of projection weights dispatched in one command buffer.
+        #[arg(long)]
+        rotate: Option<usize>,
+        /// Force rows per SIMD group for the fused auto GEMV path.
+        #[arg(long)]
+        rows: Option<usize>,
         #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
         matmul_backend: MatmulBackendArgument,
     },
@@ -118,7 +136,7 @@ enum Format {
     Json,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum MatmulBackendArgument {
     Auto,
     ReferenceMsl,
@@ -337,27 +355,66 @@ fn run() -> Result<(), CliError> {
             k,
             iterations,
             warmup,
+            rotate,
+            rows,
+            split_k,
+            half8,
             matmul_backend,
         } => {
             require_iterations(iterations)?;
             context.set_matmul_backend(matmul_backend.into());
-            let input = context.tensor_f16(&vec![0.01; m * k], &[m, k])?;
-            let weight = context.tensor_f16(&vec![0.02; n * k], &[n, k])?;
-            for _ in 0..warmup {
-                let _ = dispatch_matmul(&context, &input, &weight)?;
+            if let Some(rows) = rows {
+                if matmul_backend != MatmulBackendArgument::Auto || m != 1 || split_k.is_some() {
+                    return Err(CliError::InvalidArguments(
+                        "--rows requires auto GEMV and cannot be combined with --split-k".into(),
+                    ));
+                }
+                if n >= 65_536 && rows == 1 {
+                    return Err(CliError::InvalidArguments(
+                        "--rows 1 is unavailable for vocabulary GEMV".into(),
+                    ));
+                }
+                context.set_auto_matvec_rows(rows, 2, 2, if n >= 65_536 { rows } else { 0 })?;
             }
-            let (samples, gpu_samples) =
-                measure_dispatch(iterations, || dispatch_matmul(&context, &input, &weight))?;
-            let operations = 2.0 * m as f64 * n as f64 * k as f64;
-            let throughput = (operations / 1.0e12) / mean_seconds(&samples);
-            report(
-                format!("matmul_f16[{m},{n},{k}]"),
-                &context,
-                samples,
-                Some(gpu_samples),
-                Some(throughput),
-                Some("TFLOP/s"),
-            )
+            if let Some(splits) = split_k {
+                if matmul_backend != MatmulBackendArgument::Auto || m != 1 {
+                    return Err(CliError::InvalidArguments(
+                        "--split-k requires --matmul-backend auto and m=1".into(),
+                    ));
+                }
+                context.set_auto_matvec_split_k(splits)?;
+            }
+            if half8 {
+                if matmul_backend != MatmulBackendArgument::Auto || m != 1 || rows != Some(1) {
+                    return Err(CliError::InvalidArguments(
+                        "--half8 requires auto GEMV, m=1, and --rows 1".into(),
+                    ));
+                }
+                context.set_auto_matvec_half8(true);
+            }
+            if let Some(copies) = rotate {
+                run_rotated_matvec(
+                    &context, m, n, k, copies, iterations, warmup, rows, split_k, half8,
+                )?
+            } else {
+                let input = context.tensor_f16(&vec![0.01; m * k], &[m, k])?;
+                let weight = context.tensor_f16(&vec![0.02; n * k], &[n, k])?;
+                for _ in 0..warmup {
+                    let _ = dispatch_matmul(&context, &input, &weight)?;
+                }
+                let (samples, gpu_samples) =
+                    measure_dispatch(iterations, || dispatch_matmul(&context, &input, &weight))?;
+                let operations = 2.0 * m as f64 * n as f64 * k as f64;
+                let throughput = (operations / 1.0e12) / mean_seconds(&samples);
+                report(
+                    format!("matmul_f16[{m},{n},{k}]"),
+                    &context,
+                    samples,
+                    Some(gpu_samples),
+                    Some(throughput),
+                    Some("TFLOP/s"),
+                )
+            }
         }
         Command::Fusion {
             kind,
@@ -369,10 +426,22 @@ fn run() -> Result<(), CliError> {
             cache_capacity,
             iterations,
             warmup,
+            rotate,
+            rows,
             matmul_backend,
         } => {
             require_iterations(iterations)?;
             context.set_matmul_backend(matmul_backend.into());
+            if let Some(rows) = rows {
+                if matmul_backend != MatmulBackendArgument::Auto
+                    || !matches!(kind, FusionKind::Qkv | FusionKind::GateUp)
+                {
+                    return Err(CliError::InvalidArguments(
+                        "fusion --rows requires auto QKV or gate-up GEMV".into(),
+                    ));
+                }
+                context.set_auto_matvec_rows(4, rows, rows, 0)?;
+            }
             run_fusion_benchmark(
                 &context,
                 kind,
@@ -386,6 +455,8 @@ fn run() -> Result<(), CliError> {
                 },
                 iterations,
                 warmup,
+                rotate,
+                rows,
             )?
         }
         Command::Attention {
@@ -595,6 +666,72 @@ fn dispatch_matmul(
     let mut batch = context.begin_batch()?;
     let _output = batch.matmul(input, weight)?;
     batch.finish()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rotated_matvec(
+    context: &MetalContext,
+    m: usize,
+    n: usize,
+    k: usize,
+    copies: usize,
+    iterations: usize,
+    warmup: usize,
+    rows: Option<usize>,
+    split_k: Option<usize>,
+    half8: bool,
+) -> Result<Report, CliError> {
+    if m != 1 || n == 0 || k == 0 || copies == 0 {
+        return Err(CliError::InvalidArguments(
+            "--rotate requires m=1 and positive n, k, and copy count".into(),
+        ));
+    }
+    let elements = n
+        .checked_mul(k)
+        .ok_or_else(|| CliError::InvalidArguments("matrix element count overflow".into()))?;
+    let weight_bytes = elements
+        .checked_mul(2)
+        .ok_or_else(|| CliError::InvalidArguments("matrix byte count overflow".into()))?;
+    let working_set = weight_bytes
+        .checked_mul(copies)
+        .ok_or_else(|| CliError::InvalidArguments("rotated working set overflow".into()))?;
+    let input = context.tensor_f16(&vec![0.01; k], &[1, k])?;
+    let values = vec![0.02; elements];
+    let weights = (0..copies)
+        .map(|_| context.tensor_f16(&values, &[n, k]))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut dispatch = || {
+        let mut batch = context.begin_batch()?;
+        let outputs = weights
+            .iter()
+            .map(|weight| batch.matmul(&input, weight))
+            .collect::<Result<Vec<_>, _>>()?;
+        let stats = batch.finish()?;
+        drop(outputs);
+        Ok::<DispatchStats, metal_infer_core::CoreError>(stats)
+    };
+    for _ in 0..warmup {
+        dispatch()?;
+    }
+    let (mut wall, mut gpu) = measure_dispatch(iterations, &mut dispatch)?;
+    let divisor = copies as f64;
+    for sample in &mut wall {
+        *sample = Duration::from_secs_f64(sample.as_secs_f64() / divisor);
+    }
+    for sample in &mut gpu {
+        *sample = Duration::from_secs_f64(sample.as_secs_f64() / divisor);
+    }
+    let bandwidth = weight_bytes as f64 / 1.0e9 / mean_seconds(&gpu);
+    Ok(report(
+        format!(
+            "matvec_f16[1,{n},{k},rotate={copies},rows={rows:?},split_k={split_k:?},half8={half8},working_set={working_set}]"
+        ),
+        context,
+        wall,
+        Some(gpu),
+        Some(bandwidth),
+        Some("GB/s GPU weight reads"),
+    ))
 }
 
 fn dispatch_attention(
@@ -888,6 +1025,8 @@ fn run_fusion_benchmark(
     dimensions: FusionDimensions,
     iterations: usize,
     warmup: usize,
+    rotate: Option<usize>,
+    rows: Option<usize>,
 ) -> Result<Report, CliError> {
     let FusionDimensions {
         k,
@@ -907,6 +1046,23 @@ fn run_fusion_benchmark(
         return Err(CliError::InvalidArguments(
             "fusion benchmark dimensions must be greater than zero".into(),
         ));
+    }
+    if let Some(copies) = rotate {
+        if copies == 0 || !matches!(kind, FusionKind::Qkv | FusionKind::GateUp) {
+            return Err(CliError::InvalidArguments(
+                "fusion --rotate requires a positive copy count and QKV or gate-up".into(),
+            ));
+        }
+        let widths = match kind {
+            FusionKind::Qkv => vec![
+                query_heads * head_dim,
+                kv_heads * head_dim,
+                kv_heads * head_dim,
+            ],
+            FusionKind::GateUp => vec![intermediate, intermediate],
+            FusionKind::AddRmsNorm | FusionKind::QkRopeCache => unreachable!(),
+        };
+        return run_rotated_fusion(context, kind, k, &widths, copies, iterations, warmup, rows);
     }
     match kind {
         FusionKind::Qkv => {
@@ -1002,6 +1158,101 @@ fn run_fusion_benchmark(
             )?)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rotated_fusion(
+    context: &MetalContext,
+    kind: FusionKind,
+    k: usize,
+    widths: &[usize],
+    copies: usize,
+    iterations: usize,
+    warmup: usize,
+    rows: Option<usize>,
+) -> Result<Report, CliError> {
+    let elements = widths
+        .iter()
+        .try_fold(0usize, |sum, width| {
+            width
+                .checked_mul(k)
+                .and_then(|count| sum.checked_add(count))
+        })
+        .ok_or_else(|| CliError::InvalidArguments("projection size overflow".into()))?;
+    let weight_bytes = elements
+        .checked_mul(2)
+        .ok_or_else(|| CliError::InvalidArguments("projection byte count overflow".into()))?;
+    let working_set = weight_bytes
+        .checked_mul(copies)
+        .ok_or_else(|| CliError::InvalidArguments("rotated working set overflow".into()))?;
+    let input = context.tensor_f16(&vec![0.01; k], &[1, k])?;
+    let mut weights = Vec::with_capacity(copies);
+    for _ in 0..copies {
+        let mut projections = Vec::with_capacity(widths.len());
+        for (index, &width) in widths.iter().enumerate() {
+            projections.push(
+                context.tensor_f16(&vec![0.02 + index as f32 * 0.01; width * k], &[width, k])?,
+            );
+        }
+        weights.push(projections);
+    }
+    let dispatch = |fused: bool| -> Result<DispatchStats, metal_infer_core::CoreError> {
+        let mut batch = context.begin_batch()?;
+        let mut outputs = Vec::with_capacity(copies * widths.len());
+        for projections in &weights {
+            match (kind, fused) {
+                (FusionKind::Qkv, true) => {
+                    let (q, kv) = projections.split_first().expect("QKV widths validated");
+                    let key = kv.first().expect("QKV widths validated");
+                    let value = kv.get(1).expect("QKV widths validated");
+                    let (a, b, c) = batch.matmul3(&input, q, key, value)?;
+                    outputs.extend([a, b, c]);
+                }
+                (FusionKind::GateUp, true) => {
+                    let gate = projections.first().expect("gate-up widths validated");
+                    let up = projections.get(1).expect("gate-up widths validated");
+                    let (a, b) = batch.matmul2(&input, gate, up)?;
+                    outputs.extend([a, b]);
+                }
+                _ => {
+                    for projection in projections {
+                        outputs.push(batch.matmul(&input, projection)?);
+                    }
+                }
+            }
+        }
+        let stats = batch.finish()?;
+        drop(outputs);
+        Ok(stats)
+    };
+    let mut report = measure_fusion_pair(
+        context,
+        format!("{kind:?}_f16[k={k},rotate={copies},rows={rows:?},working_set={working_set}]"),
+        iterations,
+        warmup,
+        || dispatch(false),
+        || dispatch(true),
+    )?;
+    let divisor = copies as f64;
+    if let Some(comparison) = report.comparison.as_mut() {
+        for timing in [&mut comparison.unfused, &mut comparison.fused] {
+            timing.wall_mean_ms /= divisor;
+            timing.wall_median_ms /= divisor;
+            timing.wall_p95_ms /= divisor;
+            timing.gpu_mean_ms /= divisor;
+            timing.gpu_median_ms /= divisor;
+            timing.gpu_p95_ms /= divisor;
+        }
+        report.mean_ms = comparison.fused.wall_mean_ms;
+        report.median_ms = comparison.fused.wall_median_ms;
+        report.p95_ms = comparison.fused.wall_p95_ms;
+        report.gpu_mean_ms = Some(comparison.fused.gpu_mean_ms);
+        report.gpu_median_ms = Some(comparison.fused.gpu_median_ms);
+        report.gpu_p95_ms = Some(comparison.fused.gpu_p95_ms);
+        report.throughput = Some(weight_bytes as f64 / (comparison.fused.gpu_mean_ms * 1.0e6));
+        report.throughput_unit = Some("GB/s GPU weight reads");
+    }
+    Ok(report)
 }
 
 fn projection_path(k: usize) -> &'static str {
@@ -1333,6 +1584,7 @@ fn print_kernel_phase(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn model_report(
     context: &MetalContext,
     fusion_options: FusionOptions,

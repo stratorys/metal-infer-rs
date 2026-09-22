@@ -32,6 +32,40 @@ Pass `--model-config /path/to/Qwen3-0.6B` (repeatable for other Qwen3 model
 directories) to derive GEMM and GEMV shapes from each `config.json`.
 `--prompt-lengths 32 128 512` selects prefill M values.
 
+For decode GEMV bandwidth, rotate distinct FP16 weight buffers in one command
+buffer. Choose a copy count whose `working_set` in the benchmark name exceeds
+the cache size; for a 1024×1024 matrix, 129 copies occupy 258 MiB:
+
+```sh
+target/release/metal-infer-bench kernel --m 1 --n 1024 --k 1024 \
+  --rotate 129 --warmup 3 --iterations 10
+```
+
+The rotated report divides wall and GPU batch durations by the copy count and
+reports effective GPU weight bandwidth in decimal GB/s. `--rows 0|1|2|4|8`
+selects a single-matrix GEMV row count on M4 Pro; `--split-k 2|4|8` selects a
+two-pass split-K variant. These options require `--matmul-backend auto`. The
+ordinary kernel benchmark retains its original single-matrix TFLOP/s metric.
+`--rows 1 --half8` selects the 16-byte load variant of the one-row kernel.
+
+The same rotation is available for fused decode projections. For Qwen3-0.6B,
+QKV uses widths 2048, 1024, 1024 and gate/up uses 3072, 3072. The commands below
+use more than 256 MiB of distinct weights and report both fused and unfused GPU
+times per set of projections:
+
+```sh
+target/release/metal-infer-bench fusion --kind qkv --k 1024 \
+  --query-heads 16 --kv-heads 8 --head-dim 128 \
+  --rotate 33 --rows 2 --warmup 5 --iterations 30 --format json
+target/release/metal-infer-bench fusion --kind gate-up --k 1024 \
+  --intermediate 3072 --rotate 22 --rows 2 \
+  --warmup 5 --iterations 30 --format json
+```
+
+`--rows 0|2|4|8` selects the fused projection variant. Each iteration dispatches
+all copies in one command buffer. The `throughput` field divides the total
+projection weight bytes by the fused GPU time; `comparison` gives both paths.
+
 For automation, suppress child output and progress messages with:
 
 ```sh

@@ -265,9 +265,15 @@ impl Qwen3Model {
                 let mut trial_cache = cache.clone();
                 let (_, stats) = self.decode_with_stats(1, &mut trial_cache)?;
                 if enabled {
-                    tuned[index] = stats.gpu_time.as_nanos();
+                    tuned
+                        .get_mut(index)
+                        .expect("three tuning samples")
+                        .clone_from(&stats.gpu_time.as_nanos());
                 } else {
-                    normal[index] = stats.gpu_time.as_nanos();
+                    normal
+                        .get_mut(index)
+                        .expect("three tuning samples")
+                        .clone_from(&stats.gpu_time.as_nanos());
                 }
             }
         }
@@ -302,9 +308,15 @@ impl Qwen3Model {
                 let mut trial_cache = cache.clone();
                 let (_, stats) = self.decode_with_stats(1, &mut trial_cache)?;
                 if enabled {
-                    fused[index] = stats.gpu_time.as_nanos();
+                    fused
+                        .get_mut(index)
+                        .expect("three tuning samples")
+                        .clone_from(&stats.gpu_time.as_nanos());
                 } else {
-                    normal[index] = stats.gpu_time.as_nanos();
+                    normal
+                        .get_mut(index)
+                        .expect("three tuning samples")
+                        .clone_from(&stats.gpu_time.as_nanos());
                 }
             }
         }

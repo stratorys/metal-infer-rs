@@ -86,12 +86,16 @@ impl KernelBatchProfile {
             .into_iter()
             .enumerate()
             .map(|(index, kernel)| {
-                let read = |sample: usize| {
+                let read = |sample: usize| -> Result<u64, CoreError> {
                     let offset = sample * size_of::<u64>();
-                    u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap())
+                    let timestamp = bytes
+                        .get(offset..offset + size_of::<u64>())
+                        .and_then(|slice| slice.try_into().ok())
+                        .ok_or_else(|| CoreError::Profiling("missing GPU timestamp".into()))?;
+                    Ok(u64::from_ne_bytes(timestamp))
                 };
-                let start = read(index * 2);
-                let end = read(index * 2 + 1);
+                let start = read(index * 2)?;
+                let end = read(index * 2 + 1)?;
                 if start == 0 || end == 0 || start == u64::MAX || end == u64::MAX || end < start {
                     return Err(CoreError::Profiling(format!(
                         "invalid GPU timestamps for kernel {kernel}"
@@ -136,6 +140,11 @@ impl Default for AutoMatvecRows {
     }
 }
 
+// Measured with distinct FP16 matrices in a >512 MiB rotating working set.
+// Add entries only after the same GPU measurement on the target device.
+const SINGLE_GEMV_SHAPE_CONFIGS: &[(&str, usize, usize, usize)] =
+    &[("Apple M4 Pro", 1024, 1024, 1)];
+
 impl MatmulBackend {
     pub const fn name(self) -> &'static str {
         match self {
@@ -177,12 +186,16 @@ pub(crate) struct ScratchLease {
 pub struct MetalContext {
     pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(crate) queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    device_name: String,
     is_m4_pro: bool,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: RefCell<HashMap<String, Pipeline>>,
     matmul_backend: Rc<Cell<MatmulBackend>>,
     auto_matvec_rows: Rc<Cell<AutoMatvecRows>>,
+    manual_auto_matvec_rows: Rc<Cell<bool>>,
     auto_matvec_enabled: Rc<Cell<bool>>,
+    auto_matvec_split_k: Rc<Cell<usize>>,
+    auto_matvec_half8: Rc<Cell<bool>>,
     profile_tick_nanoseconds: Rc<Cell<Option<f64>>>,
     kernel_profiles: Rc<RefCell<Vec<KernelDispatchProfile>>>,
     flash_decode_blocks: Rc<RefCell<Vec<(usize, usize, usize)>>>,
@@ -198,16 +211,21 @@ impl MetalContext {
         let library = device
             .newLibraryWithSource_options_error(&source, None)
             .map_err(CoreError::Shader)?;
-        let is_m4_pro = device.name().to_string().contains("M4 Pro");
+        let device_name = device.name().to_string();
+        let is_m4_pro = device_name == "Apple M4 Pro";
         Ok(Self {
             device,
             queue,
+            device_name,
             is_m4_pro,
             library,
             pipelines: RefCell::new(HashMap::new()),
             matmul_backend: Rc::new(Cell::new(MatmulBackend::Auto)),
             auto_matvec_rows: Rc::new(Cell::new(AutoMatvecRows::default())),
+            manual_auto_matvec_rows: Rc::new(Cell::new(false)),
             auto_matvec_enabled: Rc::new(Cell::new(true)),
+            auto_matvec_split_k: Rc::new(Cell::new(1)),
+            auto_matvec_half8: Rc::new(Cell::new(false)),
             profile_tick_nanoseconds: Rc::new(Cell::new(None)),
             kernel_profiles: Rc::new(RefCell::new(Vec::new())),
             flash_decode_blocks: Rc::new(RefCell::new(Vec::new())),
@@ -215,7 +233,7 @@ impl MetalContext {
     }
 
     pub fn device_name(&self) -> String {
-        self.device.name().to_string()
+        self.device_name.clone()
     }
 
     pub(crate) fn is_m4_pro(&self) -> bool {
@@ -244,7 +262,7 @@ impl MetalContext {
         }
         let started = Instant::now();
         let lengths = [512, 640, 1024, 2048, 4096, 8192];
-        let maximum = *lengths.last().unwrap();
+        let maximum = 8192;
         let query = self.tensor_f16_bits(
             &vec![0x3c00; query_heads * head_dim],
             &[1, query_heads, head_dim],
@@ -327,11 +345,56 @@ impl MetalContext {
         }
     }
 
+    pub(crate) fn auto_single_matvec_rows(
+        &self,
+        n: usize,
+        k: usize,
+    ) -> usize {
+        let selected = self.auto_matvec_rows();
+        if self.manual_auto_matvec_rows.get() || !self.auto_matvec_enabled.get() {
+            return selected.single;
+        }
+        SINGLE_GEMV_SHAPE_CONFIGS
+            .iter()
+            .find(|&&(device, shape_n, shape_k, _)| {
+                device == self.device_name && shape_n == n && shape_k == k
+            })
+            .map_or(selected.single, |&(_, _, _, rows)| rows)
+    }
+
     pub fn set_auto_matvec_enabled(
         &self,
         enabled: bool,
     ) {
         self.auto_matvec_enabled.set(enabled);
+    }
+
+    pub fn set_auto_matvec_split_k(
+        &self,
+        splits: usize,
+    ) -> Result<(), CoreError> {
+        if !matches!(splits, 1 | 2 | 4 | 8) {
+            return Err(CoreError::Shape(
+                "split-K count must be 1, 2, 4, or 8".into(),
+            ));
+        }
+        self.auto_matvec_split_k.set(splits);
+        Ok(())
+    }
+
+    pub(crate) fn auto_matvec_split_k(&self) -> usize {
+        self.auto_matvec_split_k.get()
+    }
+
+    pub fn set_auto_matvec_half8(
+        &self,
+        enabled: bool,
+    ) {
+        self.auto_matvec_half8.set(enabled);
+    }
+
+    pub(crate) fn auto_matvec_half8(&self) -> bool {
+        self.auto_matvec_half8.get()
     }
 
     pub fn set_auto_matvec_rows(
@@ -341,7 +404,7 @@ impl MetalContext {
         fused3: usize,
         vocab: usize,
     ) -> Result<(), CoreError> {
-        if !matches!(single, 0 | 2 | 4 | 8)
+        if !matches!(single, 0 | 1 | 2 | 4 | 8)
             || !matches!(fused2, 0 | 2 | 4 | 8)
             || !matches!(fused3, 0 | 2 | 4 | 8)
             || !matches!(vocab, 0 | 2 | 4 | 8)
@@ -354,6 +417,7 @@ impl MetalContext {
             fused3,
             vocab,
         });
+        self.manual_auto_matvec_rows.set(true);
         Ok(())
     }
 
@@ -402,7 +466,12 @@ impl MetalContext {
             } else {
                 &[2, 0, 4, 8]
             };
-            let mut best = (u128::MAX, candidates[0]);
+            let mut best = (
+                u128::MAX,
+                *candidates
+                    .first()
+                    .ok_or_else(|| CoreError::Profiling("no GEMV candidates".into()))?,
+            );
             for &rows in candidates {
                 if started.elapsed() >= Duration::from_secs(3) {
                     break;
@@ -491,16 +560,16 @@ impl MetalContext {
             self.device.sampleTimestamps_gpuTimestamp(
                 NonNull::from(&mut cpu_start),
                 NonNull::from(&mut gpu_start),
-            );
-        }
+            )
+        };
         std::thread::sleep(Duration::from_millis(20));
         // SAFETY: both pointers refer to writable u64 values.
         unsafe {
             self.device.sampleTimestamps_gpuTimestamp(
                 NonNull::from(&mut cpu_end),
                 NonNull::from(&mut gpu_end),
-            );
-        }
+            )
+        };
         if cpu_end <= cpu_start || gpu_end <= gpu_start {
             return Err(CoreError::Profiling(
                 "could not calibrate GPU timestamps".into(),
@@ -783,8 +852,8 @@ impl CommandBatch<'_> {
         // SAFETY: reserve() checked both indices against the sample buffer capacity.
         unsafe {
             attachment.setStartOfEncoderSampleIndex(sample_index);
-            attachment.setEndOfEncoderSampleIndex(sample_index + 1);
-        }
+            attachment.setEndOfEncoderSampleIndex(sample_index + 1)
+        };
         self.command_buffer
             .computeCommandEncoderWithDescriptor(&descriptor)
             .ok_or(CoreError::Resource("profiled compute encoder"))

@@ -79,8 +79,9 @@ fn kernel_profiler_records_only_enabled_dispatches() -> Result<(), CoreError> {
     assert_close(&actual, &[32.0, 50.0]);
     let profiles = context.take_kernel_profiles();
     assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0].kernel, "matvec_f16");
-    assert!(profiles[0].gpu_time > std::time::Duration::ZERO);
+    let profile = profiles.first().expect("one profiled dispatch");
+    assert_eq!(profile.kernel, "matvec_f16");
+    assert!(profile.gpu_time > std::time::Duration::ZERO);
     context.set_kernel_profiling(false)?;
     let _ = context.matmul(&input, &weight)?;
     assert!(context.take_kernel_profiles().is_empty());
@@ -110,6 +111,41 @@ fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
         })
         .collect();
     assert_close(&actual, &expected);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires direct access to an Apple M4 Pro Metal device"]
+fn one_row_and_split_k_matvec_match_reference() -> Result<(), CoreError> {
+    let context = MetalContext::new()?;
+    if context.device_name() != "Apple M4 Pro" {
+        return Ok(());
+    }
+    let k = 1024;
+    let n = 33;
+    let input_values: Vec<f32> = (0..k)
+        .map(|index| (index % 41) as f32 / 41.0 - 0.5)
+        .collect();
+    let weight_values: Vec<f32> = (0..n * k)
+        .map(|index| (index % 37) as f32 / 37.0 - 0.5)
+        .collect();
+    let input = context.tensor_f16(&input_values, &[1, k])?;
+    let weight = context.tensor_f16(&weight_values, &[n, k])?;
+    context.set_matmul_backend(MatmulBackend::ReferenceMsl);
+    let expected = context.matmul(&input, &weight)?.to_f32_vec()?;
+    context.set_matmul_backend(MatmulBackend::Auto);
+    context.set_auto_matvec_rows(1, 2, 2, 0)?;
+    let one_row = context.matmul(&input, &weight)?.to_f32_vec()?;
+    assert_close(&one_row, &expected);
+    context.set_auto_matvec_half8(true);
+    let half8 = context.matmul(&input, &weight)?.to_f32_vec()?;
+    assert_close(&half8, &expected);
+    context.set_auto_matvec_half8(false);
+    for splits in [2, 4, 8] {
+        context.set_auto_matvec_split_k(splits)?;
+        let actual = context.matmul(&input, &weight)?.to_f32_vec()?;
+        assert_close(&actual, &expected);
+    }
     Ok(())
 }
 

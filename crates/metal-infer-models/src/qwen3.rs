@@ -3,10 +3,11 @@ use std::path::Path;
 
 use half::f16;
 
-use metal_infer_core::{
-    AttentionConfig, AttentionKind, CommandBatch, DType, DispatchStats, MatmulBackend,
-    MetalContext, PendingBatch, QkNormRopeCacheConfig, Tensor,
+use metal_infer_kernels::{
+    AttentionConfig, AttentionKind, DecodeGemvConfig, KernelBatch, Kernels, MatmulBackend,
+    QkNormRopeCacheConfig,
 };
+use metal_infer_runtime::{DType, DispatchStats, MetalContext, PendingBatch, Tensor};
 
 use crate::weights::WeightMap;
 use crate::{ModelError, Qwen3Config};
@@ -118,6 +119,7 @@ impl KvCache {
 
 pub struct Qwen3Model {
     context: MetalContext,
+    kernels: Kernels,
     config: Qwen3Config,
     embedding: Tensor,
     layers: Vec<LayerWeights>,
@@ -156,6 +158,14 @@ impl Qwen3Model {
         directory: &Path,
         context: &MetalContext,
     ) -> Result<Self, ModelError> {
+        Self::load_with(directory, Kernels::new(context)?)
+    }
+
+    pub fn load_with(
+        directory: &Path,
+        kernels: Kernels,
+    ) -> Result<Self, ModelError> {
+        let context = kernels.context();
         let config: Qwen3Config =
             serde_json::from_slice(&fs::read(directory.join("config.json"))?)?;
         config.validate()?;
@@ -204,7 +214,7 @@ impl Qwen3Model {
             "LM head",
         )?;
         if let Some(first) = layers.first() {
-            context.tune_auto_matvec_variants(
+            kernels.tune_auto_matvec_variants(
                 &first.attention.output,
                 [&first.mlp.gate, &first.mlp.up],
                 [
@@ -215,13 +225,14 @@ impl Qwen3Model {
                 &lm_head,
             )?;
         }
-        let _ = context.tune_flash_decode(
+        let _ = kernels.tune_flash_decode(
             config.num_attention_heads,
             config.num_key_value_heads,
             config.head_dim,
         );
         let mut model = Self {
             context: context.clone(),
+            kernels: kernels.clone(),
             config,
             embedding,
             layers,
@@ -233,8 +244,8 @@ impl Qwen3Model {
         };
         model.tune_matvec_path()?;
         model.tune_fused_decode_norm()?;
-        if context.device_name() == "Apple M4 Pro" {
-            context.set_decode_gemv_config(metal_infer_core::DecodeGemvConfig::Tuned);
+        if kernels.context().device_name() == "Apple M4 Pro" {
+            kernels.set_decode_gemv_config(DecodeGemvConfig::Tuned);
         }
         Ok(model)
     }
@@ -244,7 +255,7 @@ impl Qwen3Model {
     }
 
     fn tune_matvec_path(&mut self) -> Result<(), ModelError> {
-        if self.context.matmul_backend() != MatmulBackend::Auto
+        if self.kernels.matmul_backend() != MatmulBackend::Auto
             || !self.context.device_name().contains("M4 Pro")
         {
             return Ok(());
@@ -261,7 +272,7 @@ impl Qwen3Model {
             } else {
                 [true, false]
             } {
-                self.context.set_auto_matvec_enabled(enabled);
+                self.kernels.set_auto_matvec_enabled(enabled);
                 let mut trial_cache = cache.clone();
                 let (_, stats) = self.decode_with_stats(1, &mut trial_cache)?;
                 if enabled {
@@ -279,14 +290,14 @@ impl Qwen3Model {
         }
         normal.sort_unstable();
         tuned.sort_unstable();
-        self.context
+        self.kernels
             .set_auto_matvec_enabled(tuned[1].saturating_mul(100) < normal[1].saturating_mul(99));
         self.fusion_options = saved_fusions;
         Ok(())
     }
 
     fn tune_fused_decode_norm(&mut self) -> Result<(), ModelError> {
-        if self.context.matmul_backend() != MatmulBackend::Auto
+        if self.kernels.matmul_backend() != MatmulBackend::Auto
             || !self.context.device_name().contains("M4 Pro")
             || !self.config.hidden_size.is_multiple_of(256)
         {
@@ -562,7 +573,7 @@ impl Qwen3Model {
             return Err(ModelError::Config("block benchmark requires tokens".into()));
         }
         let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
-        let mut batch = self.context.begin_batch()?;
+        let mut batch = self.kernels.begin_batch()?;
         let hidden = batch.embedding(&token_tensor, &self.embedding)?;
         let shape = [
             tokens.len(),
@@ -622,7 +633,7 @@ impl Qwen3Model {
                 requested,
             });
         }
-        let mut batch = self.context.begin_batch()?;
+        let mut batch = self.kernels.begin_batch()?;
         let mut hidden = batch.embedding(tokens, &self.embedding)?;
         let offset = cache.filled;
         for (layer_index, layer) in self.layers.iter().enumerate() {
@@ -646,7 +657,7 @@ impl Qwen3Model {
 
     fn forward_layer(
         &self,
-        batch: &mut CommandBatch<'_>,
+        batch: &mut KernelBatch<'_>,
         hidden: Tensor,
         layer: &LayerWeights,
         cache: &LayerCache,
@@ -1039,7 +1050,7 @@ mod tests {
         AttentionKind, GenerationOptions, KvCache, Qwen3Model, XorShift64, argmax,
         attention_kind_for_tokens, sample_token,
     };
-    use metal_infer_core::MetalContext;
+    use metal_infer_runtime::MetalContext;
 
     #[test]
     fn tiled_attention_selects_flash_decode_for_long_gqa_decode() {

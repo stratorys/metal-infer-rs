@@ -1,5 +1,5 @@
 [package]
-name = "metal-infer-core"
+name = "metal-infer-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,6 @@ half.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-metal.workspace = true
-objc2-metal-performance-shaders.workspace = true
 thiserror.workspace = true
 
 [lints]

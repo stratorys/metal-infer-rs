@@ -1,8 +1,9 @@
 [workspace]
 members = [
     "crates/metal-infer-cli",
-    "crates/metal-infer-core",
+    "crates/metal-infer-kernels",
     "crates/metal-infer-models",
+    "crates/metal-infer-runtime",
 ]
 resolver = "3"
 

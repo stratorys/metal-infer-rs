@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use metal_infer_core::{MetalContext, Tensor};
+use metal_infer_runtime::{MetalContext, Tensor};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 

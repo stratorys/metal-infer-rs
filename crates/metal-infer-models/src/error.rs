@@ -3,7 +3,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error(transparent)]
-    Core(#[from] metal_infer_core::CoreError),
+    Core(#[from] metal_infer_runtime::CoreError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

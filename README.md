@@ -49,7 +49,8 @@ Face repository ID resolves to its locally cached snapshot; use
 
 ## Workspace layout
 
-- `metal-infer-core`: Metal runtime, tensors, and GPU kernels;
+- `metal-infer-runtime`: Metal device, buffers, tensors, command batches, and profiling;
+- `metal-infer-kernels`: Metal kernels, their Rust wrappers, and kernel variant selection;
 - `metal-infer-models`: weight loading and the Qwen3 implementation;
 - `metal-infer-cli`: text generation and benchmarks.
 

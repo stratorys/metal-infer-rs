@@ -1,0 +1,17 @@
+[package]
+name = "metal-infer-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+metal-infer-runtime = { path = "../metal-infer-runtime" }
+objc2.workspace = true
+objc2-metal.workspace = true
+objc2-metal-performance-shaders.workspace = true
+
+[dev-dependencies]
+half.workspace = true
+
+[lints]
+workspace = true

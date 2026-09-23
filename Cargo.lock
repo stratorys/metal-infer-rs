@@ -487,23 +487,23 @@ name = "metal-infer-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "metal-infer-core",
+ "metal-infer-kernels",
  "metal-infer-models",
+ "metal-infer-runtime",
  "serde",
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
-name = "metal-infer-core"
+name = "metal-infer-kernels"
 version = "0.1.0"
 dependencies = [
  "half",
+ "metal-infer-runtime",
  "objc2",
- "objc2-foundation",
  "objc2-metal",
  "objc2-metal-performance-shaders",
- "thiserror",
 ]
 
 [[package]]
@@ -511,12 +511,24 @@ name = "metal-infer-models"
 version = "0.1.0"
 dependencies = [
  "half",
- "metal-infer-core",
+ "metal-infer-kernels",
+ "metal-infer-runtime",
  "safetensors",
  "serde",
  "serde_json",
  "thiserror",
  "tokenizers",
+]
+
+[[package]]
+name = "metal-infer-runtime"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "thiserror",
 ]
 
 [[package]]

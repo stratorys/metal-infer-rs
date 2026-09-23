@@ -3,8 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use half::f16;
-use metal_infer_core::MetalContext;
 use metal_infer_models::{ChatMessage, GenerationOptions, KvCache, ModelTokenizer, Qwen3Model};
+use metal_infer_runtime::MetalContext;
 use serde::{Deserialize, Serialize};
 
 const PROMPT_LENGTHS: [usize; 9] = [1, 63, 64, 65, 511, 512, 513, 2048, 4097];

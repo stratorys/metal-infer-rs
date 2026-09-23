@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::Range;
 use std::ptr::NonNull;
@@ -11,19 +10,17 @@ use std::time::Instant;
 use half::{bf16, f16};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSRange, NSString};
+use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLComputePipelineState, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-    MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction,
-    MTLLibrary, MTLResourceOptions, MTLStorageMode,
+    MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLResourceOptions, MTLSize, MTLStorageMode,
 };
 
-use crate::gemv_dispatch::{self, DecodeGemvConfig};
-use crate::{AttentionConfig, CoreError, DType, Tensor};
+use crate::{CoreError, DType, Tensor};
 
-const SHADERS: &str = include_str!("kernels/transformer.metal");
 const PROFILE_SAMPLE_CAPACITY: usize = 2048;
 
 pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
@@ -113,45 +110,6 @@ impl KernelBatchProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum MatmulBackend {
-    #[default]
-    Auto,
-    ReferenceMsl,
-    NativeMsl,
-    Mps,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct AutoMatvecRows {
-    pub(crate) single: usize,
-    pub(crate) fused2: usize,
-    pub(crate) fused3: usize,
-    pub(crate) vocab: usize,
-}
-
-impl Default for AutoMatvecRows {
-    fn default() -> Self {
-        Self {
-            single: 4,
-            fused2: 2,
-            fused3: 2,
-            vocab: 0,
-        }
-    }
-}
-
-impl MatmulBackend {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::ReferenceMsl => "reference-msl",
-            Self::NativeMsl => "native-msl",
-            Self::Mps => "mps",
-        }
-    }
-}
-
 pub struct CommandBatch<'context> {
     pub(crate) context: &'context MetalContext,
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
@@ -194,21 +152,8 @@ pub struct MetalContext {
     pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(crate) queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     device_name: String,
-    is_m4_pro: bool,
-    library: Retained<ProtocolObject<dyn MTLLibrary>>,
-    pipelines: RefCell<HashMap<String, Pipeline>>,
-    matmul_backend: Rc<Cell<MatmulBackend>>,
-    auto_matvec_rows: Rc<Cell<AutoMatvecRows>>,
-    manual_auto_matvec_rows: Rc<Cell<bool>>,
-    auto_matvec_enabled: Rc<Cell<bool>>,
-    auto_matvec_split_k: Rc<Cell<usize>>,
-    auto_matvec_half8: Rc<Cell<bool>>,
-    fused_norm_matvec_rows: Rc<Cell<(usize, usize)>>,
-    shared_gate_up_input: Rc<Cell<bool>>,
-    decode_gemv_config: Rc<Cell<Option<DecodeGemvConfig>>>,
     profile_tick_nanoseconds: Rc<Cell<Option<f64>>>,
     kernel_profiles: Rc<RefCell<Vec<KernelDispatchProfile>>>,
-    flash_decode_blocks: Rc<RefCell<Vec<(usize, usize, usize)>>>,
     scratch_pools: Rc<RefCell<Vec<Rc<RefCell<ScratchState>>>>>,
 }
 
@@ -218,31 +163,13 @@ impl MetalContext {
         let queue = device
             .newCommandQueue()
             .ok_or(CoreError::Resource("command queue"))?;
-        let source = NSString::from_str(SHADERS);
-        let library = device
-            .newLibraryWithSource_options_error(&source, None)
-            .map_err(CoreError::Shader)?;
         let device_name = device.name().to_string();
-        let is_m4_pro = device_name == "Apple M4 Pro";
         Ok(Self {
             device,
             queue,
             device_name,
-            is_m4_pro,
-            library,
-            pipelines: RefCell::new(HashMap::new()),
-            matmul_backend: Rc::new(Cell::new(MatmulBackend::Auto)),
-            auto_matvec_rows: Rc::new(Cell::new(AutoMatvecRows::default())),
-            manual_auto_matvec_rows: Rc::new(Cell::new(false)),
-            auto_matvec_enabled: Rc::new(Cell::new(true)),
-            auto_matvec_split_k: Rc::new(Cell::new(1)),
-            auto_matvec_half8: Rc::new(Cell::new(false)),
-            fused_norm_matvec_rows: Rc::new(Cell::new((2, 2))),
-            shared_gate_up_input: Rc::new(Cell::new(false)),
-            decode_gemv_config: Rc::new(Cell::new(None)),
             profile_tick_nanoseconds: Rc::new(Cell::new(None)),
             kernel_profiles: Rc::new(RefCell::new(Vec::new())),
-            flash_decode_blocks: Rc::new(RefCell::new(Vec::new())),
             scratch_pools: Rc::new(RefCell::new(Vec::new())),
         })
     }
@@ -251,352 +178,12 @@ impl MetalContext {
         self.device_name.clone()
     }
 
-    pub(crate) fn is_m4_pro(&self) -> bool {
-        self.is_m4_pro
-    }
-
-    pub(crate) fn flash_decode_configuration_for_length(
-        &self,
-        length: usize,
-    ) -> (usize, usize) {
-        self.flash_decode_blocks
-            .borrow()
-            .iter()
-            .find(|(limit, _, _)| length <= *limit)
-            .map_or((64, 256), |(_, block, threads)| (*block, *threads))
-    }
-
-    pub fn tune_flash_decode(
-        &self,
-        query_heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<(), CoreError> {
-        if !self.is_m4_pro || query_heads != kv_heads * 2 || head_dim == 0 {
-            return Ok(());
-        }
-        let started = Instant::now();
-        let lengths = [512, 640, 1024, 2048, 4096, 8192];
-        let maximum = 8192;
-        let query = self.tensor_f16_bits(
-            &vec![0x3c00; query_heads * head_dim],
-            &[1, query_heads, head_dim],
-        )?;
-        let cache_values = vec![0x3800; maximum * kv_heads * head_dim];
-        let key = self.tensor_f16_bits(&cache_values, &[maximum, kv_heads, head_dim])?;
-        let value = self.tensor_f16_bits(&cache_values, &[maximum, kv_heads, head_dim])?;
-        let mut chosen = Vec::with_capacity(lengths.len());
-        for length in lengths {
-            if started.elapsed() >= Duration::from_secs(2) {
-                break;
-            }
-            let active_key = key.prefix(length)?;
-            let active_value = value.prefix(length)?;
-            let config = AttentionConfig {
-                query_heads,
-                kv_heads,
-                head_dim,
-                causal: true,
-                query_offset: length - 1,
-            };
-            let mut best = (u128::MAX, 64, 256);
-            for (block, threads) in [
-                (64, 256),
-                (32, 256),
-                (128, 256),
-                (256, 256),
-                (64, 128),
-                (32, 128),
-                (128, 128),
-                (256, 128),
-            ] {
-                if started.elapsed() >= Duration::from_secs(2) {
-                    break;
-                }
-                let mut samples = [0_u128; 3];
-                for sample in &mut samples {
-                    let mut batch = self.begin_batch()?;
-                    batch.attention_flash_decode_with_configuration(
-                        &query,
-                        &active_key,
-                        &active_value,
-                        config,
-                        block,
-                        threads,
-                    )?;
-                    *sample = batch.finish()?.gpu_time.as_nanos();
-                }
-                samples.sort_unstable();
-                if samples[1] < best.0 {
-                    best = (samples[1], block, threads);
-                }
-            }
-            chosen.push((length, best.1, best.2));
-        }
-        *self.flash_decode_blocks.borrow_mut() = chosen;
-        Ok(())
+    pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
+        &self.device
     }
 
     pub fn allocated_bytes(&self) -> usize {
         self.device.currentAllocatedSize()
-    }
-
-    pub fn set_matmul_backend(
-        &self,
-        backend: MatmulBackend,
-    ) {
-        self.matmul_backend.set(backend);
-    }
-
-    pub fn matmul_backend(&self) -> MatmulBackend {
-        self.matmul_backend.get()
-    }
-
-    pub(crate) fn auto_matvec_rows(&self) -> AutoMatvecRows {
-        if self.auto_matvec_enabled.get() {
-            self.auto_matvec_rows.get()
-        } else {
-            AutoMatvecRows::default()
-        }
-    }
-
-    pub fn set_decode_gemv_config(
-        &self,
-        config: DecodeGemvConfig,
-    ) {
-        self.decode_gemv_config.set(Some(config));
-    }
-
-    pub fn decode_gemv_config(&self) -> Option<DecodeGemvConfig> {
-        self.decode_gemv_config.get()
-    }
-
-    pub(crate) fn auto_matvec_rows_for_shape(
-        &self,
-        n: usize,
-        k: usize,
-        vocabulary: bool,
-    ) -> usize {
-        let selected = self.auto_matvec_rows();
-        let fallback = if vocabulary {
-            selected.vocab
-        } else {
-            selected.single
-        };
-        gemv_dispatch::single_rows(
-            &self.device_name,
-            n,
-            k,
-            fallback,
-            self.decode_gemv_config.get(),
-            self.manual_auto_matvec_rows.get(),
-            self.auto_matvec_enabled.get(),
-        )
-    }
-
-    pub fn set_auto_matvec_enabled(
-        &self,
-        enabled: bool,
-    ) {
-        self.auto_matvec_enabled.set(enabled);
-    }
-
-    pub fn set_auto_matvec_split_k(
-        &self,
-        splits: usize,
-    ) -> Result<(), CoreError> {
-        if !matches!(splits, 1 | 2 | 4 | 8) {
-            return Err(CoreError::Shape(
-                "split-K count must be 1, 2, 4, or 8".into(),
-            ));
-        }
-        self.auto_matvec_split_k.set(splits);
-        Ok(())
-    }
-
-    pub(crate) fn auto_matvec_split_k(&self) -> usize {
-        self.auto_matvec_split_k.get()
-    }
-
-    pub fn set_auto_matvec_half8(
-        &self,
-        enabled: bool,
-    ) {
-        self.auto_matvec_half8.set(enabled);
-    }
-
-    pub(crate) fn auto_matvec_half8(&self) -> bool {
-        self.auto_matvec_half8.get()
-    }
-
-    /// Rows per SIMD group for the decode-only fused RMSNorm projections.
-    /// The first value selects QKV and the second selects gate/up.
-    pub fn set_fused_norm_matvec_rows(
-        &self,
-        qkv: usize,
-        gate_up: usize,
-    ) -> Result<(), CoreError> {
-        if !matches!(qkv, 1 | 2 | 4 | 8) || !matches!(gate_up, 1 | 2 | 4 | 8) {
-            return Err(CoreError::Shape(
-                "fused norm matvec rows must be 1, 2, 4, or 8".into(),
-            ));
-        }
-        self.fused_norm_matvec_rows.set((qkv, gate_up));
-        Ok(())
-    }
-
-    /// Reuse normalized gate/up input within each threadgroup of the fused decode GEMV.
-    pub fn set_shared_gate_up_input(
-        &self,
-        enabled: bool,
-    ) {
-        self.shared_gate_up_input.set(enabled);
-    }
-
-    pub fn shared_gate_up_input(&self) -> bool {
-        self.shared_gate_up_input.get()
-    }
-
-    pub(crate) fn fused_norm_matvec_rows_for_shape(
-        &self,
-        widths: [usize; 3],
-        k: usize,
-    ) -> usize {
-        let [_, _, n2] = widths;
-        let fallback = if n2 == 0 {
-            self.fused_norm_matvec_rows.get().1
-        } else {
-            self.fused_norm_matvec_rows.get().0
-        };
-        gemv_dispatch::fused_norm_rows(
-            &self.device_name,
-            widths,
-            k,
-            fallback,
-            self.decode_gemv_config.get(),
-        )
-    }
-
-    pub fn set_auto_matvec_rows(
-        &self,
-        single: usize,
-        fused2: usize,
-        fused3: usize,
-        vocab: usize,
-    ) -> Result<(), CoreError> {
-        if !matches!(single, 0 | 1 | 2 | 4 | 8)
-            || !matches!(fused2, 0 | 2 | 4 | 8)
-            || !matches!(fused3, 0 | 2 | 4 | 8)
-            || !matches!(vocab, 0 | 2 | 4 | 8)
-        {
-            return Err(CoreError::Shape("invalid auto matvec row count".into()));
-        }
-        self.auto_matvec_rows.set(AutoMatvecRows {
-            single,
-            fused2,
-            fused3,
-            vocab,
-        });
-        self.manual_auto_matvec_rows.set(true);
-        Ok(())
-    }
-
-    fn measure_matvec_variant(
-        &self,
-        mut dispatch: impl FnMut(&mut CommandBatch<'_>) -> Result<(), CoreError>,
-    ) -> Result<u128, CoreError> {
-        let mut samples = [0_u128; 3];
-        for sample in &mut samples {
-            let mut batch = self.begin_batch()?;
-            dispatch(&mut batch)?;
-            *sample = batch.finish()?.gpu_time.as_nanos();
-        }
-        samples.sort_unstable();
-        Ok(samples[1])
-    }
-
-    pub fn tune_auto_matvec_variants(
-        &self,
-        single: &Tensor,
-        fused2: [&Tensor; 2],
-        fused3: [&Tensor; 3],
-        vocab: &Tensor,
-    ) -> Result<(), CoreError> {
-        if !self.is_m4_pro || self.matmul_backend() != MatmulBackend::Auto {
-            return Ok(());
-        }
-        let started = Instant::now();
-        let input_for = |weight: &Tensor| -> Result<Tensor, CoreError> {
-            let width = *weight
-                .shape()
-                .get(1)
-                .ok_or_else(|| CoreError::Shape("matvec tuning requires matrix weights".into()))?;
-            self.tensor_f16_bits(&vec![0x3800; width], &[1, width])
-        };
-        let single_input = input_for(single)?;
-        let fused2_input = input_for(fused2[0])?;
-        let fused3_input = input_for(fused3[0])?;
-        let vocab_input = input_for(vocab)?;
-        let mut selected = AutoMatvecRows::default();
-        for family in 0..4 {
-            let candidates: &[usize] = if family == 3 {
-                &[0, 2, 4, 8]
-            } else if family == 0 {
-                &[4, 0, 2, 8]
-            } else {
-                &[2, 0, 4, 8]
-            };
-            let mut best = (
-                u128::MAX,
-                *candidates
-                    .first()
-                    .ok_or_else(|| CoreError::Profiling("no GEMV candidates".into()))?,
-            );
-            for &rows in candidates {
-                if started.elapsed() >= Duration::from_secs(3) {
-                    break;
-                }
-                match family {
-                    0 => selected.single = rows,
-                    1 => selected.fused2 = rows,
-                    2 => selected.fused3 = rows,
-                    _ => selected.vocab = rows,
-                }
-                self.auto_matvec_rows.set(selected);
-                let elapsed = match family {
-                    0 => self.measure_matvec_variant(|batch| {
-                        batch.matmul(&single_input, single)?;
-                        Ok(())
-                    }),
-                    1 => self.measure_matvec_variant(|batch| {
-                        batch.matmul2(&fused2_input, fused2[0], fused2[1])?;
-                        Ok(())
-                    }),
-                    2 => self.measure_matvec_variant(|batch| {
-                        batch.matmul3(&fused3_input, fused3[0], fused3[1], fused3[2])?;
-                        Ok(())
-                    }),
-                    _ => self.measure_matvec_variant(|batch| {
-                        batch.matmul(&vocab_input, vocab)?;
-                        Ok(())
-                    }),
-                };
-                let Ok(elapsed) = elapsed else {
-                    continue;
-                };
-                if elapsed < best.0 {
-                    best = (elapsed, rows);
-                }
-            }
-            match family {
-                0 => selected.single = best.1,
-                1 => selected.fused2 = best.1,
-                2 => selected.fused3 = best.1,
-                _ => selected.vocab = best.1,
-            }
-            self.auto_matvec_rows.set(selected);
-        }
-        Ok(())
     }
 
     /// Enables timestamp sampling for subsequent batches. Each profiled dispatch
@@ -871,28 +458,6 @@ impl MetalContext {
         Ok(tensor)
     }
 
-    pub(crate) fn pipeline(
-        &self,
-        name: &str,
-    ) -> Result<Pipeline, CoreError> {
-        if let Some(pipeline) = self.pipelines.borrow().get(name) {
-            return Ok(pipeline.clone());
-        }
-        let function_name = NSString::from_str(name);
-        let function: Retained<ProtocolObject<dyn MTLFunction>> = self
-            .library
-            .newFunctionWithName(&function_name)
-            .ok_or_else(|| CoreError::MissingKernel(name.to_owned()))?;
-        let pipeline = self
-            .device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(CoreError::Pipeline)?;
-        self.pipelines
-            .borrow_mut()
-            .insert(name.to_owned(), pipeline.clone());
-        Ok(pipeline)
-    }
-
     pub(crate) fn command_buffer(
         &self
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, CoreError> {
@@ -901,14 +466,60 @@ impl MetalContext {
             .ok_or(CoreError::Resource("command buffer"))
     }
 
-    pub(crate) unsafe fn bytes<T>(value: &T) -> (NonNull<c_void>, usize) {
+    unsafe fn bytes<T>(value: &T) -> (NonNull<c_void>, usize) {
         let pointer = NonNull::from(value).cast();
         (pointer, std::mem::size_of::<T>())
     }
 }
 
 impl<'context> CommandBatch<'context> {
-    pub(crate) fn end_compute_encoding(&mut self) -> Result<(), CoreError> {
+    pub fn dispatch<T>(
+        &mut self,
+        pipeline: &Pipeline,
+        kernel: &str,
+        tensors: &[&Tensor],
+        params: &T,
+        grid: MTLSize,
+        threadgroup: MTLSize,
+    ) -> Result<(), CoreError> {
+        let profile_index = self
+            .profile
+            .as_mut()
+            .map(|profile| profile.reserve(kernel))
+            .transpose()?;
+        let profiled_encoder = profile_index
+            .map(|index| self.profiled_encoder(index))
+            .transpose()?;
+        let encoder = if let Some(encoder) = &profiled_encoder {
+            encoder.as_ref()
+        } else {
+            self.encoder()?
+        };
+        encoder.setComputePipelineState(pipeline);
+        for (index, tensor) in tensors.iter().enumerate() {
+            // SAFETY: tensor resources remain alive through command completion
+            // and each kernel's binding order is fixed by its safe
+            // wrapper above.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(
+                    Some(tensor.buffer.as_ref()),
+                    tensor.offset_bytes,
+                    index,
+                )
+            };
+        }
+        let (pointer, length): (NonNull<c_void>, usize) = unsafe { MetalContext::bytes(params) };
+        // SAFETY: Metal copies `length` bytes from a valid repr(C)/scalar value
+        // while encoding.
+        unsafe { encoder.setBytes_length_atIndex(pointer, length, tensors.len()) };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        if let Some(encoder) = profiled_encoder {
+            encoder.endEncoding();
+        }
+        Ok(())
+    }
+
+    pub fn end_compute_encoding(&mut self) -> Result<(), CoreError> {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
         } else if self.profile.is_none() {
@@ -917,7 +528,7 @@ impl<'context> CommandBatch<'context> {
         Ok(())
     }
 
-    pub(crate) fn resume_compute_encoding(&mut self) -> Result<(), CoreError> {
+    pub fn resume_compute_encoding(&mut self) -> Result<(), CoreError> {
         if self.profile.is_some() {
             return Ok(());
         }
@@ -955,11 +566,11 @@ impl<'context> CommandBatch<'context> {
             .ok_or(CoreError::Resource("profiled compute encoder"))
     }
 
-    pub(crate) fn command_buffer_ref(&self) -> &ProtocolObject<dyn MTLCommandBuffer> {
+    pub fn command_buffer_ref(&self) -> &ProtocolObject<dyn MTLCommandBuffer> {
         &self.command_buffer
     }
 
-    pub(crate) fn empty(
+    pub fn empty(
         &self,
         shape: &[usize],
         dtype: DType,

@@ -236,5 +236,5 @@ These numbers are measurements, not correctness tests. Run the GPU test suite
 before collecting them:
 
 ```sh
-cargo test -p metal-infer-core --test gpu -- --ignored
+cargo test -p metal-infer-kernels --test gpu -- --ignored
 ```

@@ -86,6 +86,14 @@ impl Tensor {
         }
     }
 
+    pub fn buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.buffer
+    }
+
+    pub const fn offset_bytes(&self) -> usize {
+        self.offset_bytes
+    }
+
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }

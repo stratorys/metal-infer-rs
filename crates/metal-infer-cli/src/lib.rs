@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use metal_infer_core::CoreError;
 use metal_infer_models::ModelError;
+use metal_infer_runtime::CoreError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

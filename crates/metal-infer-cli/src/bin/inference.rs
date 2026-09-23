@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use clap::ValueEnum;
 use metal_infer_cli::CliError;
-use metal_infer_core::MetalContext;
 use metal_infer_models::{KvCache, Qwen3Model};
+use metal_infer_runtime::MetalContext;
 use serde::{Deserialize, Serialize};
 
 use super::Format;

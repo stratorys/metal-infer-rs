@@ -1,5 +1,3 @@
-//! Transformer models built on `metal-infer-core`.
-
 mod config;
 mod error;
 mod qwen3;

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use metal_infer_cli::{CliError, hugging_face_model_id, resolve_model_path};
-use metal_infer_core::MetalContext;
 use metal_infer_models::{ChatMessage, GenerationOptions, KvCache, ModelTokenizer, Qwen3Model};
+use metal_infer_runtime::MetalContext;
 use serde::Deserialize;
 use serde_json::{Value, json};
 

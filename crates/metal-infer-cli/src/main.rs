@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use metal_infer_cli::{CliError, resolve_model_path};
-use metal_infer_core::{AttentionKind, MetalContext};
+use metal_infer_kernels::AttentionKind;
 use metal_infer_models::{GenerationOptions, KvCache, ModelTokenizer, Qwen3Model};
+use metal_infer_runtime::MetalContext;
 
 use crate::server::{ServerOptions, serve};
 

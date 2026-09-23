@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use metal_infer_cli::CliError;
-use metal_infer_core::{
-    AttentionConfig, AttentionKind, DecodeGemvConfig, DispatchStats, KernelDispatchProfile,
-    MatmulBackend, MetalContext, QkNormRopeCacheConfig, Tensor,
+use metal_infer_kernels::{
+    AttentionConfig, AttentionKind, DecodeGemvConfig, Kernels, MatmulBackend, QkNormRopeCacheConfig,
 };
 use metal_infer_models::{FusionOptions, KvCache, Qwen3Model};
+use metal_infer_runtime::{DispatchStats, KernelDispatchProfile, MetalContext, Tensor};
 use serde::Serialize;
 
 #[path = "inference.rs"]
@@ -401,7 +401,7 @@ struct AttentionDimensions {
 
 #[derive(Clone, Copy)]
 struct AttentionCase<'tensor> {
-    context: &'tensor MetalContext,
+    kernels: &'tensor Kernels,
     query: &'tensor Tensor,
     key: &'tensor Tensor,
     value: &'tensor Tensor,
@@ -435,6 +435,7 @@ fn run() -> Result<(), CliError> {
         );
     }
     let context = MetalContext::new()?;
+    let kernels = Kernels::new(&context)?;
     let report = match arguments.command {
         Command::Inference { .. } => unreachable!("inference is handled before creating a context"),
         Command::Kernel {
@@ -450,7 +451,7 @@ fn run() -> Result<(), CliError> {
             matmul_backend,
         } => {
             require_iterations(iterations)?;
-            context.set_matmul_backend(matmul_backend.into());
+            kernels.set_matmul_backend(matmul_backend.into());
             if let Some(rows) = rows {
                 if matmul_backend != MatmulBackendArgument::Auto || m != 1 || split_k.is_some() {
                     return Err(CliError::InvalidArguments(
@@ -462,7 +463,7 @@ fn run() -> Result<(), CliError> {
                         "--rows 1 is unavailable for vocabulary GEMV".into(),
                     ));
                 }
-                context.set_auto_matvec_rows(rows, 2, 2, if n >= 65_536 { rows } else { 0 })?;
+                kernels.set_auto_matvec_rows(rows, 2, 2, if n >= 65_536 { rows } else { 0 })?;
             }
             if let Some(splits) = split_k {
                 if matmul_backend != MatmulBackendArgument::Auto || m != 1 {
@@ -470,7 +471,7 @@ fn run() -> Result<(), CliError> {
                         "--split-k requires --matmul-backend auto and m=1".into(),
                     ));
                 }
-                context.set_auto_matvec_split_k(splits)?;
+                kernels.set_auto_matvec_split_k(splits)?;
             }
             if half8 {
                 if matmul_backend != MatmulBackendArgument::Auto || m != 1 || rows != Some(1) {
@@ -478,25 +479,25 @@ fn run() -> Result<(), CliError> {
                         "--half8 requires auto GEMV, m=1, and --rows 1".into(),
                     ));
                 }
-                context.set_auto_matvec_half8(true);
+                kernels.set_auto_matvec_half8(true);
             }
             if let Some(copies) = rotate {
                 run_rotated_matvec(
-                    &context, m, n, k, copies, iterations, warmup, rows, split_k, half8,
+                    &kernels, m, n, k, copies, iterations, warmup, rows, split_k, half8,
                 )?
             } else {
                 let input = context.tensor_f16(&vec![0.01; m * k], &[m, k])?;
                 let weight = context.tensor_f16(&vec![0.02; n * k], &[n, k])?;
                 for _ in 0..warmup {
-                    let _ = dispatch_matmul(&context, &input, &weight)?;
+                    let _ = dispatch_matmul(&kernels, &input, &weight)?;
                 }
                 let (samples, gpu_samples) =
-                    measure_dispatch(iterations, || dispatch_matmul(&context, &input, &weight))?;
+                    measure_dispatch(iterations, || dispatch_matmul(&kernels, &input, &weight))?;
                 let operations = 2.0 * m as f64 * n as f64 * k as f64;
                 let throughput = (operations / 1.0e12) / mean_seconds(&samples);
                 report(
                     format!("matmul_f16[{m},{n},{k}]"),
-                    &context,
+                    &kernels,
                     samples,
                     Some(gpu_samples),
                     Some(throughput),
@@ -519,7 +520,7 @@ fn run() -> Result<(), CliError> {
             matmul_backend,
         } => {
             require_iterations(iterations)?;
-            context.set_matmul_backend(matmul_backend.into());
+            kernels.set_matmul_backend(matmul_backend.into());
             if let Some(rows) = rows {
                 if matmul_backend != MatmulBackendArgument::Auto
                     || !matches!(
@@ -535,13 +536,13 @@ fn run() -> Result<(), CliError> {
                     ));
                 }
                 if matches!(kind, FusionKind::QkvRms | FusionKind::GateUpAddRms) {
-                    context.set_fused_norm_matvec_rows(rows, rows)?;
+                    kernels.set_fused_norm_matvec_rows(rows, rows)?;
                 } else {
-                    context.set_auto_matvec_rows(4, rows, rows, 0)?;
+                    kernels.set_auto_matvec_rows(4, rows, rows, 0)?;
                 }
             }
             run_fusion_benchmark(
-                &context,
+                &kernels,
                 kind,
                 FusionDimensions {
                     k,
@@ -567,7 +568,7 @@ fn run() -> Result<(), CliError> {
             iterations,
             warmup,
         } => run_attention_benchmark(
-            &context,
+            &kernels,
             kind,
             AttentionDimensions {
                 tokens,
@@ -586,14 +587,14 @@ fn run() -> Result<(), CliError> {
             warmup,
         } => {
             require_iterations(iterations)?;
-            let mut model = Qwen3Model::load(&model, &context)?;
+            let mut model = Qwen3Model::load_with(&model, kernels.clone())?;
             model.set_attention_kind(AttentionKind::Tiled);
             let token_ids = vec![1; tokens];
             for _ in 0..warmup {
                 let _ = model.run_first_block(&token_ids)?;
             }
             let samples = measure(iterations, || model.run_first_block(&token_ids).map(|_| ()))?;
-            report("qwen3_block".into(), &context, samples, None, None, None)
+            report("qwen3_block".into(), &kernels, samples, None, None, None)
         }
         Command::Model {
             model,
@@ -644,8 +645,8 @@ fn run() -> Result<(), CliError> {
                     "--shared-gate-up-input requires the tuned GEMV configuration".into(),
                 ));
             }
-            context.set_matmul_backend(matmul_backend.into());
-            let mut model = Qwen3Model::load(&model, &context)?;
+            kernels.set_matmul_backend(matmul_backend.into());
+            let mut model = Qwen3Model::load_with(&model, kernels.clone())?;
             if shared_gate_up_input {
                 if context.device_name() != "Apple M4 Pro"
                     || model.config().hidden_size != 1024
@@ -656,10 +657,10 @@ fn run() -> Result<(), CliError> {
                         "--shared-gate-up-input requires Qwen3-0.6B dimensions and auto matmul on Apple M4 Pro".into(),
                     ));
                 }
-                context.set_shared_gate_up_input(true);
+                kernels.set_shared_gate_up_input(true);
             }
             if let Some(config) = gemv_config {
-                context.set_decode_gemv_config(config.into());
+                kernels.set_decode_gemv_config(config.into());
             }
             if qkv_rms_rows.is_some() || gate_up_add_rms_rows.is_some() {
                 if matmul_backend != MatmulBackendArgument::Auto {
@@ -667,7 +668,7 @@ fn run() -> Result<(), CliError> {
                         "fused norm row overrides require --matmul-backend auto".into(),
                     ));
                 }
-                context.set_fused_norm_matvec_rows(
+                kernels.set_fused_norm_matvec_rows(
                     qkv_rms_rows.unwrap_or(2),
                     gate_up_add_rms_rows.unwrap_or(2),
                 )?;
@@ -688,7 +689,7 @@ fn run() -> Result<(), CliError> {
             let token_ids = vec![1; prompt];
             for _ in 0..warmup {
                 let _ = run_model_iteration(
-                    &context,
+                    &kernels,
                     &model,
                     &token_ids,
                     generate,
@@ -707,7 +708,7 @@ fn run() -> Result<(), CliError> {
             let mut decode_kernels = Vec::new();
             for _ in 0..iterations {
                 let (prefill, decode, prefill_profile, decode_profile) = run_model_iteration(
-                    &context,
+                    &kernels,
                     &model,
                     &token_ids,
                     generate,
@@ -727,7 +728,7 @@ fn run() -> Result<(), CliError> {
                 decode: kernel_phase_profile(&decode_samples, decode_kernels),
             });
             let mut report = model_report(
-                &context,
+                &kernels,
                 fusion_options,
                 allocated_before_measurement,
                 prompt,
@@ -736,7 +737,7 @@ fn run() -> Result<(), CliError> {
                 decode_samples,
                 kernel_profile,
             );
-            report.decode_gemv_config = context.decode_gemv_config().map(DecodeGemvConfig::name);
+            report.decode_gemv_config = kernels.decode_gemv_config().map(DecodeGemvConfig::name);
             report.decode_mode = Some(effective_decode_mode.name());
             report
         }
@@ -836,18 +837,18 @@ fn measure_dispatch<E>(
 }
 
 fn dispatch_matmul(
-    context: &MetalContext,
-    input: &metal_infer_core::Tensor,
-    weight: &metal_infer_core::Tensor,
-) -> Result<DispatchStats, metal_infer_core::CoreError> {
-    let mut batch = context.begin_batch()?;
+    kernels: &Kernels,
+    input: &metal_infer_runtime::Tensor,
+    weight: &metal_infer_runtime::Tensor,
+) -> Result<DispatchStats, metal_infer_runtime::CoreError> {
+    let mut batch = kernels.begin_batch()?;
     let _output = batch.matmul(input, weight)?;
     batch.finish()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_rotated_matvec(
-    context: &MetalContext,
+    kernels: &Kernels,
     m: usize,
     n: usize,
     k: usize,
@@ -858,6 +859,7 @@ fn run_rotated_matvec(
     split_k: Option<usize>,
     half8: bool,
 ) -> Result<Report, CliError> {
+    let context = kernels.context();
     if m != 1 || n == 0 || k == 0 || copies == 0 {
         return Err(CliError::InvalidArguments(
             "--rotate requires m=1 and positive n, k, and copy count".into(),
@@ -878,14 +880,14 @@ fn run_rotated_matvec(
         .map(|_| context.tensor_f16(&values, &[n, k]))
         .collect::<Result<Vec<_>, _>>()?;
     let mut dispatch = || {
-        let mut batch = context.begin_batch()?;
+        let mut batch = kernels.begin_batch()?;
         let outputs = weights
             .iter()
             .map(|weight| batch.matmul(&input, weight))
             .collect::<Result<Vec<_>, _>>()?;
         let stats = batch.finish()?;
         drop(outputs);
-        Ok::<DispatchStats, metal_infer_core::CoreError>(stats)
+        Ok::<DispatchStats, metal_infer_runtime::CoreError>(stats)
     };
     for _ in 0..warmup {
         dispatch()?;
@@ -903,7 +905,7 @@ fn run_rotated_matvec(
         format!(
             "matvec_f16[1,{n},{k},rotate={copies},rows={rows:?},split_k={split_k:?},half8={half8},working_set={working_set}]"
         ),
-        context,
+        kernels,
         wall,
         Some(gpu),
         Some(bandwidth),
@@ -912,25 +914,26 @@ fn run_rotated_matvec(
 }
 
 fn dispatch_attention(
-    context: &MetalContext,
+    kernels: &Kernels,
     query: &Tensor,
     key: &Tensor,
     value: &Tensor,
     config: AttentionConfig,
     kind: AttentionKind,
-) -> Result<DispatchStats, metal_infer_core::CoreError> {
-    let mut batch = context.begin_batch()?;
+) -> Result<DispatchStats, metal_infer_runtime::CoreError> {
+    let mut batch = kernels.begin_batch()?;
     let _output = batch.attention(query, key, value, config, kind)?;
     batch.finish()
 }
 
 fn run_attention_benchmark(
-    context: &MetalContext,
+    kernels: &Kernels,
     selection: AttentionBenchmarkKind,
     dimensions: AttentionDimensions,
     iterations: usize,
     warmup: usize,
 ) -> Result<Report, CliError> {
+    let context = kernels.context();
     require_iterations(iterations)?;
     let AttentionDimensions {
         tokens,
@@ -990,7 +993,7 @@ fn run_attention_benchmark(
         query_offset: length - tokens,
     };
     let case = AttentionCase {
-        context,
+        kernels,
         query: &query,
         key: &key,
         value: &value,
@@ -1003,7 +1006,7 @@ fn run_attention_benchmark(
         let (samples, gpu_samples) = measure_attention_variant(case, kind, iterations, warmup)?;
         return Ok(report(
             format!("{benchmark}[{}]", attention_kind_name(kind)),
-            context,
+            kernels,
             samples,
             Some(gpu_samples),
             None,
@@ -1086,7 +1089,7 @@ fn run_attention_benchmark(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: context.matmul_backend().name(),
+        matmul_backend: kernels.matmul_backend().name(),
         decode_gemv_config: None,
         decode_mode: None,
         shared_gate_up_input: None,
@@ -1131,7 +1134,7 @@ fn attention_flash_decode_variant_report(
     warmup: usize,
 ) -> Result<AttentionVariantReport, CliError> {
     let output = case
-        .context
+        .kernels
         .attention_flash_decode_with_configuration(
             case.query,
             case.key,
@@ -1159,7 +1162,7 @@ fn measure_flash_decode_variant(
     threads: usize,
     iterations: usize,
     warmup: usize,
-) -> Result<(Vec<Duration>, Vec<Duration>), metal_infer_core::CoreError> {
+) -> Result<(Vec<Duration>, Vec<Duration>), metal_infer_runtime::CoreError> {
     for _ in 0..warmup {
         let _ = dispatch_flash_decode_variant(case, threads)?;
     }
@@ -1169,8 +1172,8 @@ fn measure_flash_decode_variant(
 fn dispatch_flash_decode_variant(
     case: AttentionCase<'_>,
     threads: usize,
-) -> Result<DispatchStats, metal_infer_core::CoreError> {
-    let mut batch = case.context.begin_batch()?;
+) -> Result<DispatchStats, metal_infer_runtime::CoreError> {
+    let mut batch = case.kernels.begin_batch()?;
     let _output = batch.attention_flash_decode_with_configuration(
         case.query,
         case.key,
@@ -1187,10 +1190,10 @@ fn measure_attention_variant(
     kind: AttentionKind,
     iterations: usize,
     warmup: usize,
-) -> Result<(Vec<Duration>, Vec<Duration>), metal_infer_core::CoreError> {
+) -> Result<(Vec<Duration>, Vec<Duration>), metal_infer_runtime::CoreError> {
     for _ in 0..warmup {
         let _ = dispatch_attention(
-            case.context,
+            case.kernels,
             case.query,
             case.key,
             case.value,
@@ -1200,7 +1203,7 @@ fn measure_attention_variant(
     }
     measure_dispatch(iterations, || {
         dispatch_attention(
-            case.context,
+            case.kernels,
             case.query,
             case.key,
             case.value,
@@ -1213,8 +1216,8 @@ fn measure_attention_variant(
 fn attention_output(
     case: AttentionCase<'_>,
     kind: AttentionKind,
-) -> Result<Vec<f32>, metal_infer_core::CoreError> {
-    case.context
+) -> Result<Vec<f32>, metal_infer_runtime::CoreError> {
+    case.kernels
         .attention(case.query, case.key, case.value, case.config, kind)?
         .to_f32_vec()
 }
@@ -1262,7 +1265,7 @@ fn print_attention_variant(variant: &AttentionVariantReport) {
 }
 
 fn run_fusion_benchmark(
-    context: &MetalContext,
+    kernels: &Kernels,
     kind: FusionKind,
     dimensions: FusionDimensions,
     iterations: usize,
@@ -1270,6 +1273,7 @@ fn run_fusion_benchmark(
     rotate: Option<usize>,
     rows: Option<usize>,
 ) -> Result<Report, CliError> {
+    let context = kernels.context();
     let FusionDimensions {
         k,
         intermediate,
@@ -1312,7 +1316,7 @@ fn run_fusion_benchmark(
             FusionKind::GateUp | FusionKind::GateUpAddRms => vec![intermediate, intermediate],
             FusionKind::AddRmsNorm | FusionKind::QkRopeCache => unreachable!(),
         };
-        return run_rotated_fusion(context, kind, k, &widths, copies, iterations, warmup, rows);
+        return run_rotated_fusion(kernels, kind, k, &widths, copies, iterations, warmup, rows);
     }
     match kind {
         FusionKind::QkvRms | FusionKind::GateUpAddRms => Err(CliError::InvalidArguments(
@@ -1326,12 +1330,12 @@ fn run_fusion_benchmark(
             let key = context.tensor_f16(&vec![0.03; kv_width * k], &[kv_width, k])?;
             let value = context.tensor_f16(&vec![0.04; kv_width * k], &[kv_width, k])?;
             Ok(measure_fusion_pair(
-                context,
+                kernels,
                 format!("qkv_f16[k={k},{}]", projection_path(k)),
                 iterations,
                 warmup,
-                || dispatch_qkv(context, &input, &query, &key, &value, false),
-                || dispatch_qkv(context, &input, &query, &key, &value, true),
+                || dispatch_qkv(kernels, &input, &query, &key, &value, false),
+                || dispatch_qkv(kernels, &input, &query, &key, &value, true),
             )?)
         }
         FusionKind::GateUp => {
@@ -1339,12 +1343,12 @@ fn run_fusion_benchmark(
             let gate = context.tensor_f16(&vec![0.02; intermediate * k], &[intermediate, k])?;
             let up = context.tensor_f16(&vec![0.03; intermediate * k], &[intermediate, k])?;
             Ok(measure_fusion_pair(
-                context,
+                kernels,
                 format!("gate_up_f16[k={k},{}]", projection_path(k)),
                 iterations,
                 warmup,
-                || dispatch_gate_up(context, &input, &gate, &up, false),
-                || dispatch_gate_up(context, &input, &gate, &up, true),
+                || dispatch_gate_up(kernels, &input, &gate, &up, false),
+                || dispatch_gate_up(kernels, &input, &gate, &up, true),
             )?)
         }
         FusionKind::AddRmsNorm => {
@@ -1352,12 +1356,12 @@ fn run_fusion_benchmark(
             let right = context.tensor_f16(&vec![0.02; k], &[1, k])?;
             let weight = context.tensor_f16(&vec![1.0; k], &[k])?;
             Ok(measure_fusion_pair(
-                context,
+                kernels,
                 format!("add_rms_norm_f16[width={k}]"),
                 iterations,
                 warmup,
-                || dispatch_add_rms_norm(context, &left, &right, &weight, false),
-                || dispatch_add_rms_norm(context, &left, &right, &weight, true),
+                || dispatch_add_rms_norm(kernels, &left, &right, &weight, false),
+                || dispatch_add_rms_norm(kernels, &left, &right, &weight, true),
             )?)
         }
         FusionKind::QkRopeCache => {
@@ -1380,13 +1384,13 @@ fn run_fusion_benchmark(
             )?;
             let offset = cache_capacity / 2;
             Ok(measure_fusion_pair(
-                context,
+                kernels,
                 format!("qk_rope_cache_f16[head_dim={head_dim}]"),
                 iterations,
                 warmup,
                 || {
                     dispatch_qk_rope_cache(
-                        context,
+                        kernels,
                         &query,
                         &key,
                         &query_weight,
@@ -1398,7 +1402,7 @@ fn run_fusion_benchmark(
                 },
                 || {
                     dispatch_qk_rope_cache(
-                        context,
+                        kernels,
                         &query,
                         &key,
                         &query_weight,
@@ -1415,7 +1419,7 @@ fn run_fusion_benchmark(
 
 #[allow(clippy::too_many_arguments)]
 fn run_rotated_fusion(
-    context: &MetalContext,
+    kernels: &Kernels,
     kind: FusionKind,
     k: usize,
     widths: &[usize],
@@ -1424,6 +1428,7 @@ fn run_rotated_fusion(
     warmup: usize,
     rows: Option<usize>,
 ) -> Result<Report, CliError> {
+    let context = kernels.context();
     let elements = widths
         .iter()
         .try_fold(0usize, |sum, width| {
@@ -1451,8 +1456,8 @@ fn run_rotated_fusion(
         }
         weights.push(projections);
     }
-    let dispatch = |fused: bool| -> Result<DispatchStats, metal_infer_core::CoreError> {
-        let mut batch = context.begin_batch()?;
+    let dispatch = |fused: bool| -> Result<DispatchStats, metal_infer_runtime::CoreError> {
+        let mut batch = kernels.begin_batch()?;
         let mut outputs = Vec::with_capacity(copies * widths.len());
         for projections in &weights {
             match (kind, fused) {
@@ -1512,7 +1517,7 @@ fn run_rotated_fusion(
         Ok(stats)
     };
     let mut report = measure_fusion_pair(
-        context,
+        kernels,
         format!("{kind:?}_f16[k={k},rotate={copies},rows={rows:?},working_set={working_set}]"),
         iterations,
         warmup,
@@ -1550,13 +1555,14 @@ fn projection_path(k: usize) -> &'static str {
 }
 
 fn measure_fusion_pair<E>(
-    context: &MetalContext,
+    kernels: &Kernels,
     benchmark: String,
     iterations: usize,
     warmup: usize,
     mut unfused: impl FnMut() -> Result<DispatchStats, E>,
     mut fused: impl FnMut() -> Result<DispatchStats, E>,
 ) -> Result<Report, E> {
+    let context = kernels.context();
     for _ in 0..warmup {
         let _ = unfused()?;
         let _ = fused()?;
@@ -1596,7 +1602,7 @@ fn measure_fusion_pair<E>(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: context.matmul_backend().name(),
+        matmul_backend: kernels.matmul_backend().name(),
         decode_gemv_config: None,
         decode_mode: None,
         shared_gate_up_input: None,
@@ -1643,14 +1649,14 @@ fn timing_report(
 }
 
 fn dispatch_qkv(
-    context: &MetalContext,
-    input: &metal_infer_core::Tensor,
-    query: &metal_infer_core::Tensor,
-    key: &metal_infer_core::Tensor,
-    value: &metal_infer_core::Tensor,
+    kernels: &Kernels,
+    input: &metal_infer_runtime::Tensor,
+    query: &metal_infer_runtime::Tensor,
+    key: &metal_infer_runtime::Tensor,
+    value: &metal_infer_runtime::Tensor,
     fused: bool,
-) -> Result<DispatchStats, metal_infer_core::CoreError> {
-    let mut batch = context.begin_batch()?;
+) -> Result<DispatchStats, metal_infer_runtime::CoreError> {
+    let mut batch = kernels.begin_batch()?;
     if fused {
         let _ = batch.matmul3(input, query, key, value)?;
     } else {
@@ -1662,13 +1668,13 @@ fn dispatch_qkv(
 }
 
 fn dispatch_gate_up(
-    context: &MetalContext,
-    input: &metal_infer_core::Tensor,
-    gate: &metal_infer_core::Tensor,
-    up: &metal_infer_core::Tensor,
+    kernels: &Kernels,
+    input: &metal_infer_runtime::Tensor,
+    gate: &metal_infer_runtime::Tensor,
+    up: &metal_infer_runtime::Tensor,
     fused: bool,
-) -> Result<DispatchStats, metal_infer_core::CoreError> {
-    let mut batch = context.begin_batch()?;
+) -> Result<DispatchStats, metal_infer_runtime::CoreError> {
+    let mut batch = kernels.begin_batch()?;
     if fused {
         let _ = batch.matmul2(input, gate, up)?;
     } else {
@@ -1679,13 +1685,13 @@ fn dispatch_gate_up(
 }
 
 fn dispatch_add_rms_norm(
-    context: &MetalContext,
-    left: &metal_infer_core::Tensor,
-    right: &metal_infer_core::Tensor,
-    weight: &metal_infer_core::Tensor,
+    kernels: &Kernels,
+    left: &metal_infer_runtime::Tensor,
+    right: &metal_infer_runtime::Tensor,
+    weight: &metal_infer_runtime::Tensor,
     fused: bool,
-) -> Result<DispatchStats, metal_infer_core::CoreError> {
-    let mut batch = context.begin_batch()?;
+) -> Result<DispatchStats, metal_infer_runtime::CoreError> {
+    let mut batch = kernels.begin_batch()?;
     if fused {
         let _ = batch.add_rms_norm(left, right, weight, 1.0e-6)?;
     } else {
@@ -1697,16 +1703,16 @@ fn dispatch_add_rms_norm(
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_qk_rope_cache(
-    context: &MetalContext,
-    query: &metal_infer_core::Tensor,
-    key: &metal_infer_core::Tensor,
-    query_weight: &metal_infer_core::Tensor,
-    key_weight: &metal_infer_core::Tensor,
-    key_cache: &metal_infer_core::Tensor,
+    kernels: &Kernels,
+    query: &metal_infer_runtime::Tensor,
+    key: &metal_infer_runtime::Tensor,
+    query_weight: &metal_infer_runtime::Tensor,
+    key_weight: &metal_infer_runtime::Tensor,
+    key_cache: &metal_infer_runtime::Tensor,
     offset: usize,
     fused: bool,
-) -> Result<DispatchStats, metal_infer_core::CoreError> {
-    let mut batch = context.begin_batch()?;
+) -> Result<DispatchStats, metal_infer_runtime::CoreError> {
+    let mut batch = kernels.begin_batch()?;
     if fused {
         let _ = batch.qk_norm_rope_cache(
             query,
@@ -1732,12 +1738,13 @@ fn dispatch_qk_rope_cache(
 
 fn report(
     benchmark: String,
-    context: &MetalContext,
+    kernels: &Kernels,
     mut samples: Vec<Duration>,
     gpu_samples: Option<Vec<Duration>>,
     throughput: Option<f64>,
     throughput_unit: Option<&'static str>,
 ) -> Report {
+    let context = kernels.context();
     samples.sort();
     let mean = mean_seconds(&samples);
     let median = samples
@@ -1759,7 +1766,7 @@ fn report(
         throughput,
         throughput_unit,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: context.matmul_backend().name(),
+        matmul_backend: kernels.matmul_backend().name(),
         decode_gemv_config: None,
         decode_mode: None,
         shared_gate_up_input: None,
@@ -1774,7 +1781,7 @@ fn report(
 }
 
 fn run_model_iteration(
-    context: &MetalContext,
+    kernels: &Kernels,
     model: &Qwen3Model,
     prompt: &[u32],
     decode_tokens: usize,
@@ -1790,6 +1797,7 @@ fn run_model_iteration(
     ),
     CliError,
 > {
+    let context = kernels.context();
     let started = Instant::now();
     let slots = if decode_mode == DecodeMode::Pipelined {
         Some(context.tensor_u32(&vec![u32::MAX; decode_tokens + 1], &[decode_tokens + 1])?)
@@ -1950,7 +1958,7 @@ fn print_kernel_phase(
 
 #[allow(clippy::too_many_arguments)]
 fn model_report(
-    context: &MetalContext,
+    kernels: &Kernels,
     fusion_options: FusionOptions,
     allocated_before_measurement: usize,
     prompt_tokens: usize,
@@ -1959,6 +1967,7 @@ fn model_report(
     decode_samples: Vec<PhaseSample>,
     kernel_profile: Option<KernelProfileReport>,
 ) -> Report {
+    let context = kernels.context();
     let prefill = phase_report(prompt_tokens, &prefill_samples);
     let decode = phase_report(decode_tokens, &decode_samples);
     Report {
@@ -1974,10 +1983,10 @@ fn model_report(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: context.matmul_backend().name(),
+        matmul_backend: kernels.matmul_backend().name(),
         decode_gemv_config: None,
         decode_mode: None,
-        shared_gate_up_input: Some(context.shared_gate_up_input()),
+        shared_gate_up_input: Some(kernels.shared_gate_up_input()),
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()

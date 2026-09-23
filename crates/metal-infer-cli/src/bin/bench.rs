@@ -355,6 +355,8 @@ struct AttentionComparison {
     decode_split_kv: Option<AttentionVariantReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     flash_decode: Option<AttentionVariantReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flash_decode_128: Option<AttentionVariantReport>,
 }
 
 #[derive(Serialize)]
@@ -792,6 +794,9 @@ fn run() -> Result<(), CliError> {
                 if let Some(decode) = &comparison.decode_split_kv {
                     print_attention_variant(decode);
                 }
+                if let Some(decode) = &comparison.flash_decode_128 {
+                    print_attention_variant(decode);
+                }
                 if let Some(decode) = &comparison.flash_decode {
                     print_attention_variant(decode);
                 }
@@ -1043,16 +1048,18 @@ fn run_attention_benchmark(
     } else {
         None
     };
-    let flash_decode = if tokens == 1 && query_heads / kv_heads == 2 {
-        Some(attention_variant_report(
-            case,
-            AttentionKind::FlashDecode,
-            &reference_output,
-            iterations,
-            warmup,
-        )?)
+    let (flash_decode_128, flash_decode) = if tokens == 1 && query_heads / kv_heads == 2 {
+        let reference = &reference_output;
+        (
+            Some(attention_flash_decode_variant_report(
+                case, 128, reference, iterations, warmup,
+            )?),
+            Some(attention_flash_decode_variant_report(
+                case, 256, reference, iterations, warmup,
+            )?),
+        )
     } else {
-        None
+        (None, None)
     };
     let selected = if length >= 256 {
         flash_decode.as_ref().or(decode_split_kv.as_ref())
@@ -1092,6 +1099,7 @@ fn run_attention_benchmark(
             flash_prefill,
             decode_split_kv,
             flash_decode,
+            flash_decode_128,
         }),
         prefill: None,
         decode: None,
@@ -1113,6 +1121,65 @@ fn attention_variant_report(
         timing: timing_report(wall, gpu),
         max_abs_error: max_abs_error(&output, reference),
     })
+}
+
+fn attention_flash_decode_variant_report(
+    case: AttentionCase<'_>,
+    threads: usize,
+    reference: &[f32],
+    iterations: usize,
+    warmup: usize,
+) -> Result<AttentionVariantReport, CliError> {
+    let output = case
+        .context
+        .attention_flash_decode_with_configuration(
+            case.query,
+            case.key,
+            case.value,
+            case.config,
+            64,
+            threads,
+        )?
+        .to_f32_vec()?;
+    let (wall, gpu) = measure_flash_decode_variant(case, threads, iterations, warmup)?;
+    let kind = match threads {
+        128 => "flash-decode-128t",
+        256 => "flash-decode-256t",
+        _ => "flash-decode-custom",
+    };
+    Ok(AttentionVariantReport {
+        kind,
+        timing: timing_report(wall, gpu),
+        max_abs_error: max_abs_error(&output, reference),
+    })
+}
+
+fn measure_flash_decode_variant(
+    case: AttentionCase<'_>,
+    threads: usize,
+    iterations: usize,
+    warmup: usize,
+) -> Result<(Vec<Duration>, Vec<Duration>), metal_infer_core::CoreError> {
+    for _ in 0..warmup {
+        let _ = dispatch_flash_decode_variant(case, threads)?;
+    }
+    measure_dispatch(iterations, || dispatch_flash_decode_variant(case, threads))
+}
+
+fn dispatch_flash_decode_variant(
+    case: AttentionCase<'_>,
+    threads: usize,
+) -> Result<DispatchStats, metal_infer_core::CoreError> {
+    let mut batch = case.context.begin_batch()?;
+    let _output = batch.attention_flash_decode_with_configuration(
+        case.query,
+        case.key,
+        case.value,
+        case.config,
+        64,
+        threads,
+    )?;
+    batch.finish()
 }
 
 fn measure_attention_variant(

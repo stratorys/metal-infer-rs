@@ -1,3 +1,4 @@
+#include "prelude.metal"
 kernel void matmul_f16(device const half *x [[buffer(0)]],
                        device const half *weight [[buffer(1)]],
                        device half *out [[buffer(2)]],

@@ -1,3 +1,4 @@
+#include "prelude.metal"
 inline bool argmax_better(float candidate, uint candidate_index, float current,
                           uint current_index) {
   if (candidate_index == UINT_MAX)

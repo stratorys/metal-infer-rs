@@ -7,8 +7,9 @@ use objc2_metal::MTLSize;
 
 use crate::tuning::Tuning;
 
-const SHADERS: &str = concat!(
-    include_str!("../metal/prelude.metal"),
+const PRELUDE: &str = include_str!("../metal/prelude.metal");
+const PRELUDE_INCLUDE: &str = "#include \"prelude.metal\"\n";
+const FAMILIES: [&str; 9] = [
     include_str!("../metal/elementwise.metal"),
     include_str!("../metal/gemm.metal"),
     include_str!("../metal/gemv.metal"),
@@ -18,7 +19,15 @@ const SHADERS: &str = concat!(
     include_str!("../metal/rope.metal"),
     include_str!("../metal/attention.metal"),
     include_str!("../metal/kv.metal"),
-);
+];
+
+fn shader_source() -> String {
+    let mut source = PRELUDE.to_owned();
+    for family in FAMILIES {
+        source.push_str(family.strip_prefix(PRELUDE_INCLUDE).unwrap_or(family));
+    }
+    source
+}
 
 #[derive(Clone)]
 pub struct Kernels {
@@ -29,7 +38,7 @@ pub struct Kernels {
 
 impl Kernels {
     pub fn new(context: &MetalContext) -> Result<Self, CoreError> {
-        let library = Library::new(context, SHADERS)?;
+        let library = Library::new(context, &shader_source())?;
         Ok(Self {
             context: context.clone(),
             library: Rc::new(library),
@@ -82,5 +91,28 @@ impl<'kernels> KernelBatch<'kernels> {
         let pipeline = self.kernels.library.pipeline(kernel)?;
         self.batch
             .dispatch(&pipeline, kernel, tensors, params, grid, threadgroup)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shader_source;
+
+    #[test]
+    fn shader_source_is_self_contained() {
+        let source = shader_source();
+        assert!(
+            source.starts_with("#include <metal_simdgroup_matrix>\n"),
+            "the prelude must open the shader source"
+        );
+        assert!(
+            !source.contains("#include \""),
+            "local includes must be resolved before compilation"
+        );
+        assert_eq!(
+            source.matches("\nkernel void").count(),
+            48,
+            "every kernel must be part of the shader source"
+        );
     }
 }

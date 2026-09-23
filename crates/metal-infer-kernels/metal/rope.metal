@@ -1,3 +1,4 @@
+#include "prelude.metal"
 kernel void rope_f16(device const half *input [[buffer(0)]],
                      device half *out [[buffer(1)]],
                      constant RopeParams &p [[buffer(2)]],

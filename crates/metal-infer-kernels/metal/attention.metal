@@ -1,3 +1,4 @@
+#include "prelude.metal"
 kernel void attention_reference_f16(device const half *q [[buffer(0)]],
                                     device const half *k [[buffer(1)]],
                                     device const half *v [[buffer(2)]],

@@ -1,3 +1,4 @@
+#include "prelude.metal"
 template <ushort ROWS, ushort GROUPS>
 void matvec3_rms_impl(device const half *x, device const half *norm_weight,
                       device const half *weight0, device const half *weight1,

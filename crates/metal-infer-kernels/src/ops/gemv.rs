@@ -1,7 +1,7 @@
 use metal_infer_runtime::{CoreError, DType, Tensor};
 
 use super::{MultiMatrixParams, checked_mul, matrix_shape, require_f16, size, to_u32};
-use crate::{KernelBatch, MatmulBackend};
+use crate::KernelBatch;
 
 impl KernelBatch<'_> {
     pub fn matmul2(
@@ -31,15 +31,8 @@ impl KernelBatch<'_> {
             k: to_u32(k, "k")?,
         };
         let outputs = n0.max(n1);
-        let backend = self.kernels.matmul_backend();
-        let rows = if k.is_multiple_of(256) {
-            if backend == MatmulBackend::NativeMsl {
-                2
-            } else if backend == MatmulBackend::Auto && self.kernels.is_m4_pro() {
-                self.kernels.auto_matvec_rows().fused2
-            } else {
-                0
-            }
+        let rows = if k.is_multiple_of(256) && self.kernels.is_m4_pro() {
+            2
         } else {
             0
         };
@@ -50,8 +43,6 @@ impl KernelBatch<'_> {
         self.dispatch(
             match rows {
                 2 => "matvec2_tuned_f16",
-                4 => "matvec2_tuned4_f16",
-                8 => "matvec2_tuned8_f16",
                 _ => "matvec2_f16",
             },
             &[input, weight0, weight1, &out0, &out1],
@@ -97,15 +88,8 @@ impl KernelBatch<'_> {
             k: to_u32(k, "k")?,
         };
         let outputs = n0.max(n1).max(n2);
-        let backend = self.kernels.matmul_backend();
-        let rows = if k.is_multiple_of(256) {
-            if backend == MatmulBackend::NativeMsl {
-                2
-            } else if backend == MatmulBackend::Auto && self.kernels.is_m4_pro() {
-                self.kernels.auto_matvec_rows().fused3
-            } else {
-                0
-            }
+        let rows = if k.is_multiple_of(256) && self.kernels.is_m4_pro() {
+            2
         } else {
             0
         };
@@ -116,8 +100,6 @@ impl KernelBatch<'_> {
         self.dispatch(
             match rows {
                 2 => "matvec3_tuned_f16",
-                4 => "matvec3_tuned4_f16",
-                8 => "matvec3_tuned8_f16",
                 _ => "matvec3_f16",
             },
             &[input, weight0, weight1, weight2, &out0, &out1, &out2],

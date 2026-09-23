@@ -4,10 +4,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use metal_infer_cli::{CliError, load_model_with};
-use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, KernelSelection, Kernels, MatmulBackend, MatvecRows,
-    QkNormRopeCacheConfig,
-};
+use metal_infer_kernels::{AttentionConfig, AttentionKind, Kernels, QkNormRopeCacheConfig};
 use metal_infer_models::{KvCache, Qwen3Model};
 use metal_infer_planner::Plan;
 use metal_infer_runtime::{DispatchStats, KernelDispatchProfile, MetalContext, Tensor};
@@ -54,17 +51,6 @@ enum Command {
         /// Distinct weight matrices dispatched in one command buffer.
         #[arg(long)]
         rotate: Option<usize>,
-        /// Force rows per SIMD group for the single-matrix auto GEMV path.
-        #[arg(long)]
-        rows: Option<usize>,
-        /// Divide K into this many partial GEMV dispatches, then reduce.
-        #[arg(long)]
-        split_k: Option<usize>,
-        /// Compare 16-byte vector loads in the one-row GEMV kernel.
-        #[arg(long)]
-        half8: bool,
-        #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
-        matmul_backend: MatmulBackendArgument,
     },
     Fusion {
         #[arg(long, value_enum)]
@@ -88,11 +74,6 @@ enum Command {
         /// Distinct sets of projection weights dispatched in one command buffer.
         #[arg(long)]
         rotate: Option<usize>,
-        /// Force rows per SIMD group for the fused auto GEMV path.
-        #[arg(long)]
-        rows: Option<usize>,
-        #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
-        matmul_backend: MatmulBackendArgument,
     },
     Attention {
         #[arg(long, value_enum, default_value_t = AttentionBenchmarkKind::Compare)]
@@ -163,25 +144,6 @@ impl DecodeMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum MatmulBackendArgument {
-    Auto,
-    ReferenceMsl,
-    NativeMsl,
-    Mps,
-}
-
-impl From<MatmulBackendArgument> for MatmulBackend {
-    fn from(value: MatmulBackendArgument) -> Self {
-        match value {
-            MatmulBackendArgument::Auto => Self::Auto,
-            MatmulBackendArgument::ReferenceMsl => Self::ReferenceMsl,
-            MatmulBackendArgument::NativeMsl => Self::NativeMsl,
-            MatmulBackendArgument::Mps => Self::Mps,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FusionKind {
     Qkv,
@@ -219,7 +181,6 @@ struct Report {
     throughput: Option<f64>,
     throughput_unit: Option<&'static str>,
     allocated_bytes: usize,
-    matmul_backend: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     decode_mode: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -389,56 +350,10 @@ fn run() -> Result<(), CliError> {
             iterations,
             warmup,
             rotate,
-            rows,
-            split_k,
-            half8,
-            matmul_backend,
         } => {
             require_iterations(iterations)?;
-            select(&kernels, |selection| {
-                selection.matmul_backend = matmul_backend.into()
-            })?;
-            if let Some(rows) = rows {
-                if matmul_backend != MatmulBackendArgument::Auto || m != 1 || split_k.is_some() {
-                    return Err(CliError::InvalidArguments(
-                        "--rows requires auto GEMV and cannot be combined with --split-k".into(),
-                    ));
-                }
-                if n >= 65_536 && rows == 1 {
-                    return Err(CliError::InvalidArguments(
-                        "--rows 1 is unavailable for vocabulary GEMV".into(),
-                    ));
-                }
-                select(&kernels, |selection| {
-                    selection.matvec_rows = MatvecRows {
-                        single: rows,
-                        fused2: 2,
-                        fused3: 2,
-                        vocab: if n >= 65_536 { rows } else { 0 },
-                    };
-                    selection.matvec_rows_manual = true;
-                })?;
-            }
-            if let Some(splits) = split_k {
-                if matmul_backend != MatmulBackendArgument::Auto || m != 1 {
-                    return Err(CliError::InvalidArguments(
-                        "--split-k requires --matmul-backend auto and m=1".into(),
-                    ));
-                }
-                select(&kernels, |selection| selection.split_k = splits)?;
-            }
-            if half8 {
-                if matmul_backend != MatmulBackendArgument::Auto || m != 1 || rows != Some(1) {
-                    return Err(CliError::InvalidArguments(
-                        "--half8 requires auto GEMV, m=1, and --rows 1".into(),
-                    ));
-                }
-                select(&kernels, |selection| selection.half8 = true)?;
-            }
             if let Some(copies) = rotate {
-                run_rotated_matvec(
-                    &kernels, m, n, k, copies, iterations, warmup, rows, split_k, half8,
-                )?
+                run_rotated_matvec(&kernels, m, n, k, copies, iterations, warmup)?
             } else {
                 let input = context.tensor_f16(&vec![0.01; m * k], &[m, k])?;
                 let weight = context.tensor_f16(&vec![0.02; n * k], &[n, k])?;
@@ -470,44 +385,8 @@ fn run() -> Result<(), CliError> {
             iterations,
             warmup,
             rotate,
-            rows,
-            matmul_backend,
         } => {
             require_iterations(iterations)?;
-            select(&kernels, |selection| {
-                selection.matmul_backend = matmul_backend.into()
-            })?;
-            if let Some(rows) = rows {
-                if matmul_backend != MatmulBackendArgument::Auto
-                    || !matches!(
-                        kind,
-                        FusionKind::Qkv
-                            | FusionKind::GateUp
-                            | FusionKind::QkvRms
-                            | FusionKind::GateUpAddRms
-                    )
-                {
-                    return Err(CliError::InvalidArguments(
-                        "fusion --rows requires auto QKV or gate-up GEMV".into(),
-                    ));
-                }
-                if matches!(kind, FusionKind::QkvRms | FusionKind::GateUpAddRms) {
-                    select(&kernels, |selection| {
-                        selection.fused_norm_qkv_rows = rows;
-                        selection.fused_norm_gate_up_rows = rows;
-                    })?;
-                } else {
-                    select(&kernels, |selection| {
-                        selection.matvec_rows = MatvecRows {
-                            single: 4,
-                            fused2: rows,
-                            fused3: rows,
-                            vocab: 0,
-                        };
-                        selection.matvec_rows_manual = true;
-                    })?;
-                }
-            }
             run_fusion_benchmark(
                 &kernels,
                 kind,
@@ -522,7 +401,6 @@ fn run() -> Result<(), CliError> {
                 iterations,
                 warmup,
                 rotate,
-                rows,
             )?
         }
         Command::Attention {
@@ -647,7 +525,6 @@ fn run() -> Result<(), CliError> {
         Format::Table => {
             println!("benchmark: {}", report.benchmark);
             println!("device: {}", report.device);
-            println!("matmul backend: {}", report.matmul_backend);
             if let Some(plan) = &report.plan {
                 for (key, value) in plan {
                     println!("plan: {key}={value}");
@@ -710,16 +587,6 @@ fn run() -> Result<(), CliError> {
     Ok(())
 }
 
-fn select(
-    kernels: &Kernels,
-    change: impl FnOnce(&mut KernelSelection),
-) -> Result<(), CliError> {
-    let mut selection = kernels.selection();
-    change(&mut selection);
-    kernels.select(&selection)?;
-    Ok(())
-}
-
 fn measure<E>(
     iterations: usize,
     mut operation: impl FnMut() -> Result<(), E>,
@@ -758,7 +625,6 @@ fn dispatch_matmul(
     batch.finish()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_rotated_matvec(
     kernels: &Kernels,
     m: usize,
@@ -767,9 +633,6 @@ fn run_rotated_matvec(
     copies: usize,
     iterations: usize,
     warmup: usize,
-    rows: Option<usize>,
-    split_k: Option<usize>,
-    half8: bool,
 ) -> Result<Report, CliError> {
     let context = kernels.context();
     if m != 1 || n == 0 || k == 0 || copies == 0 {
@@ -814,9 +677,7 @@ fn run_rotated_matvec(
     }
     let bandwidth = weight_bytes as f64 / 1.0e9 / mean_seconds(&gpu);
     Ok(report(
-        format!(
-            "matvec_f16[1,{n},{k},rotate={copies},rows={rows:?},split_k={split_k:?},half8={half8},working_set={working_set}]"
-        ),
+        format!("matvec_f16[1,{n},{k},rotate={copies},working_set={working_set}]"),
         kernels,
         wall,
         Some(gpu),
@@ -1001,7 +862,6 @@ fn run_attention_benchmark(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: kernels.selection().matmul_backend.name(),
         decode_mode: None,
         allocation_growth_bytes: None,
         plan: None,
@@ -1181,7 +1041,6 @@ fn run_fusion_benchmark(
     iterations: usize,
     warmup: usize,
     rotate: Option<usize>,
-    rows: Option<usize>,
 ) -> Result<Report, CliError> {
     let context = kernels.context();
     let FusionDimensions {
@@ -1226,7 +1085,7 @@ fn run_fusion_benchmark(
             FusionKind::GateUp | FusionKind::GateUpAddRms => vec![intermediate, intermediate],
             FusionKind::AddRmsNorm | FusionKind::QkRopeCache => unreachable!(),
         };
-        return run_rotated_fusion(kernels, kind, k, &widths, copies, iterations, warmup, rows);
+        return run_rotated_fusion(kernels, kind, k, &widths, copies, iterations, warmup);
     }
     match kind {
         FusionKind::QkvRms | FusionKind::GateUpAddRms => Err(CliError::InvalidArguments(
@@ -1327,7 +1186,6 @@ fn run_fusion_benchmark(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_rotated_fusion(
     kernels: &Kernels,
     kind: FusionKind,
@@ -1336,7 +1194,6 @@ fn run_rotated_fusion(
     copies: usize,
     iterations: usize,
     warmup: usize,
-    rows: Option<usize>,
 ) -> Result<Report, CliError> {
     let context = kernels.context();
     let elements = widths
@@ -1428,7 +1285,7 @@ fn run_rotated_fusion(
     };
     let mut report = measure_fusion_pair(
         kernels,
-        format!("{kind:?}_f16[k={k},rotate={copies},rows={rows:?},working_set={working_set}]"),
+        format!("{kind:?}_f16[k={k},rotate={copies},working_set={working_set}]"),
         iterations,
         warmup,
         || dispatch(false),
@@ -1512,7 +1369,6 @@ fn measure_fusion_pair<E>(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: kernels.selection().matmul_backend.name(),
         decode_mode: None,
         allocation_growth_bytes: Some(
             context
@@ -1674,7 +1530,6 @@ fn report(
         throughput,
         throughput_unit,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: kernels.selection().matmul_backend.name(),
         decode_mode: None,
         allocation_growth_bytes: None,
         plan: None,
@@ -1889,7 +1744,6 @@ fn model_report(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: kernels.selection().matmul_backend.name(),
         decode_mode: None,
         allocation_growth_bytes: Some(
             context

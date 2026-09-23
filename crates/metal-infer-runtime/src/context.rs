@@ -519,24 +519,12 @@ impl<'context> CommandBatch<'context> {
         Ok(())
     }
 
-    pub fn end_compute_encoding(&mut self) -> Result<(), CoreError> {
+    fn end_compute_encoding(&mut self) -> Result<(), CoreError> {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
         } else if self.profile.is_none() {
             return Err(CoreError::Resource("finished compute encoder"));
         }
-        Ok(())
-    }
-
-    pub fn resume_compute_encoding(&mut self) -> Result<(), CoreError> {
-        if self.profile.is_some() {
-            return Ok(());
-        }
-        let encoder = self
-            .command_buffer
-            .computeCommandEncoder()
-            .ok_or(CoreError::Resource("compute encoder"))?;
-        self.encoder = Some(encoder);
         Ok(())
     }
 
@@ -564,10 +552,6 @@ impl<'context> CommandBatch<'context> {
         self.command_buffer
             .computeCommandEncoderWithDescriptor(&descriptor)
             .ok_or(CoreError::Resource("profiled compute encoder"))
-    }
-
-    pub fn command_buffer_ref(&self) -> &ProtocolObject<dyn MTLCommandBuffer> {
-        &self.command_buffer
     }
 
     pub fn empty(

@@ -4,8 +4,7 @@ use std::path::Path;
 use half::f16;
 
 use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, DecodeGemvConfig, KernelBatch, Kernels, MatmulBackend,
-    QkNormRopeCacheConfig,
+    AttentionConfig, AttentionKind, DecodeGemvConfig, KernelBatch, Kernels, QkNormRopeCacheConfig,
 };
 use metal_infer_planner::{Fusions, Plan};
 use metal_infer_runtime::{DType, DispatchStats, MetalContext, PendingBatch, Tensor};
@@ -240,8 +239,7 @@ impl Qwen3Model {
     }
 
     fn tune_fused_decode_norm(&mut self) -> Result<(), ModelError> {
-        if self.kernels.selection().matmul_backend != MatmulBackend::Auto
-            || !self.context.device_name().contains("M4 Pro")
+        if !self.context.device_name().contains("M4 Pro")
             || !self.config.hidden_size.is_multiple_of(256)
         {
             return Ok(());

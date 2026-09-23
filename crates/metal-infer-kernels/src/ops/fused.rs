@@ -3,7 +3,7 @@ use metal_infer_runtime::{CoreError, DType, Tensor};
 use super::{
     NormMultiMatrixParams, checked_mul, matrix_shape, require_f16, require_same_shape, size, to_u32,
 };
-use crate::{KernelBatch, MatmulBackend};
+use crate::KernelBatch;
 
 impl KernelBatch<'_> {
     pub fn rms_norm_matmul3(
@@ -45,20 +45,17 @@ impl KernelBatch<'_> {
             k: to_u32(width, "width")?,
             epsilon,
         };
-        let rows =
-            if self.kernels.matmul_backend() == MatmulBackend::Auto && self.kernels.is_m4_pro() {
-                self.kernels
-                    .fused_norm_matvec_rows_for_shape([n0, n1, n2], width)
-            } else {
-                2
-            };
+        let rows = if self.kernels.is_m4_pro() {
+            self.kernels
+                .fused_norm_matvec_rows_for_shape([n0, n1, n2], width)
+        } else {
+            2
+        };
         let simdgroups = if rows == 1 { 8 } else { 4 };
         let groups = n0.max(n1).max(n2).div_ceil(rows * simdgroups);
         self.dispatch(
             match rows {
                 1 => "matvec3_rms_r1_f16",
-                4 => "matvec3_rms_r4_f16",
-                8 => "matvec3_rms_r8_f16",
                 _ => "matvec3_rms_f16",
             },
             &[
@@ -120,20 +117,17 @@ impl KernelBatch<'_> {
             k: to_u32(width, "width")?,
             epsilon,
         };
-        let rows =
-            if self.kernels.matmul_backend() == MatmulBackend::Auto && self.kernels.is_m4_pro() {
-                self.kernels
-                    .fused_norm_matvec_rows_for_shape([n0, n1, 0], width)
-            } else {
-                2
-            };
+        let rows = if self.kernels.is_m4_pro() {
+            self.kernels
+                .fused_norm_matvec_rows_for_shape([n0, n1, 0], width)
+        } else {
+            2
+        };
         let simdgroups = if rows == 1 { 8 } else { 4 };
         let groups = n0.max(n1).div_ceil(rows * simdgroups);
         self.dispatch(
             match rows {
                 1 => "matvec2_add_rms_r1_f16",
-                4 => "matvec2_add_rms_r4_f16",
-                8 => "matvec2_add_rms_r8_f16",
                 _ => "matvec2_add_rms_f16",
             },
             &[

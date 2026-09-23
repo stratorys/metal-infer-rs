@@ -42,9 +42,8 @@ pub(crate) fn single_rows(
     k: usize,
     fallback: usize,
     config: Option<DecodeGemvConfig>,
-    manual: bool,
 ) -> usize {
-    let Some(config) = config.filter(|_| !manual) else {
+    let Some(config) = config else {
         return fallback;
     };
     SINGLE_SHAPES
@@ -77,45 +76,6 @@ pub(crate) fn fused_norm_rows(
         })
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum MatmulBackend {
-    #[default]
-    Auto,
-    ReferenceMsl,
-    NativeMsl,
-    Mps,
-}
-
-impl MatmulBackend {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::ReferenceMsl => "reference-msl",
-            Self::NativeMsl => "native-msl",
-            Self::Mps => "mps",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MatvecRows {
-    pub single: usize,
-    pub fused2: usize,
-    pub fused3: usize,
-    pub vocab: usize,
-}
-
-impl Default for MatvecRows {
-    fn default() -> Self {
-        Self {
-            single: 4,
-            fused2: 2,
-            fused3: 2,
-            vocab: 0,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlashDecodeBlock {
     pub max_length: usize,
@@ -123,57 +83,14 @@ pub struct FlashDecodeBlock {
     pub threads: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KernelSelection {
-    pub matmul_backend: MatmulBackend,
-    pub matvec_rows: MatvecRows,
-    pub matvec_rows_manual: bool,
-    pub split_k: usize,
-    pub half8: bool,
-    pub fused_norm_qkv_rows: usize,
-    pub fused_norm_gate_up_rows: usize,
     pub decode_gemv: Option<DecodeGemvConfig>,
     pub flash_decode_blocks: Vec<FlashDecodeBlock>,
 }
 
-impl Default for KernelSelection {
-    fn default() -> Self {
-        Self {
-            matmul_backend: MatmulBackend::Auto,
-            matvec_rows: MatvecRows::default(),
-            matvec_rows_manual: false,
-            split_k: 1,
-            half8: false,
-            fused_norm_qkv_rows: 2,
-            fused_norm_gate_up_rows: 2,
-            decode_gemv: None,
-            flash_decode_blocks: Vec::new(),
-        }
-    }
-}
-
 impl KernelSelection {
     pub fn validate(&self) -> Result<(), CoreError> {
-        let rows = self.matvec_rows;
-        if !matches!(rows.single, 0 | 1 | 2 | 4 | 8)
-            || !matches!(rows.fused2, 0 | 2 | 4 | 8)
-            || !matches!(rows.fused3, 0 | 2 | 4 | 8)
-            || !matches!(rows.vocab, 0 | 2 | 4 | 8)
-        {
-            return Err(CoreError::Shape("invalid auto matvec row count".into()));
-        }
-        if !matches!(self.split_k, 1 | 2 | 4 | 8) {
-            return Err(CoreError::Shape(
-                "split-K count must be 1, 2, 4, or 8".into(),
-            ));
-        }
-        if !matches!(self.fused_norm_qkv_rows, 1 | 2 | 4 | 8)
-            || !matches!(self.fused_norm_gate_up_rows, 1 | 2 | 4 | 8)
-        {
-            return Err(CoreError::Shape(
-                "fused norm matvec rows must be 1, 2, 4, or 8".into(),
-            ));
-        }
         for entry in &self.flash_decode_blocks {
             if !matches!(entry.block, 32 | 64 | 128 | 256) || !matches!(entry.threads, 128 | 256) {
                 return Err(CoreError::Shape(
@@ -221,10 +138,6 @@ impl Kernels {
         self.tuning.is_m4_pro
     }
 
-    pub(crate) fn matmul_backend(&self) -> MatmulBackend {
-        self.tuning.selection.borrow().matmul_backend
-    }
-
     pub(crate) fn flash_decode_configuration_for_length(
         &self,
         length: usize,
@@ -238,39 +151,19 @@ impl Kernels {
             .map_or((64, 256), |entry| (entry.block, entry.threads))
     }
 
-    pub(crate) fn auto_matvec_rows(&self) -> MatvecRows {
-        self.tuning.selection.borrow().matvec_rows
-    }
-
-    pub(crate) fn auto_matvec_rows_for_shape(
+    pub(crate) fn matvec_rows_for_shape(
         &self,
         n: usize,
         k: usize,
         vocabulary: bool,
     ) -> usize {
-        let selected = self.auto_matvec_rows();
-        let fallback = if vocabulary {
-            selected.vocab
-        } else {
-            selected.single
-        };
-        let selection = self.tuning.selection.borrow();
         single_rows(
             &self.tuning.device_name,
             n,
             k,
-            fallback,
-            selection.decode_gemv,
-            selection.matvec_rows_manual,
+            if vocabulary { 0 } else { 4 },
+            self.tuning.selection.borrow().decode_gemv,
         )
-    }
-
-    pub(crate) fn auto_matvec_split_k(&self) -> usize {
-        self.tuning.selection.borrow().split_k
-    }
-
-    pub(crate) fn auto_matvec_half8(&self) -> bool {
-        self.tuning.selection.borrow().half8
     }
 
     pub(crate) fn fused_norm_matvec_rows_for_shape(
@@ -278,19 +171,12 @@ impl Kernels {
         widths: [usize; 3],
         k: usize,
     ) -> usize {
-        let [_, _, n2] = widths;
-        let selection = self.tuning.selection.borrow();
-        let fallback = if n2 == 0 {
-            selection.fused_norm_gate_up_rows
-        } else {
-            selection.fused_norm_qkv_rows
-        };
         fused_norm_rows(
             &self.tuning.device_name,
             widths,
             k,
-            fallback,
-            selection.decode_gemv,
+            2,
+            self.tuning.selection.borrow().decode_gemv,
         )
     }
 
@@ -381,13 +267,10 @@ mod tests {
     #[test]
     fn tuned_shapes_and_fallbacks() {
         let tuned = Some(DecodeGemvConfig::Tuned);
-        assert_eq!(single_rows("Apple M4 Pro", 1024, 3072, 4, tuned, false), 1);
-        assert_eq!(single_rows("Apple M4 Pro", 1024, 2048, 4, tuned, false), 2);
-        assert_eq!(
-            single_rows("Apple M4 Pro", 151_936, 1024, 0, tuned, false),
-            2
-        );
-        assert_eq!(single_rows("Apple M3", 1024, 3072, 4, tuned, false), 4);
+        assert_eq!(single_rows("Apple M4 Pro", 1024, 3072, 4, tuned), 1);
+        assert_eq!(single_rows("Apple M4 Pro", 1024, 2048, 4, tuned), 2);
+        assert_eq!(single_rows("Apple M4 Pro", 151_936, 1024, 0, tuned), 2);
+        assert_eq!(single_rows("Apple M3", 1024, 3072, 4, tuned), 4);
         assert_eq!(
             fused_norm_rows("Apple M4 Pro", [3072, 3072, 0], 1024, 2, tuned),
             1
@@ -399,18 +282,15 @@ mod tests {
     }
 
     #[test]
-    fn manual_rows_and_missing_config_use_the_fallback() {
-        let tuned = Some(DecodeGemvConfig::Tuned);
-        assert_eq!(single_rows("Apple M4 Pro", 1024, 3072, 4, tuned, true), 4);
-        assert_eq!(single_rows("Apple M4 Pro", 1024, 3072, 4, None, false), 4);
+    fn missing_config_and_baseline_use_their_rows() {
+        assert_eq!(single_rows("Apple M4 Pro", 1024, 3072, 4, None), 4);
         assert_eq!(
             single_rows(
                 "Apple M4 Pro",
                 1024,
                 3072,
                 4,
-                Some(DecodeGemvConfig::Baseline),
-                false
+                Some(DecodeGemvConfig::Baseline)
             ),
             4
         );

@@ -16,7 +16,6 @@ enum AttentionExecution {
     Kind(AttentionKind),
     FlashDecode {
         configuration: Option<(usize, usize)>,
-        legacy: bool,
     },
 }
 
@@ -74,29 +73,6 @@ impl KernelBatch<'_> {
             config,
             AttentionExecution::FlashDecode {
                 configuration: Some((block_keys, threads)),
-                legacy: false,
-            },
-        )
-    }
-
-    #[cfg(test)]
-    fn attention_flash_decode_legacy_with_configuration(
-        &mut self,
-        query: &Tensor,
-        key: &Tensor,
-        value: &Tensor,
-        config: AttentionConfig,
-        block_keys: usize,
-        threads: usize,
-    ) -> Result<Tensor, CoreError> {
-        self.attention_with_flash_configuration(
-            query,
-            key,
-            value,
-            config,
-            AttentionExecution::FlashDecode {
-                configuration: Some((block_keys, threads)),
-                legacy: true,
             },
         )
     }
@@ -109,12 +85,11 @@ impl KernelBatch<'_> {
         config: AttentionConfig,
         execution: AttentionExecution,
     ) -> Result<Tensor, CoreError> {
-        let (kind, flash_configuration, force_legacy_flash) = match execution {
-            AttentionExecution::Kind(kind) => (kind, None, false),
-            AttentionExecution::FlashDecode {
-                configuration,
-                legacy,
-            } => (AttentionKind::FlashDecode, configuration, legacy),
+        let (kind, flash_configuration) = match execution {
+            AttentionExecution::Kind(kind) => (kind, None),
+            AttentionExecution::FlashDecode { configuration } => {
+                (AttentionKind::FlashDecode, configuration)
+            }
         };
         require_f16(query)?;
         require_f16(key)?;
@@ -167,7 +142,11 @@ impl KernelBatch<'_> {
                     "flash decode threadgroup size must be 128 or 256".into(),
                 ));
             }
-            (block, threads)
+            if threads == 128 && config.head_dim != 128 {
+                (block, 256)
+            } else {
+                (block, threads)
+            }
         } else {
             (0, 0)
         };
@@ -214,13 +193,10 @@ impl KernelBatch<'_> {
                 .ok_or_else(|| CoreError::Shape("flash decode partial width overflow".into()))?;
             let scratch = self.empty(&[config.kv_heads, blocks, 2, partial_width], DType::F32)?;
             let groups = checked_mul(config.kv_heads, blocks, "flash decode groups")?;
-            let optimized_128 =
-                !force_legacy_flash && config.head_dim == 128 && flash_threads == 128;
+            let optimized_128 = flash_threads == 128;
             self.dispatch(
                 if optimized_128 {
                     "attention_flash_decode_partial_128_opt_f16"
-                } else if flash_threads == 128 {
-                    "attention_flash_decode_partial_128_legacy_f16"
                 } else {
                     "attention_flash_decode_partial_legacy_f16"
                 },
@@ -298,71 +274,5 @@ impl KernelBatch<'_> {
             threadgroup,
         )?;
         Ok(out)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use metal_infer_runtime::MetalContext;
-
-    use super::AttentionConfig;
-    use crate::Kernels;
-
-    #[test]
-    #[ignore = "requires direct access to an Apple Metal device"]
-    fn flash_decode_128_is_bit_exact_to_legacy() -> Result<(), metal_infer_runtime::CoreError> {
-        let context = MetalContext::new()?;
-        let kernels = Kernels::new(&context)?;
-        let query_values: Vec<f32> = (0..2 * 128)
-            .map(|i| ((i * 17 % 101) as f32 - 50.0) / 101.0)
-            .collect();
-        let query = context.tensor_f16(&query_values, &[1, 2, 128])?;
-        let config_for = |length| AttentionConfig {
-            query_heads: 2,
-            kv_heads: 1,
-            head_dim: 128,
-            causal: true,
-            query_offset: length - 1,
-        };
-        for length in [256, 511, 576, 1024, 2048] {
-            let key_values: Vec<f32> = (0..length * 128)
-                .map(|i| ((i * 29 % 127) as f32 - 63.0) / 127.0)
-                .collect();
-            let value_values: Vec<f32> = (0..length * 128)
-                .map(|i| ((i * 13 % 89) as f32 - 44.0) / 89.0)
-                .collect();
-            let key = context.tensor_f16(&key_values, &[length, 1, 128])?;
-            let value = context.tensor_f16(&value_values, &[length, 1, 128])?;
-            for threads in [128, 256] {
-                let mut optimized_batch = kernels.begin_batch()?;
-                let optimized = optimized_batch.attention_flash_decode_with_configuration(
-                    &query,
-                    &key,
-                    &value,
-                    config_for(length),
-                    64,
-                    threads,
-                )?;
-                optimized_batch.finish()?;
-
-                let mut legacy_batch = kernels.begin_batch()?;
-                let legacy = legacy_batch.attention_flash_decode_legacy_with_configuration(
-                    &query,
-                    &key,
-                    &value,
-                    config_for(length),
-                    64,
-                    threads,
-                )?;
-                legacy_batch.finish()?;
-                let optimized_bits = optimized.with_f16_bits(<[u16]>::to_vec)?;
-                let legacy_bits = legacy.with_f16_bits(<[u16]>::to_vec)?;
-                assert_eq!(
-                    optimized_bits, legacy_bits,
-                    "length={length}, threads={threads}"
-                );
-            }
-        }
-        Ok(())
     }
 }

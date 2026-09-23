@@ -113,46 +113,6 @@ kernel void matvec3_rms_f16(device const half *x [[buffer(0)]],
                          &scale);
 }
 
-kernel void matvec3_rms_r4_f16(device const half *x [[buffer(0)]],
-                               device const half *norm_weight [[buffer(1)]],
-                               device const half *weight0 [[buffer(2)]],
-                               device const half *weight1 [[buffer(3)]],
-                               device const half *weight2 [[buffer(4)]],
-                               device half *out0 [[buffer(5)]],
-                               device half *out1 [[buffer(6)]],
-                               device half *out2 [[buffer(7)]],
-                               constant NormMultiMatrixParams &p [[buffer(8)]],
-                               uint group [[threadgroup_position_in_grid]],
-                               uint lane [[thread_index_in_simdgroup]],
-                               uint simdgroup_index
-                               [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partial[8];
-  threadgroup float scale;
-  matvec3_rms_impl<4, 4>(x, norm_weight, weight0, weight1, weight2, out0, out1,
-                         out2, p, group, lane, simdgroup_index, partial,
-                         &scale);
-}
-
-kernel void matvec3_rms_r8_f16(device const half *x [[buffer(0)]],
-                               device const half *norm_weight [[buffer(1)]],
-                               device const half *weight0 [[buffer(2)]],
-                               device const half *weight1 [[buffer(3)]],
-                               device const half *weight2 [[buffer(4)]],
-                               device half *out0 [[buffer(5)]],
-                               device half *out1 [[buffer(6)]],
-                               device half *out2 [[buffer(7)]],
-                               constant NormMultiMatrixParams &p [[buffer(8)]],
-                               uint group [[threadgroup_position_in_grid]],
-                               uint lane [[thread_index_in_simdgroup]],
-                               uint simdgroup_index
-                               [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partial[8];
-  threadgroup float scale;
-  matvec3_rms_impl<8, 4>(x, norm_weight, weight0, weight1, weight2, out0, out1,
-                         out2, p, group, lane, simdgroup_index, partial,
-                         &scale);
-}
-
 template <ushort ROWS, ushort GROUPS>
 void matvec2_add_rms_impl(device const half *left, device const half *right,
                           device const half *norm_weight,
@@ -261,48 +221,6 @@ kernel void matvec2_add_rms_f16(device const half *left [[buffer(0)]],
   threadgroup float partial[8];
   threadgroup float scale;
   matvec2_add_rms_impl<2, 4>(left, right, norm_weight, weight0, weight1,
-                             residual, out0, out1, p, group, lane,
-                             simdgroup_index, partial, &scale);
-}
-
-kernel void matvec2_add_rms_r4_f16(device const half *left [[buffer(0)]],
-                                   device const half *right [[buffer(1)]],
-                                   device const half *norm_weight [[buffer(2)]],
-                                   device const half *weight0 [[buffer(3)]],
-                                   device const half *weight1 [[buffer(4)]],
-                                   device half *residual [[buffer(5)]],
-                                   device half *out0 [[buffer(6)]],
-                                   device half *out1 [[buffer(7)]],
-                                   constant NormMultiMatrixParams &p
-                                   [[buffer(8)]],
-                                   uint group [[threadgroup_position_in_grid]],
-                                   uint lane [[thread_index_in_simdgroup]],
-                                   uint simdgroup_index
-                                   [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partial[8];
-  threadgroup float scale;
-  matvec2_add_rms_impl<4, 4>(left, right, norm_weight, weight0, weight1,
-                             residual, out0, out1, p, group, lane,
-                             simdgroup_index, partial, &scale);
-}
-
-kernel void matvec2_add_rms_r8_f16(device const half *left [[buffer(0)]],
-                                   device const half *right [[buffer(1)]],
-                                   device const half *norm_weight [[buffer(2)]],
-                                   device const half *weight0 [[buffer(3)]],
-                                   device const half *weight1 [[buffer(4)]],
-                                   device half *residual [[buffer(5)]],
-                                   device half *out0 [[buffer(6)]],
-                                   device half *out1 [[buffer(7)]],
-                                   constant NormMultiMatrixParams &p
-                                   [[buffer(8)]],
-                                   uint group [[threadgroup_position_in_grid]],
-                                   uint lane [[thread_index_in_simdgroup]],
-                                   uint simdgroup_index
-                                   [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partial[8];
-  threadgroup float scale;
-  matvec2_add_rms_impl<8, 4>(left, right, norm_weight, weight0, weight1,
                              residual, out0, out1, p, group, lane,
                              simdgroup_index, partial, &scale);
 }

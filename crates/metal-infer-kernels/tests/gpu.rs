@@ -1,6 +1,6 @@
 use half::f16;
 use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, KernelSelection, Kernels, MatmulBackend, MatvecRows,
+    AttentionConfig, AttentionKind, DecodeGemvConfig, KernelSelection, Kernels,
     QkNormRopeCacheConfig,
 };
 use metal_infer_runtime::{CoreError, MetalContext};
@@ -92,35 +92,10 @@ fn matmul_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn mps_matmul_matches_native_msl() -> Result<(), CoreError> {
+fn matmul_variants_match_cpu_reference() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
-    let input_values: Vec<f32> = (0..17 * 33)
-        .map(|index| (index % 19) as f32 / 19.0 - 0.5)
-        .collect();
-    let weight_values: Vec<f32> = (0..29 * 33)
-        .map(|index| (index % 23) as f32 / 23.0 - 0.5)
-        .collect();
-    let input = context.tensor_f16(&input_values, &[17, 33])?;
-    let weight = context.tensor_f16(&weight_values, &[29, 33])?;
-    select(&kernels, |selection| {
-        selection.matmul_backend = MatmulBackend::NativeMsl
-    })?;
-    let expected = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-    select(&kernels, |selection| {
-        selection.matmul_backend = MatmulBackend::Mps
-    })?;
-    let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-    assert_close(&actual, &expected);
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires direct access to an Apple Metal device"]
-fn simdgroup_matmul_matches_reference_msl() -> Result<(), CoreError> {
-    let context = MetalContext::new()?;
-    let kernels = Kernels::new(&context)?;
-    for (m, n, k) in [(32, 32, 32), (64, 96, 64), (31, 35, 37)] {
+    for (m, n, k) in [(128, 256, 256), (32, 32, 32), (31, 35, 37)] {
         let input_values: Vec<f32> = (0..m * k)
             .map(|index| (index % 19) as f32 / 19.0 - 0.5)
             .collect();
@@ -129,19 +104,11 @@ fn simdgroup_matmul_matches_reference_msl() -> Result<(), CoreError> {
             .collect();
         let input = context.tensor_f16(&input_values, &[m, k])?;
         let weight = context.tensor_f16(&weight_values, &[n, k])?;
-        select(&kernels, |selection| {
-            selection.matmul_backend = MatmulBackend::ReferenceMsl
-        })?;
-        let expected = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-        select(&kernels, |selection| {
-            selection.matmul_backend = MatmulBackend::NativeMsl
-        })?;
         let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-        assert_close(&actual, &expected);
+        assert_close(&actual, &cpu_matmul(&input_values, &weight_values, k));
     }
     Ok(())
 }
-
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
 fn matvec_matches_cpu() -> Result<(), CoreError> {
@@ -203,59 +170,11 @@ fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
 }
 
 #[test]
-#[ignore = "requires direct access to an Apple M4 Pro Metal device"]
-fn one_row_and_split_k_matvec_match_reference() -> Result<(), CoreError> {
-    let context = MetalContext::new()?;
-    let kernels = Kernels::new(&context)?;
-    if context.device_name() != "Apple M4 Pro" {
-        return Ok(());
-    }
-    let k = 1024;
-    let n = 33;
-    let input_values: Vec<f32> = (0..k)
-        .map(|index| (index % 41) as f32 / 41.0 - 0.5)
-        .collect();
-    let weight_values: Vec<f32> = (0..n * k)
-        .map(|index| (index % 37) as f32 / 37.0 - 0.5)
-        .collect();
-    let input = context.tensor_f16(&input_values, &[1, k])?;
-    let weight = context.tensor_f16(&weight_values, &[n, k])?;
-    select(&kernels, |selection| {
-        selection.matmul_backend = MatmulBackend::ReferenceMsl
-    })?;
-    let expected = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-    select(&kernels, |selection| {
-        selection.matmul_backend = MatmulBackend::Auto
-    })?;
-    select(&kernels, |selection| {
-        selection.matvec_rows = MatvecRows {
-            single: 1,
-            fused2: 2,
-            fused3: 2,
-            vocab: 0,
-        };
-        selection.matvec_rows_manual = true;
-    })?;
-    let one_row = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-    assert_close(&one_row, &expected);
-    select(&kernels, |selection| selection.half8 = true)?;
-    let half8 = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-    assert_close(&half8, &expected);
-    select(&kernels, |selection| selection.half8 = false)?;
-    for splits in [2, 4, 8] {
-        select(&kernels, |selection| selection.split_k = splits)?;
-        let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-        assert_close(&actual, &expected);
-    }
-    Ok(())
-}
-
-#[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn tuned_matvec_matches_reference_across_qwen_shapes() -> Result<(), CoreError> {
+fn matvec_variants_match_cpu_reference_at_qwen_shapes() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
-    for (n, k) in [(1024, 1024), (1024, 3072), (65_537, 256)] {
+    for (n, k) in [(1024, 1024), (1024, 2048), (1024, 3072), (65_537, 256)] {
         let input_values: Vec<f32> = (0..k)
             .map(|index| (index % 17) as f32 / 34.0 - 0.25)
             .collect();
@@ -264,24 +183,19 @@ fn tuned_matvec_matches_reference_across_qwen_shapes() -> Result<(), CoreError> 
             .collect();
         let input = context.tensor_f16(&input_values, &[1, k])?;
         let weight = context.tensor_f16(&weight_values, &[n, k])?;
-        select(&kernels, |selection| {
-            selection.matmul_backend = MatmulBackend::ReferenceMsl
-        })?;
-        let expected = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-        select(&kernels, |selection| {
-            selection.matmul_backend = MatmulBackend::NativeMsl
-        })?;
-        let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-        assert_close(&actual, &expected);
-        select(&kernels, |selection| {
-            selection.matmul_backend = MatmulBackend::Auto
-        })?;
-        let auto = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-        assert_close(&auto, &expected);
+        let expected = cpu_matmul(&input_values, &weight_values, k);
+        for config in [
+            None,
+            Some(DecodeGemvConfig::Baseline),
+            Some(DecodeGemvConfig::Tuned),
+        ] {
+            select(&kernels, |selection| selection.decode_gemv = config)?;
+            let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
+            assert_close(&actual, &expected);
+        }
     }
     Ok(())
 }
-
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
 fn simd_rms_norm_matches_cpu() -> Result<(), CoreError> {
@@ -310,7 +224,7 @@ fn simd_rms_norm_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn fused_projections_match_individual_matvecs() -> Result<(), CoreError> {
+fn fused_projections_match_cpu_reference() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     for k in [1024, 128, 127] {
@@ -322,82 +236,81 @@ fn fused_projections_match_individual_matvecs() -> Result<(), CoreError> {
                 .map(|index| (index % modulus) as f32 / modulus as f32 - 0.5)
                 .collect::<Vec<_>>()
         };
+        let (values0, values1, values2) = (weights(35, 19), weights(17, 23), weights(6, 29));
         let input = context.tensor_f16(&input_values, &[1, k])?;
-        let weight0 = context.tensor_f16(&weights(35, 19), &[35, k])?;
-        let weight1 = context.tensor_f16(&weights(17, 23), &[17, k])?;
-        let weight2 = context.tensor_f16(&weights(6, 29), &[6, k])?;
-        select(&kernels, |selection| {
-            selection.matmul_backend = MatmulBackend::ReferenceMsl
-        })?;
-        let expected0 = kernels.matmul(&input, &weight0)?.to_f32_vec()?;
-        let expected1 = kernels.matmul(&input, &weight1)?.to_f32_vec()?;
-        let expected2 = kernels.matmul(&input, &weight2)?.to_f32_vec()?;
-        for backend in [MatmulBackend::NativeMsl, MatmulBackend::Auto] {
-            select(&kernels, |selection| selection.matmul_backend = backend)?;
+        let weight0 = context.tensor_f16(&values0, &[35, k])?;
+        let weight1 = context.tensor_f16(&values1, &[17, k])?;
+        let weight2 = context.tensor_f16(&values2, &[6, k])?;
+        let expected0 = cpu_matmul(&input_values, &values0, k);
+        let expected1 = cpu_matmul(&input_values, &values1, k);
+        let expected2 = cpu_matmul(&input_values, &values2, k);
 
-            let mut batch = kernels.begin_batch()?;
-            let (actual0, actual1, actual2) =
-                batch.matmul3(&input, &weight0, &weight1, &weight2)?;
-            batch.finish()?;
-            assert_close(&actual0.to_f32_vec()?, &expected0);
-            assert_close(&actual1.to_f32_vec()?, &expected1);
-            assert_close(&actual2.to_f32_vec()?, &expected2);
+        let mut batch = kernels.begin_batch()?;
+        let (actual0, actual1, actual2) = batch.matmul3(&input, &weight0, &weight1, &weight2)?;
+        batch.finish()?;
+        assert_close(&actual0.to_f32_vec()?, &expected0);
+        assert_close(&actual1.to_f32_vec()?, &expected1);
+        assert_close(&actual2.to_f32_vec()?, &expected2);
 
-            let mut batch = kernels.begin_batch()?;
-            let (actual0, actual1) = batch.matmul2(&input, &weight0, &weight1)?;
-            batch.finish()?;
-            assert_close(&actual0.to_f32_vec()?, &expected0);
-            assert_close(&actual1.to_f32_vec()?, &expected1);
-        }
+        let mut batch = kernels.begin_batch()?;
+        let (actual0, actual1) = batch.matmul2(&input, &weight0, &weight1)?;
+        batch.finish()?;
+        assert_close(&actual0.to_f32_vec()?, &expected0);
+        assert_close(&actual1.to_f32_vec()?, &expected1);
     }
     Ok(())
 }
-
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn auto_fused_projections_match_reference_at_qwen_dimensions() -> Result<(), CoreError> {
+fn fused_projections_match_cpu_reference_at_qwen_dimensions() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input_values: Vec<f32> = (0..1024)
         .map(|index| (index % 31) as f32 / 31.0 - 0.5)
         .collect();
     let input = context.tensor_f16(&input_values, &[1, 1024])?;
-    let make_weight = |rows: usize, modulus: usize| {
-        let values: Vec<f32> = (0..rows * 1024)
+    let weight_values = |rows: usize, modulus: usize| {
+        (0..rows * 1024)
             .map(|index| (index % modulus) as f32 / modulus as f32 - 0.5)
-            .collect();
-        context.tensor_f16(&values, &[rows, 1024])
+            .collect::<Vec<_>>()
     };
-    let query = make_weight(2048, 37)?;
-    let key = make_weight(1024, 41)?;
-    let value = make_weight(1024, 43)?;
-    let gate = make_weight(3072, 47)?;
-    let up = make_weight(3072, 53)?;
+    let query_values = weight_values(2048, 37);
+    let key_values = weight_values(1024, 41);
+    let value_values = weight_values(1024, 43);
+    let gate_values = weight_values(3072, 47);
+    let up_values = weight_values(3072, 53);
+    let query = context.tensor_f16(&query_values, &[2048, 1024])?;
+    let key = context.tensor_f16(&key_values, &[1024, 1024])?;
+    let value = context.tensor_f16(&value_values, &[1024, 1024])?;
+    let gate = context.tensor_f16(&gate_values, &[3072, 1024])?;
+    let up = context.tensor_f16(&up_values, &[3072, 1024])?;
 
-    select(&kernels, |selection| {
-        selection.matmul_backend = MatmulBackend::ReferenceMsl
-    })?;
-    let expected_query = kernels.matmul(&input, &query)?.to_f32_vec()?;
-    let expected_key = kernels.matmul(&input, &key)?.to_f32_vec()?;
-    let expected_value = kernels.matmul(&input, &value)?.to_f32_vec()?;
-    let expected_gate = kernels.matmul(&input, &gate)?.to_f32_vec()?;
-    let expected_up = kernels.matmul(&input, &up)?.to_f32_vec()?;
-
-    select(&kernels, |selection| {
-        selection.matmul_backend = MatmulBackend::Auto
-    })?;
     let mut batch = kernels.begin_batch()?;
     let (actual_query, actual_key, actual_value) = batch.matmul3(&input, &query, &key, &value)?;
     let (actual_gate, actual_up) = batch.matmul2(&input, &gate, &up)?;
     batch.finish()?;
-    assert_close(&actual_query.to_f32_vec()?, &expected_query);
-    assert_close(&actual_key.to_f32_vec()?, &expected_key);
-    assert_close(&actual_value.to_f32_vec()?, &expected_value);
-    assert_close(&actual_gate.to_f32_vec()?, &expected_gate);
-    assert_close(&actual_up.to_f32_vec()?, &expected_up);
+    assert_close(
+        &actual_query.to_f32_vec()?,
+        &cpu_matmul(&input_values, &query_values, 1024),
+    );
+    assert_close(
+        &actual_key.to_f32_vec()?,
+        &cpu_matmul(&input_values, &key_values, 1024),
+    );
+    assert_close(
+        &actual_value.to_f32_vec()?,
+        &cpu_matmul(&input_values, &value_values, 1024),
+    );
+    assert_close(
+        &actual_gate.to_f32_vec()?,
+        &cpu_matmul(&input_values, &gate_values, 1024),
+    );
+    assert_close(
+        &actual_up.to_f32_vec()?,
+        &cpu_matmul(&input_values, &up_values, 1024),
+    );
     Ok(())
 }
-
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
 fn fused_add_rms_norm_matches_individual_ops() -> Result<(), CoreError> {
@@ -463,89 +376,55 @@ fn fused_decode_norm_projections_match_separate_ops() -> Result<(), CoreError> {
     );
     assert_close(&actual_gate.to_f32_vec()?, &expected_gate.to_f32_vec()?);
     assert_close(&actual_up.to_f32_vec()?, &expected_up.to_f32_vec()?);
-    if context.device_name() == "Apple M4 Pro" {
-        for rows in [1, 4, 8] {
-            select(&kernels, |selection| {
-                selection.fused_norm_qkv_rows = rows;
-                selection.fused_norm_gate_up_rows = rows;
-            })?;
-            let mut batch = kernels.begin_batch()?;
-            let (query, key, value) = batch.rms_norm_matmul3(
-                &input,
-                &norm_weight,
-                &weight0,
-                &weight1,
-                &weight2,
-                1.0e-6,
-            )?;
-            let (residual, gate, up) = batch.add_rms_norm_matmul2(
-                &input,
-                &right,
-                &norm_weight,
-                &weight0,
-                &weight1,
-                1.0e-6,
-            )?;
-            batch.finish()?;
-            assert_close(&query.to_f32_vec()?, &expected0.to_f32_vec()?);
-            assert_close(&key.to_f32_vec()?, &expected1.to_f32_vec()?);
-            assert_close(&value.to_f32_vec()?, &expected2.to_f32_vec()?);
-            assert_close(&residual.to_f32_vec()?, &expected_residual.to_f32_vec()?);
-            assert_close(&gate.to_f32_vec()?, &expected_gate.to_f32_vec()?);
-            assert_close(&up.to_f32_vec()?, &expected_up.to_f32_vec()?);
-        }
-    }
     Ok(())
 }
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn auto_matvec_row_variants_match_reference() -> Result<(), CoreError> {
+fn fused_decode_norm_projections_match_separate_ops_at_qwen_dimensions() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
-    if !context.device_name().contains("M4 Pro") {
-        return Ok(());
-    }
-    let input_values: Vec<f32> = (0..256).map(|i| (i % 23) as f32 / 23.0 - 0.5).collect();
-    let input = context.tensor_f16(&input_values, &[1, 256])?;
-    let make_weight = |rows: usize, modulus: usize| {
-        let values: Vec<f32> = (0..rows * 256)
-            .map(|i| (i % modulus) as f32 / modulus as f32 - 0.5)
-            .collect();
-        context.tensor_f16(&values, &[rows, 256])
+    let values = |count: usize, modulus: usize, scale: f32| {
+        (0..count)
+            .map(|i| (i % modulus) as f32 / modulus as f32 * scale - scale / 2.0)
+            .collect::<Vec<_>>()
     };
-    let weight0 = make_weight(40, 19)?;
-    let weight1 = make_weight(24, 29)?;
-    let weight2 = make_weight(16, 31)?;
-    select(&kernels, |selection| {
-        selection.matmul_backend = MatmulBackend::ReferenceMsl
-    })?;
-    let expected0 = kernels.matmul(&input, &weight0)?.to_f32_vec()?;
-    let expected1 = kernels.matmul(&input, &weight1)?.to_f32_vec()?;
-    let expected2 = kernels.matmul(&input, &weight2)?.to_f32_vec()?;
-    select(&kernels, |selection| {
-        selection.matmul_backend = MatmulBackend::Auto
-    })?;
-    for rows in [0, 2, 4, 8] {
-        select(&kernels, |selection| {
-            selection.matvec_rows = MatvecRows {
-                single: rows,
-                fused2: rows,
-                fused3: rows,
-                vocab: 0,
-            };
-            selection.matvec_rows_manual = true;
-        })?;
-        assert_close(&kernels.matmul(&input, &weight0)?.to_f32_vec()?, &expected0);
+    let input = context.tensor_f16(&values(1024, 29, 1.0), &[1, 1024])?;
+    let right = context.tensor_f16(&values(1024, 19, 0.5), &[1, 1024])?;
+    let norm_values: Vec<f32> = (0..1024).map(|i| 0.5 + (i % 17) as f32 / 34.0).collect();
+    let norm_weight = context.tensor_f16(&norm_values, &[1024])?;
+    let query = context.tensor_f16(&values(2048 * 1024, 31, 0.1), &[2048, 1024])?;
+    let key = context.tensor_f16(&values(1024 * 1024, 37, 0.1), &[1024, 1024])?;
+    let value = context.tensor_f16(&values(1024 * 1024, 41, 0.1), &[1024, 1024])?;
+    let gate = context.tensor_f16(&values(3072 * 1024, 43, 0.1), &[3072, 1024])?;
+    let up = context.tensor_f16(&values(3072 * 1024, 47, 0.1), &[3072, 1024])?;
+    for config in [
+        None,
+        Some(DecodeGemvConfig::Baseline),
+        Some(DecodeGemvConfig::Tuned),
+    ] {
+        select(&kernels, |selection| selection.decode_gemv = config)?;
+        let normalized = kernels.rms_norm(&input, &norm_weight, 1.0e-6)?;
         let mut batch = kernels.begin_batch()?;
-        let (two0, two1) = batch.matmul2(&input, &weight0, &weight1)?;
-        let (three0, three1, three2) = batch.matmul3(&input, &weight0, &weight1, &weight2)?;
+        let (expected_query, expected_key, expected_value) =
+            batch.matmul3(&normalized, &query, &key, &value)?;
+        let (actual_query, actual_key, actual_value) =
+            batch.rms_norm_matmul3(&input, &norm_weight, &query, &key, &value, 1.0e-6)?;
+        let (expected_residual, expected_normalized) =
+            batch.add_rms_norm(&input, &right, &norm_weight, 1.0e-6)?;
+        let (expected_gate, expected_up) = batch.matmul2(&expected_normalized, &gate, &up)?;
+        let (actual_residual, actual_gate, actual_up) =
+            batch.add_rms_norm_matmul2(&input, &right, &norm_weight, &gate, &up, 1.0e-6)?;
         batch.finish()?;
-        assert_close(&two0.to_f32_vec()?, &expected0);
-        assert_close(&two1.to_f32_vec()?, &expected1);
-        assert_close(&three0.to_f32_vec()?, &expected0);
-        assert_close(&three1.to_f32_vec()?, &expected1);
-        assert_close(&three2.to_f32_vec()?, &expected2);
+        assert_close(&actual_query.to_f32_vec()?, &expected_query.to_f32_vec()?);
+        assert_close(&actual_key.to_f32_vec()?, &expected_key.to_f32_vec()?);
+        assert_close(&actual_value.to_f32_vec()?, &expected_value.to_f32_vec()?);
+        assert_close(
+            &actual_residual.to_f32_vec()?,
+            &expected_residual.to_f32_vec()?,
+        );
+        assert_close(&actual_gate.to_f32_vec()?, &expected_gate.to_f32_vec()?);
+        assert_close(&actual_up.to_f32_vec()?, &expected_up.to_f32_vec()?);
     }
     Ok(())
 }
@@ -838,6 +717,32 @@ fn assert_close(
             "element {index}: actual={actual}, expected={expected}"
         );
     }
+}
+
+fn cpu_matmul(
+    input: &[f32],
+    weight: &[f32],
+    k: usize,
+) -> Vec<f32> {
+    let round = |values: &[f32]| {
+        values
+            .iter()
+            .map(|value| f16::from_f32(*value).to_f32())
+            .collect::<Vec<_>>()
+    };
+    let input = round(input);
+    let weight = round(weight);
+    input
+        .chunks_exact(k)
+        .flat_map(|row| {
+            weight.chunks_exact(k).map(move |column| {
+                row.iter()
+                    .zip(column)
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>()
+            })
+        })
+        .collect()
 }
 
 fn select(

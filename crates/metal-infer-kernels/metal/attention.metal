@@ -87,8 +87,6 @@ kernel void attention_tiled_f16(device const half *q [[buffer(0)]],
   }
 }
 
-// Four SIMD-groups own eight query rows each. The score and probability tiles
-// bridge matrix fragments and the row-wise online softmax.
 kernel void attention_flash_prefill_f16(
     device const half *q [[buffer(0)]], device const half *k [[buffer(1)]],
     device const half *v [[buffer(2)]], device half *out [[buffer(3)]],

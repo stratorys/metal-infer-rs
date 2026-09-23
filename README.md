@@ -46,9 +46,10 @@ Face repository ID resolves to its locally cached snapshot; use
 ## Workspace layout
 
 - `metal-infer-runtime`: Metal device, buffers, tensors, command batches, and profiling;
-- `metal-infer-kernels`: Metal kernels, their Rust wrappers, and kernel variant selection;
+- `metal-infer-kernels`: Metal kernels, their Rust wrappers, and the tuned tables for each device;
+- `metal-infer-planner`: the execution plan (kernel variants, fusions, attention) and its `--with` overrides;
 - `metal-infer-models`: weight loading and the Qwen3 implementation;
-- `metal-infer-cli`: text generation and benchmarks.
+- `metal-infer-cli`: text generation, the OpenAI-compatible server, and benchmarks.
 
 See [benchmarks](benchmarks/README.md) for the comparison protocol and metrics.
 

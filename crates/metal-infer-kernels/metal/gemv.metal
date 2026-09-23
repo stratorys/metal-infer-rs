@@ -264,8 +264,6 @@ kernel void matvec3_f16(device const half *x [[buffer(0)]],
   }
 }
 
-// Fused decode projections use two outputs per SIMD-group to keep the number
-// of live FP32 accumulators bounded when two or three matrices are present.
 kernel void matvec2_tuned_f16(device const half *x [[buffer(0)]],
                               device const half *weight0 [[buffer(1)]],
                               device const half *weight1 [[buffer(2)]],

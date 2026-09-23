@@ -99,7 +99,7 @@ def sharegpt_workload(args: argparse.Namespace, directory: pathlib.Path) -> Work
     source_hash = file_sha256(source)
     tokenizer_files = [
         directory / name
-        for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
+        for name in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]
     ]
     tokenizer_hash = ":".join(file_sha256(path) for path in tokenizer_files if path.is_file())
     cache = DATASETS / f"sharegpt-{slug(args.model)}-{args.num_prompts}-seed{args.seed}.json"

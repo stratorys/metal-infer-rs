@@ -7,7 +7,7 @@ import shutil
 import statistics
 from typing import Any
 
-from benchlib.common import RESULTS, SCHEMA_VERSION, slug
+from benchlib.common import RESULTS, ROOT, SCHEMA_VERSION, slug
 from benchlib.engines import offline_commands, server_command
 from benchlib.format import (
     interval_cell,
@@ -521,6 +521,20 @@ def row(name: str, value: str) -> dict[str, str]:
     return {"name": name, "value": value}
 
 
+def display_path(value: str) -> str:
+    path = pathlib.Path(value)
+    if path.is_relative_to(ROOT):
+        return str(path.relative_to(ROOT))
+    home = pathlib.Path.home()
+    if path.is_relative_to(home):
+        return str(pathlib.Path("~") / path.relative_to(home))
+    return value
+
+
+def display_command(command: list[str]) -> str:
+    return " ".join(display_path(part) for part in command)
+
+
 def workload_rows(document: dict[str, Any], args: argparse.Namespace) -> list[dict[str, str]]:
     workload = document["workload"]
     if workload["name"] == "sharegpt":
@@ -641,7 +655,9 @@ def setup(document: dict[str, Any]) -> str:
             rows.append(row("llama.cpp requests", "`cache_prompt: false`, one slot (`-np 1`)"))
     gguf = (document.get("files") or {}).get("gguf")
     if gguf:
-        rows.append(row("llama.cpp model", f"`{gguf['path']}`, sha256 `{gguf['sha256']}`"))
+        rows.append(
+            row("llama.cpp model", f"`{display_path(gguf['path'])}`, sha256 `{gguf['sha256']}`")
+        )
     rows += [
         row("peak bandwidth for MBU", f"{number(document['peak_bandwidth_gbs'])} GB/s"),
         row("peak FP16 TFLOPS for MFU", number(args.peak_tflops)),
@@ -668,10 +684,10 @@ def setup(document: dict[str, Any]) -> str:
         if "offline" in run_modes:
             for prompt in args.prompt:
                 commands += [
-                    " ".join(command) for command in offline_commands(engine, args, prompt)
+                    display_command(command) for command in offline_commands(engine, args, prompt)
                 ]
         if "server" in run_modes:
-            commands.append(" ".join(server_command(engine, args)))
+            commands.append(display_command(server_command(engine, args)))
     lines += [
         "",
         "Offline: pp = prompt tokens / prefill time and tg = generated tokens / decode time, "

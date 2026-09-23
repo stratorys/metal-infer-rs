@@ -202,14 +202,14 @@ def offline_commands(engine: Engine, args: argparse.Namespace, prompt: int) -> l
         return [mlx_bench_command(args, prompt)]
     if engine.kind == "llama.cpp":
         return llama_bench_commands(args, prompt)
-    return [metal_bench_command(args, engine.overrides, prompt, test) for test in ("pp", "tg")]
+    return [metal_bench_command(args, engine.overrides, prompt, test) for test in ["pp", "tg"]]
 
 
 def offline_metal(
     args: argparse.Namespace, overrides: list[str], prompt: int
 ) -> list[dict[str, Any]]:
     samples = []
-    for test in ("pp", "tg"):
+    for test in ["pp", "tg"]:
         report = json.loads(run(metal_bench_command(args, overrides, prompt, test)))
         for sample in report["samples"]:
             samples.append(

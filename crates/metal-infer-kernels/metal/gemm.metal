@@ -25,9 +25,6 @@ kernel void matmul_f16(device const half *x [[buffer(0)]],
     out[id.y * p.n + id.x] = half(sum);
 }
 
-// Adjacent threadgroups reuse a weight tile across up to eight M tiles. The
-// two threadgroup buffers let the next K tile be fetched before matrix work on
-// the current tile has finished.
 kernel void matmul_simd_db_f16(
     device const half *x [[buffer(0)]], device const half *weight [[buffer(1)]],
     device half *out [[buffer(2)]], constant MatrixParams &p [[buffer(3)]],

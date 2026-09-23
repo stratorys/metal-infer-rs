@@ -79,7 +79,7 @@ def stream(
             has_output = any(
                 choice.get("delta", {}).get(field)
                 for choice in chunk.get("choices", [])
-                for field in ("content", "reasoning", "reasoning_content")
+                for field in ["content", "reasoning", "reasoning_content"]
             )
             if has_output:
                 if first is None:

@@ -4,7 +4,7 @@ import html
 import math
 from typing import Any
 
-from benchlib.format import adaptive, level_for, load_tick, number, p50, server_loads
+from benchlib.format import level_for, load_tick, number, p50, server_loads
 
 COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
 FONT = "-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
@@ -133,10 +133,12 @@ def load_panels(document: dict[str, Any]) -> list[dict[str, Any]]:
     ]:
         if len(loads) == 1:
             entries = []
-            for index, result in enumerate(results):
-                level = level_for(result, loads[0])
+            for index in range(len(results)):
+                level = level_for(results[index], loads[0])
                 value = p50(level.get(metric["key"])) if level else None
-                entries.append({"color": index, "values": {"p50": value} if value is not None else None})
+                entries.append(
+                    {"color": index, "values": {"p50": value} if value is not None else None}
+                )
             if any(entry["values"] for entry in entries):
                 panels.append(
                     {
@@ -212,10 +214,14 @@ def bars(
         if entry["values"]
     ]
     whiskers = panel.get("whiskers", True)
-    maximum = max(
-        max(values["p50"], values["mean"] + values["std"] if whiskers else values["p50"])
-        for values in stats
-    ) * 1.15 or 1.0
+    maximum = (
+        max(
+            max(values["p50"], values["mean"] + values["std"] if whiskers else values["p50"])
+            for values in stats
+        )
+        * 1.15
+        or 1.0
+    )
     axis(body, left, baseline, width, height, maximum)
     group_width = width / len(panel["groups"])
     for group_index in range(len(panel["groups"])):
@@ -242,7 +248,9 @@ def bars(
                     'stroke="#24292f" stroke-width="1.5"/>'
                 )
                 label_y = min(y, high)
-            body.append(svg_text(x, label_y - 6, chart_number(values["p50"]), size=10, weight="600"))
+            body.append(
+                svg_text(x, label_y - 6, chart_number(values["p50"]), size=10, weight="600")
+            )
         body.append(svg_text(center, baseline + 18, group["label"], size=11))
 
 
@@ -341,9 +349,21 @@ def svg(document: dict[str, Any]) -> str:
         svg_text(WIDTH / 2, 56, subtitle(document), size=12, fill="#57606a"),
     ]
     system = document["system"]
-    power = "battery" if "Battery" in system.get("power_source", "") else system.get("power_source", "unknown power")
+    power = (
+        "battery"
+        if "Battery" in system.get("power_source", "")
+        else system.get("power_source", "unknown power")
+    )
     dirty = "dirty tree" if system.get("metal_infer_dirty") else "clean tree"
-    body.append(svg_text(WIDTH / 2, 100, f"{power} · {dirty} · commit {system.get('metal_infer_commit', 'unknown')[:8]}", size=11, fill="#57606a"))
+    body.append(
+        svg_text(
+            WIDTH / 2,
+            100,
+            f"{power} · {dirty} · commit {system.get('metal_infer_commit', 'unknown')[:8]}",
+            size=11,
+            fill="#57606a",
+        )
+    )
     legend_width = 190
     legend_left = WIDTH / 2 - legend_width * len(engines) / 2
     for index in range(len(engines)):
@@ -373,9 +393,25 @@ def svg(document: dict[str, Any]) -> str:
                 bars(body, panel, left, baseline, panel_width, CHART_HEIGHT)
             else:
                 lines_panel(body, panel, left, baseline, panel_width, CHART_HEIGHT)
-    failures = sum(level.get("failures", 0) for result in document["results"] for level in result.get("server") or [])
-    short_outputs = sum(len(level.get("short_outputs") or []) for result in document["results"] for level in result.get("server") or [])
-    body.append(svg_text(WIDTH / 2, height - 18, f"Server: {failures} failed requests · {short_outputs} short outputs · offline and server throughput are different measurements", size=11, fill="#57606a"))
+    failures = sum(
+        level.get("failures", 0)
+        for result in document["results"]
+        for level in result.get("server") or []
+    )
+    short_outputs = sum(
+        len(level.get("short_outputs") or [])
+        for result in document["results"]
+        for level in result.get("server") or []
+    )
+    body.append(
+        svg_text(
+            WIDTH / 2,
+            height - 18,
+            f"Server: {failures} failed requests · {short_outputs} short outputs · offline and server throughput are different measurements",
+            size=11,
+            fill="#57606a",
+        )
+    )
     return "\n".join(
         [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{height}" '

@@ -166,8 +166,9 @@ def validate(args: argparse.Namespace) -> None:
     if "llama.cpp" in args.engines and not args.gguf:
         raise BenchmarkError("llama.cpp needs --gguf, a local GGUF or supported Hugging Face repo")
     if args.gguf:
-        gguf, args.gguf_source = resolve_gguf(args.gguf)
-        args.gguf = str(gguf)
+        resolved = resolve_gguf(args.gguf)
+        args.gguf = str(resolved.path)
+        args.gguf_source = resolved.source
 
 
 def header(args: argparse.Namespace, directory: pathlib.Path, load: Workload) -> dict[str, Any]:

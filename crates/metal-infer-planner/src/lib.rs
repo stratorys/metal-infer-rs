@@ -19,44 +19,41 @@ pub struct Plan {
 
 #[derive(Debug, Error)]
 pub enum PlanError {
-    #[error("plan override `{0}` must have the form key=value")]
-    Syntax(String),
-    #[error("unknown plan key `{0}`; use `--with list` to show the available keys")]
-    UnknownKey(String),
-    #[error("invalid value `{value}` for plan key `{key}`: expected {expected}")]
-    InvalidValue {
-        key: String,
-        value: String,
-        expected: &'static str,
-    },
+    #[error("plan override must have the form key=value")]
+    Syntax,
+    #[error("unknown plan key, use `--with list` to show the available keys")]
+    UnknownKey,
+    #[error("plan switch must be on or off")]
+    InvalidSwitch,
+    #[error("attention must be reference, tiled, flash-prefill, decode-split-kv, or flash-decode")]
+    InvalidAttention,
+    #[error("gemv.config must be none, baseline, or tuned")]
+    InvalidGemvConfig,
+    #[error(
+        "flash_decode.blocks must be default, BLOCK, or LENGTH:BLOCK entries separated by commas"
+    )]
+    InvalidFlashDecodeBlocks,
 }
-
-const SWITCH: &str = "on or off";
-const ATTENTION: &str = "reference, tiled, flash-prefill, decode-split-kv, or flash-decode";
-const GEMV_CONFIG: &str = "none, baseline, or tuned";
-const BLOCKS: &str = "default, BLOCK, or LENGTH:BLOCK entries separated by commas";
 
 impl Plan {
     pub fn apply_override(
         &mut self,
         assignment: &str,
     ) -> Result<(), PlanError> {
-        let (key, value) = assignment
-            .split_once('=')
-            .ok_or_else(|| PlanError::Syntax(assignment.to_owned()))?;
+        let (key, value) = assignment.split_once('=').ok_or(PlanError::Syntax)?;
         let key = key.trim();
         let value = value.trim();
         let kernels = &mut self.kernels;
         match key {
-            "attention" => self.attention = parse_attention(key, value)?,
-            "fusion.qkv" => self.fusions.qkv = parse_switch(key, value)?,
-            "fusion.gate_up" => self.fusions.gate_up = parse_switch(key, value)?,
-            "fusion.add_rms_norm" => self.fusions.add_rms_norm = parse_switch(key, value)?,
-            "fusion.qk_rope_cache" => self.fusions.qk_rope_cache = parse_switch(key, value)?,
-            "fusion.decode_norm" => self.fusions.decode_norm = parse_switch(key, value)?,
-            "gemv.config" => kernels.decode_gemv = parse_gemv_config(key, value)?,
-            "flash_decode.blocks" => kernels.flash_decode_blocks = parse_blocks(key, value)?,
-            _ => return Err(PlanError::UnknownKey(key.to_owned())),
+            "attention" => self.attention = parse_attention(value)?,
+            "fusion.qkv" => self.fusions.qkv = parse_switch(value)?,
+            "fusion.gate_up" => self.fusions.gate_up = parse_switch(value)?,
+            "fusion.add_rms_norm" => self.fusions.add_rms_norm = parse_switch(value)?,
+            "fusion.qk_rope_cache" => self.fusions.qk_rope_cache = parse_switch(value)?,
+            "fusion.decode_norm" => self.fusions.decode_norm = parse_switch(value)?,
+            "gemv.config" => kernels.decode_gemv = parse_gemv_config(value)?,
+            "flash_decode.blocks" => kernels.flash_decode_blocks = parse_blocks(value)?,
+            _ => return Err(PlanError::UnknownKey),
         }
         Ok(())
     }
@@ -91,26 +88,11 @@ impl Plan {
     }
 }
 
-fn invalid(
-    key: &str,
-    value: &str,
-    expected: &'static str,
-) -> PlanError {
-    PlanError::InvalidValue {
-        key: key.to_owned(),
-        value: value.to_owned(),
-        expected,
-    }
-}
-
-fn parse_switch(
-    key: &str,
-    value: &str,
-) -> Result<bool, PlanError> {
+fn parse_switch(value: &str) -> Result<bool, PlanError> {
     match value {
         "on" | "true" => Ok(true),
         "off" | "false" => Ok(false),
-        _ => Err(invalid(key, value, SWITCH)),
+        _ => Err(PlanError::InvalidSwitch),
     }
 }
 
@@ -118,17 +100,14 @@ fn switch_name(enabled: bool) -> String {
     String::from(if enabled { "on" } else { "off" })
 }
 
-fn parse_attention(
-    key: &str,
-    value: &str,
-) -> Result<AttentionKind, PlanError> {
+fn parse_attention(value: &str) -> Result<AttentionKind, PlanError> {
     match value {
         "reference" => Ok(AttentionKind::Reference),
         "tiled" => Ok(AttentionKind::Tiled),
         "flash-prefill" => Ok(AttentionKind::FlashPrefill),
         "decode-split-kv" => Ok(AttentionKind::DecodeSplitKv),
         "flash-decode" => Ok(AttentionKind::FlashDecode),
-        _ => Err(invalid(key, value, ATTENTION)),
+        _ => Err(PlanError::InvalidAttention),
     }
 }
 
@@ -142,22 +121,16 @@ const fn attention_name(kind: AttentionKind) -> &'static str {
     }
 }
 
-fn parse_gemv_config(
-    key: &str,
-    value: &str,
-) -> Result<Option<DecodeGemvConfig>, PlanError> {
+fn parse_gemv_config(value: &str) -> Result<Option<DecodeGemvConfig>, PlanError> {
     match value {
         "none" => Ok(None),
         "baseline" => Ok(Some(DecodeGemvConfig::Baseline)),
         "tuned" => Ok(Some(DecodeGemvConfig::Tuned)),
-        _ => Err(invalid(key, value, GEMV_CONFIG)),
+        _ => Err(PlanError::InvalidGemvConfig),
     }
 }
 
-fn parse_blocks(
-    key: &str,
-    value: &str,
-) -> Result<Vec<FlashDecodeBlock>, PlanError> {
+fn parse_blocks(value: &str) -> Result<Vec<FlashDecodeBlock>, PlanError> {
     if value == "default" {
         return Ok(Vec::new());
     }
@@ -169,7 +142,7 @@ fn parse_blocks(
                     length
                         .trim()
                         .parse()
-                        .map_err(|_| invalid(key, value, BLOCKS))?,
+                        .map_err(|_| PlanError::InvalidFlashDecodeBlocks)?,
                     block,
                 ),
                 None => (usize::MAX, entry),
@@ -179,7 +152,7 @@ fn parse_blocks(
                 block: block
                     .trim()
                     .parse()
-                    .map_err(|_| invalid(key, value, BLOCKS))?,
+                    .map_err(|_| PlanError::InvalidFlashDecodeBlocks)?,
             })
         })
         .collect()
@@ -250,23 +223,20 @@ mod tests {
     fn invalid_overrides_are_rejected() {
         let mut target = plan();
         assert!(
-            matches!(
-                target.apply_override("fusion.qkv"),
-                Err(PlanError::Syntax(_))
-            ),
+            matches!(target.apply_override("fusion.qkv"), Err(PlanError::Syntax)),
             "a missing value must be rejected"
         );
         assert!(
             matches!(
                 target.apply_override("fusion.unknown=on"),
-                Err(PlanError::UnknownKey(_))
+                Err(PlanError::UnknownKey)
             ),
             "an unknown key must be rejected"
         );
         assert!(
             matches!(
                 target.apply_override("fusion.qkv=maybe"),
-                Err(PlanError::InvalidValue { .. })
+                Err(PlanError::InvalidSwitch)
             ),
             "an invalid value must be rejected"
         );

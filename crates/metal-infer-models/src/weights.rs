@@ -34,10 +34,7 @@ impl WeightMap {
                 } else if view.dtype() == Dtype::BF16 {
                     context.tensor_bf16_as_f16_bytes(view.data(), view.shape())?
                 } else {
-                    return Err(ModelError::Unsupported(format!(
-                        "tensor `{name}` uses {:?}; only F16 and BF16 are supported",
-                        view.dtype()
-                    )));
+                    return Err(ModelError::UnsupportedTensorDType);
                 };
                 tensors.insert(name.to_owned(), tensor);
             }
@@ -49,9 +46,7 @@ impl WeightMap {
         &mut self,
         name: &str,
     ) -> Result<Tensor, ModelError> {
-        self.tensors
-            .remove(name)
-            .ok_or_else(|| ModelError::MissingTensor(name.to_owned()))
+        self.tensors.remove(name).ok_or(ModelError::MissingTensor)
     }
 }
 
@@ -68,8 +63,5 @@ fn tensor_files(directory: &Path) -> Result<Vec<PathBuf>, ModelError> {
     if single.exists() {
         return Ok(vec![single]);
     }
-    Err(ModelError::Unsupported(format!(
-        "{} contains neither model.safetensors nor its index",
-        directory.display()
-    )))
+    Err(ModelError::MissingWeights)
 }

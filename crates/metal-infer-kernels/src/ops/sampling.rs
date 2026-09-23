@@ -11,14 +11,12 @@ impl KernelBatch<'_> {
     ) -> Result<(), CoreError> {
         require_f16(logits)?;
         if logits.shape().len() != 1 || logits.is_empty() {
-            return Err(CoreError::Shape(
-                "argmax logits must be a nonempty vector".into(),
-            ));
+            return Err(CoreError::ArgmaxLogitsShape);
         }
         if output.dtype() != DType::U32 || output.shape() != [1] {
-            return Err(CoreError::Shape("argmax output must be one u32".into()));
+            return Err(CoreError::ArgmaxOutputShape);
         }
-        let count = to_u32(logits.len(), "argmax logits count")?;
+        let count = to_u32(logits.len())?;
         let groups = count.div_ceil(2048);
         let partial_values = self.empty(&[groups as usize], DType::F32)?;
         let partial_indices = self.empty(&[groups as usize], DType::U32)?;

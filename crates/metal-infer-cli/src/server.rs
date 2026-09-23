@@ -121,21 +121,38 @@ struct Command {
 
 enum Reply {
     Stream(async_mpsc::Sender<Result<Bytes, std::convert::Infallible>>),
-    Once(oneshot::Sender<Result<Value, ServerError>>),
+    Once(oneshot::Sender<Result<Value, ClientError>>),
+}
+
+struct ClientError {
+    status: StatusCode,
+    message: String,
+}
+
+impl From<&ServerError> for ClientError {
+    fn from(error: &ServerError) -> Self {
+        let status = error_status(error);
+        let message = if status.is_server_error() {
+            "internal server error".to_owned()
+        } else {
+            error.to_string()
+        };
+        Self { status, message }
+    }
 }
 
 impl Reply {
     fn error(
         self,
-        error: ServerError,
+        error: &ServerError,
     ) {
+        let client = ClientError::from(error);
         match self {
             Self::Stream(sender) => {
-                let value = error_body(error_status(&error), error.message());
-                let _ = send_event(&sender, &value);
+                let _ = send_event(&sender, &error_body(client.status, &client.message));
             }
             Self::Once(sender) => {
-                let _ = sender.send(Err(error));
+                let _ = sender.send(Err(client));
             }
         }
     }
@@ -170,13 +187,13 @@ struct ActiveCompletion {
 
 pub fn serve(options: ServerOptions) -> Result<(), CliError> {
     if options.max_active_requests == 0 {
-        return Err(ServerError::InvalidOptions.into());
+        return Err(CliError::NoActiveRequests);
     }
     let bind = options.bind.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|source| ServerError::Runtime { source })?;
+        .map_err(ServerError::Runtime)?;
     runtime.block_on(async move {
         let (commands, receiver) = async_mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (ready_sender, ready_receiver) = oneshot::channel();
@@ -185,16 +202,12 @@ pub fn serve(options: ServerOptions) -> Result<(), CliError> {
         let model_id = match ready_receiver.await {
             Ok(Ok(model_id)) => model_id,
             Ok(Err(error)) => {
-                worker
-                    .await
-                    .map_err(|source| ServerError::WorkerJoin { source })?;
+                worker.await.map_err(ServerError::WorkerJoin)?;
                 return Err(error.into());
             }
             Err(source) => {
-                worker
-                    .await
-                    .map_err(|source| ServerError::WorkerJoin { source })?;
-                return Err(ServerError::WorkerStoppedSource { source }.into());
+                worker.await.map_err(ServerError::WorkerJoin)?;
+                return Err(ServerError::WorkerStopped(source).into());
             }
         };
         let state = HttpState { model_id, commands };
@@ -206,13 +219,11 @@ pub fn serve(options: ServerOptions) -> Result<(), CliError> {
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(&bind)
             .await
-            .map_err(|source| ServerError::Bind { source })?;
+            .map_err(ServerError::Bind)?;
         tracing::info!(%bind, "OpenAI-compatible server listening");
         let result = axum::serve(listener, router).await;
-        worker
-            .await
-            .map_err(|source| ServerError::WorkerJoin { source })?;
-        result.map_err(|source| ServerError::Http { source }.into())
+        worker.await.map_err(ServerError::WorkerJoin)?;
+        result.map_err(|error| ServerError::Http(error).into())
     })
 }
 
@@ -273,9 +284,9 @@ async fn completion_inner(
         }
         match receiver.await {
             Ok(Ok(value)) => Json(value).into_response(),
-            Ok(Err(error)) => error_response(error_status(&error), error.message()),
+            Ok(Err(error)) => error_response(error.status, &error.message),
             Err(error) => {
-                tracing::error!(message = "Inference worker stopped before replying.", error = %error);
+                tracing::error!(message = "Inference worker stopped before replying.", %error);
                 error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "inference worker stopped",
@@ -306,24 +317,22 @@ fn error_body(
 
 const fn error_status(error: &ServerError) -> StatusCode {
     match error {
-        ServerError::InvalidRequest
-        | ServerError::InvalidRequestSource { .. }
-        | ServerError::InvalidJson { .. }
-        | ServerError::InvalidOptions
-        | ServerError::InvalidOptionsSource { .. }
+        ServerError::InvalidJson(_)
+        | ServerError::InvalidRequest(_)
+        | ServerError::InvalidOptions(_)
         | ServerError::Disconnected
         | ServerError::SlowClient => StatusCode::BAD_REQUEST,
-        ServerError::Runtime { .. }
-        | ServerError::Bind { .. }
-        | ServerError::Http { .. }
-        | ServerError::WorkerStopped
-        | ServerError::WorkerStoppedSource { .. }
-        | ServerError::WorkerJoin { .. }
-        | ServerError::ModelInitialization
-        | ServerError::ModelInitializationSource { .. }
-        | ServerError::CacheAllocation { .. }
-        | ServerError::Inference
-        | ServerError::InferenceSource { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        ServerError::Runtime(_)
+        | ServerError::Bind(_)
+        | ServerError::Http(_)
+        | ServerError::WorkerStopped(_)
+        | ServerError::WorkerJoin(_)
+        | ServerError::ModelInitialization(_)
+        | ServerError::PlanListed
+        | ServerError::StreamModeMismatch
+        | ServerError::CacheAllocation(_)
+        | ServerError::Inference(_)
+        | ServerError::MissingDecodeInput => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -343,45 +352,6 @@ fn admission_error_response(error: async_mpsc::error::TrySendError<Command>) -> 
     }
 }
 
-fn log_server_error(
-    operation: &'static str,
-    error: &ServerError,
-) {
-    match error {
-        ServerError::Runtime { source }
-        | ServerError::Bind { source }
-        | ServerError::Http { source } => {
-            tracing::error!(message = "Server operation failed.", operation, error = %source);
-        }
-        ServerError::ModelInitializationSource { source }
-        | ServerError::InvalidRequestSource { source }
-        | ServerError::InferenceSource { source } => {
-            tracing::error!(message = "Server operation failed.", operation, error = %source);
-        }
-        ServerError::InvalidOptionsSource { source } | ServerError::CacheAllocation { source } => {
-            tracing::error!(message = "Server operation failed.", operation, error = %source);
-        }
-        ServerError::WorkerStoppedSource { source } => {
-            tracing::error!(message = "Server operation failed.", operation, error = %source);
-        }
-        ServerError::WorkerJoin { source } => {
-            tracing::error!(message = "Server operation failed.", operation, error = %source);
-        }
-        ServerError::InvalidJson { source } => {
-            tracing::error!(message = "Server operation failed.", operation, error = %source);
-        }
-        ServerError::WorkerStopped
-        | ServerError::ModelInitialization
-        | ServerError::InvalidRequest
-        | ServerError::InvalidOptions
-        | ServerError::Inference
-        | ServerError::Disconnected
-        | ServerError::SlowClient => {
-            tracing::error!(message = "Server operation failed.", operation, error = %error);
-        }
-    }
-}
-
 fn run_inference(
     options: ServerOptions,
     mut incoming: async_mpsc::Receiver<Command>,
@@ -389,27 +359,17 @@ fn run_inference(
 ) {
     let initialized = (|| -> Result<ServerState, ServerError> {
         let requested_model_id = hugging_face_model_id(&options.model);
-        let model_path = resolve_model_path(&options.model).map_err(|source| {
-            ServerError::ModelInitializationSource {
-                source: Box::new(source),
-            }
-        })?;
-        let context =
-            MetalContext::new().map_err(|source| ServerError::ModelInitializationSource {
-                source: Box::new(source.into()),
-            })?;
+        let model_path = resolve_model_path(&options.model)
+            .map_err(|source| ServerError::ModelInitialization(Box::new(source)))?;
+        let context = MetalContext::new()
+            .map_err(|source| ServerError::ModelInitialization(Box::new(source.into())))?;
         tracing::info!(message = "Metal device ready.", device = %context.device_name());
         tracing::info!(message = "Loading model.", path = %model_path.display());
-        let tokenizer = ModelTokenizer::from_directory(&model_path).map_err(|source| {
-            ServerError::ModelInitializationSource {
-                source: Box::new(source.into()),
-            }
-        })?;
+        let tokenizer = ModelTokenizer::from_directory(&model_path)
+            .map_err(|source| ServerError::ModelInitialization(Box::new(source.into())))?;
         let model = load_model(&model_path, &context, &options.with)
-            .map_err(|source| ServerError::ModelInitializationSource {
-                source: Box::new(source),
-            })?
-            .ok_or(ServerError::ModelInitialization)?;
+            .map_err(|source| ServerError::ModelInitialization(Box::new(source)))?
+            .ok_or(ServerError::PlanListed)?;
         let model_id = options
             .model_id
             .or(requested_model_id)
@@ -424,7 +384,6 @@ fn run_inference(
     let state = match initialized {
         Ok(state) => state,
         Err(error) => {
-            log_server_error("startup", &error);
             let _ = ready.send(Err(error));
             return;
         }
@@ -455,7 +414,7 @@ fn run_inference(
             let mut completion = match prepare_command(command, &state) {
                 Ok(completion) => completion,
                 Err(error) => {
-                    log_server_error("request preparation", &error);
+                    tracing::error!(message = "Server operation failed.", operation = "request preparation", %error);
                     continue;
                 }
             };
@@ -465,11 +424,9 @@ fn run_inference(
             let span = completion.span.clone();
             let _guard = span.enter();
             if let Err(source) = completion.start(&state) {
-                let error = ServerError::InferenceSource {
-                    source: Box::new(source),
-                };
-                log_server_error("prefill", &error);
-                completion.fail(ServerError::Inference);
+                let error = ServerError::Inference(Box::new(source));
+                tracing::error!(message = "Server operation failed.", operation = "prefill", %error);
+                completion.fail(&error);
             }
             if !completion.done {
                 active.push(completion);
@@ -486,10 +443,10 @@ fn run_inference(
             .map(|completion| completion.generated.last().copied())
             .collect();
         let Some(inputs) = inputs else {
-            let error = ServerError::Inference;
-            log_server_error("decode input", &error);
+            let error = ServerError::MissingDecodeInput;
+            tracing::error!(message = "Server operation failed.", operation = "decode input", %error);
             for completion in &mut active {
-                completion.fail(ServerError::Inference);
+                completion.fail(&error);
             }
             active.clear();
             continue;
@@ -512,12 +469,10 @@ fn run_inference(
         let logits = match logits {
             Ok(logits) => logits,
             Err(source) => {
-                let error = ServerError::InferenceSource {
-                    source: Box::new(source.into()),
-                };
-                log_server_error("decode", &error);
+                let error = ServerError::Inference(Box::new(source.into()));
+                tracing::error!(message = "Server operation failed.", operation = "decode", %error);
                 for completion in &mut active {
-                    completion.fail(ServerError::Inference);
+                    completion.fail(&error);
                 }
                 active.clear();
                 continue;
@@ -529,15 +484,12 @@ fn run_inference(
             .map(|(row, completion)| {
                 logits
                     .row(row)
-                    .map_err(|source| ServerError::InferenceSource {
-                        source: Box::new(source.into()),
-                    })
+                    .map_err(|source| ServerError::Inference(Box::new(source.into())))
                     .and_then(|row| {
-                        completion.sampler.sample(&row).map_err(|source| {
-                            ServerError::InferenceSource {
-                                source: Box::new(source.into()),
-                            }
-                        })
+                        completion
+                            .sampler
+                            .sample(&row)
+                            .map_err(|source| ServerError::Inference(Box::new(source.into())))
                     })
             })
             .collect::<Vec<_>>();
@@ -547,16 +499,14 @@ fn run_inference(
             match result {
                 Ok(token) => {
                     if let Err(source) = completion.accept_token(token, &state) {
-                        let error = ServerError::InferenceSource {
-                            source: Box::new(source),
-                        };
-                        log_server_error("completion", &error);
-                        completion.fail(ServerError::Inference);
+                        let error = ServerError::Inference(Box::new(source));
+                        tracing::error!(message = "Server operation failed.", operation = "completion", %error);
+                        completion.fail(&error);
                     }
                 }
                 Err(error) => {
-                    log_server_error("sampling", &error);
-                    completion.fail(ServerError::Inference);
+                    tracing::error!(message = "Server operation failed.", operation = "sampling", %error);
+                    completion.fail(&error);
                 }
             }
         }
@@ -577,26 +527,17 @@ fn prepare_command(
     } = command;
     let parsed: ChatCompletionRequest = match serde_json::from_value(body) {
         Ok(value) => value,
-        Err(source) => {
-            reply.error(ServerError::InvalidRequest);
-            return Err(ServerError::InvalidJson { source });
-        }
+        Err(source) => return Err(reject(reply, ServerError::InvalidJson(source))),
     };
     let prepared = match prepare_completion(state, parsed) {
         Ok(value) => value,
         Err(source) => {
-            reply.error(ServerError::InvalidRequest);
-            return Err(ServerError::InvalidRequestSource {
-                source: Box::new(source),
-            });
+            return Err(reject(reply, ServerError::InvalidRequest(Box::new(source))));
         }
     };
     let sampler = match TokenSampler::new(prepared.options.clone()) {
         Ok(value) => value,
-        Err(source) => {
-            reply.error(ServerError::InvalidOptions);
-            return Err(ServerError::InvalidOptionsSource { source });
-        }
+        Err(source) => return Err(reject(reply, ServerError::InvalidOptions(source))),
     };
     let capacity = prepared
         .prompt
@@ -605,14 +546,10 @@ fn prepare_command(
         .max(1);
     let cache = match KvCache::new(state.model.context(), state.model.config(), capacity) {
         Ok(value) => value,
-        Err(source) => {
-            reply.error(ServerError::Inference);
-            return Err(ServerError::CacheAllocation { source });
-        }
+        Err(source) => return Err(reject(reply, ServerError::CacheAllocation(source))),
     };
     if prepared.stream != matches!(reply, Reply::Stream(_)) {
-        reply.error(ServerError::InvalidRequest);
-        return Err(ServerError::InvalidRequest);
+        return Err(reject(reply, ServerError::StreamModeMismatch));
     }
     Ok(ActiveCompletion {
         span,
@@ -779,13 +716,21 @@ impl ActiveCompletion {
 
     fn fail(
         &mut self,
-        error: ServerError,
+        error: &ServerError,
     ) {
         if let Some(reply) = self.reply.take() {
             reply.error(error);
         }
         self.done = true;
     }
+}
+
+fn reject(
+    reply: Reply,
+    error: ServerError,
+) -> ServerError {
+    reply.error(&error);
+    error
 }
 
 fn send_event(
@@ -828,9 +773,7 @@ fn prepare_completion(
     if let Some(model) = &request.model
         && model != &state.model_id
     {
-        return Err(CliError::InvalidArguments(format!(
-            "requested model `{model}` is not loaded"
-        )));
+        return Err(CliError::ModelNotLoaded);
     }
     let messages = request
         .messages
@@ -840,10 +783,7 @@ fn prepare_completion(
     let prompt = state.tokenizer.encode_chat(&messages)?;
     let required = prompt.len().saturating_add(max_tokens);
     if required > state.context {
-        return Err(CliError::InvalidArguments(format!(
-            "prompt + generated tokens ({required}) exceeds context {}",
-            state.context
-        )));
+        return Err(CliError::ContextExceeded);
     }
     let stop_sequences = request.stop.map_or_else(Vec::new, StopSequences::into_vec);
     let options = GenerationOptions {
@@ -874,10 +814,7 @@ impl WireMessage {
                 let mut output = String::new();
                 for part in parts {
                     if part.kind != "text" {
-                        return Err(CliError::InvalidArguments(format!(
-                            "message content type `{}` is not supported yet",
-                            part.kind
-                        )));
+                        return Err(CliError::UnsupportedContentPart);
                     }
                     if let Some(text) = part.text {
                         output.push_str(&text);

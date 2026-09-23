@@ -49,9 +49,7 @@ impl KernelBatchProfile {
     ) -> Result<usize, CoreError> {
         let index = self.kernels.len() * 2;
         if index + 2 > PROFILE_SAMPLE_CAPACITY {
-            return Err(CoreError::Profiling(
-                "too many dispatches in one command batch for the timestamp buffer".into(),
-            ));
+            return Err(CoreError::TooManyProfiledDispatches);
         }
         self.kernels.push(kernel.to_owned());
         Ok(index)
@@ -72,13 +70,11 @@ impl KernelBatchProfile {
                 length: count,
             })
         }
-        .ok_or_else(|| CoreError::Profiling("could not resolve GPU timestamps".into()))?;
+        .ok_or_else(|| CoreError::TimestampResolution)?;
         // SAFETY: the resolved NSData is immutable and remains alive for this slice.
         let bytes = unsafe { resolved.as_bytes_unchecked() };
         if bytes.len() != count * size_of::<u64>() {
-            return Err(CoreError::Profiling(
-                "GPU timestamp buffer has an unexpected size".into(),
-            ));
+            return Err(CoreError::TimestampBufferSize);
         }
         self.kernels
             .into_iter()
@@ -89,15 +85,13 @@ impl KernelBatchProfile {
                     let timestamp = bytes
                         .get(offset..offset + size_of::<u64>())
                         .and_then(|slice| slice.try_into().ok())
-                        .ok_or_else(|| CoreError::Profiling("missing GPU timestamp".into()))?;
+                        .ok_or_else(|| CoreError::MissingTimestamp)?;
                     Ok(u64::from_ne_bytes(timestamp))
                 };
                 let start = read(index * 2)?;
                 let end = read(index * 2 + 1)?;
                 if start == 0 || end == 0 || start == u64::MAX || end == u64::MAX || end < start {
-                    return Err(CoreError::Profiling(format!(
-                        "invalid GPU timestamps for kernel {kernel}"
-                    )));
+                    return Err(CoreError::InvalidTimestamps);
                 }
                 Ok(KernelDispatchProfile {
                     kernel,
@@ -162,7 +156,7 @@ impl MetalContext {
         let device = MTLCreateSystemDefaultDevice().ok_or(CoreError::NoDevice)?;
         let queue = device
             .newCommandQueue()
-            .ok_or(CoreError::Resource("command queue"))?;
+            .ok_or(CoreError::CommandQueueCreation)?;
         let device_name = device.name().to_string();
         Ok(Self {
             device,
@@ -200,23 +194,19 @@ impl MetalContext {
             .device
             .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
         {
-            return Err(CoreError::Profiling(
-                "GPU does not support counters at compute pass boundaries".into(),
-            ));
+            return Err(CoreError::StageBoundaryCountersUnsupported);
         }
         let sets = self
             .device
             .counterSets()
-            .ok_or_else(|| CoreError::Profiling("GPU exposes no counter sets".into()))?;
+            .ok_or_else(|| CoreError::NoCounterSets)?;
         let has_timestamps = (0..sets.count()).any(|index| {
             let set = sets.objectAtIndex(index);
             set.name()
                 .isEqualToString(unsafe { MTLCommonCounterSetTimestamp })
         });
         if !has_timestamps {
-            return Err(CoreError::Profiling(
-                "GPU exposes no timestamp counter set".into(),
-            ));
+            return Err(CoreError::NoTimestampCounterSet);
         }
         let mut cpu_start = 0;
         let mut gpu_start = 0;
@@ -238,9 +228,7 @@ impl MetalContext {
             )
         };
         if cpu_end <= cpu_start || gpu_end <= gpu_start {
-            return Err(CoreError::Profiling(
-                "could not calibrate GPU timestamps".into(),
-            ));
+            return Err(CoreError::TimestampCalibration);
         }
         // Metal's CPU timestamps are already nanoseconds; GPU timestamps use
         // the device clock and need the ratio of the two sampled spans.
@@ -262,14 +250,14 @@ impl MetalContext {
         let sets = self
             .device
             .counterSets()
-            .ok_or_else(|| CoreError::Profiling("GPU exposes no counter sets".into()))?;
+            .ok_or_else(|| CoreError::NoCounterSets)?;
         let counter_set = (0..sets.count())
             .map(|index| sets.objectAtIndex(index))
             .find(|set| {
                 set.name()
                     .isEqualToString(unsafe { MTLCommonCounterSetTimestamp })
             })
-            .ok_or_else(|| CoreError::Profiling("GPU exposes no timestamp counter set".into()))?;
+            .ok_or_else(|| CoreError::NoTimestampCounterSet)?;
         let descriptor = MTLCounterSampleBufferDescriptor::new();
         descriptor.setCounterSet(Some(&counter_set));
         descriptor.setStorageMode(MTLStorageMode::Shared);
@@ -278,9 +266,7 @@ impl MetalContext {
         let buffer = self
             .device
             .newCounterSampleBufferWithDescriptor_error(&descriptor)
-            .map_err(|error| {
-                CoreError::Profiling(format!("could not create timestamp buffer: {error}"))
-            })?;
+            .map_err(CoreError::TimestampBufferCreation)?;
         Ok(Some(KernelBatchProfile {
             buffer,
             kernels: Vec::new(),
@@ -296,7 +282,7 @@ impl MetalContext {
             Some(
                 command_buffer
                     .computeCommandEncoder()
-                    .ok_or(CoreError::Resource("compute encoder"))?,
+                    .ok_or(CoreError::ComputeEncoderCreation)?,
             )
         };
         let scratch = {
@@ -332,11 +318,11 @@ impl MetalContext {
         let elements = checked_elements(shape)?;
         let byte_len = elements
             .checked_mul(dtype.size())
-            .ok_or_else(|| CoreError::Shape("tensor byte length overflow".into()))?;
+            .ok_or_else(|| CoreError::ByteLengthOverflow)?;
         let buffer = self
             .device
             .newBufferWithLength_options(byte_len.max(1), MTLResourceOptions::StorageModeShared)
-            .ok_or(CoreError::Resource("buffer"))?;
+            .ok_or(CoreError::BufferCreation)?;
         Ok(Tensor::new(buffer, shape.to_vec(), dtype))
     }
 
@@ -386,10 +372,7 @@ impl MetalContext {
     ) -> Result<Tensor, CoreError> {
         let tensor = self.empty(shape, DType::F16)?;
         if tensor.byte_len() != bytes.len() {
-            return Err(CoreError::DataLength {
-                expected: tensor.byte_len(),
-                actual: bytes.len(),
-            });
+            return Err(CoreError::DataLengthMismatch);
         }
         // SAFETY: both regions are valid for bytes.len() bytes and do not
         // overlap.
@@ -413,17 +396,11 @@ impl MetalContext {
     ) -> Result<Tensor, CoreError> {
         let tensor = self.empty(shape, DType::F16)?;
         if tensor.byte_len() != bytes.len() {
-            return Err(CoreError::DataLength {
-                expected: tensor.byte_len(),
-                actual: bytes.len(),
-            });
+            return Err(CoreError::DataLengthMismatch);
         }
         let (values, remainder) = bytes.as_chunks::<2>();
         if !remainder.is_empty() {
-            return Err(CoreError::DataLength {
-                expected: tensor.byte_len(),
-                actual: bytes.len(),
-            });
+            return Err(CoreError::DataLengthMismatch);
         }
         let destination = tensor.buffer.contents().as_ptr().cast::<u16>();
         for (index, [low, high]) in values.iter().enumerate() {
@@ -463,7 +440,7 @@ impl MetalContext {
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, CoreError> {
         self.queue
             .commandBuffer()
-            .ok_or(CoreError::Resource("command buffer"))
+            .ok_or(CoreError::CommandBufferCreation)
     }
 
     unsafe fn bytes<T>(value: &T) -> (NonNull<c_void>, usize) {
@@ -523,7 +500,7 @@ impl<'context> CommandBatch<'context> {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
         } else if self.profile.is_none() {
-            return Err(CoreError::Resource("finished compute encoder"));
+            return Err(CoreError::EncoderFinished);
         }
         Ok(())
     }
@@ -535,7 +512,7 @@ impl<'context> CommandBatch<'context> {
         let profile = self
             .profile
             .as_ref()
-            .ok_or_else(|| CoreError::Profiling("batch has no timestamp buffer".into()))?;
+            .ok_or_else(|| CoreError::MissingTimestampBuffer)?;
         let descriptor = MTLComputePassDescriptor::computePassDescriptor();
         // SAFETY: Metal compute pass descriptors always have attachment slot 0.
         let attachment = unsafe {
@@ -551,7 +528,7 @@ impl<'context> CommandBatch<'context> {
         };
         self.command_buffer
             .computeCommandEncoderWithDescriptor(&descriptor)
-            .ok_or(CoreError::Resource("profiled compute encoder"))
+            .ok_or(CoreError::ProfiledEncoderCreation)
     }
 
     pub fn empty(
@@ -562,7 +539,7 @@ impl<'context> CommandBatch<'context> {
         let elements = checked_elements(shape)?;
         let byte_len = elements
             .checked_mul(dtype.size())
-            .ok_or_else(|| CoreError::Shape("tensor byte length overflow".into()))?;
+            .ok_or_else(|| CoreError::ByteLengthOverflow)?;
         let allocation_len = align_up(byte_len.max(1), SCRATCH_ALIGNMENT)?;
         let mut state = self.scratch.borrow_mut();
         let mut selected = None;
@@ -589,7 +566,7 @@ impl<'context> CommandBatch<'context> {
                 .context
                 .device
                 .newBufferWithLength_options(chunk_len, MTLResourceOptions::StorageModeShared)
-                .ok_or(CoreError::Resource("scratch buffer"))?;
+                .ok_or(CoreError::ScratchBufferCreation)?;
             let chunk_index = state.chunks.len();
             let mut free = Vec::new();
             if allocation_len < chunk_len {
@@ -619,9 +596,7 @@ impl<'context> CommandBatch<'context> {
     pub(crate) fn encoder(
         &self
     ) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>, CoreError> {
-        self.encoder
-            .as_deref()
-            .ok_or(CoreError::Resource("finished compute encoder"))
+        self.encoder.as_deref().ok_or(CoreError::EncoderFinished)
     }
 
     pub fn commit(mut self) -> Result<PendingBatch<'context>, CoreError> {
@@ -654,17 +629,16 @@ impl PendingBatch<'_> {
             return Err(self
                 .command_buffer
                 .error()
-                .map_or(CoreError::UnknownCommand, CoreError::Command));
+                .map_or(CoreError::CommandWithoutError, CoreError::Command));
         }
         let gpu_seconds =
             (self.command_buffer.GPUEndTime() - self.command_buffer.GPUStartTime()).max(0.0);
         if let Some(profile) = self.profile.take() {
-            let nanoseconds_per_tick =
-                self.context.profile_tick_nanoseconds.get().ok_or_else(|| {
-                    CoreError::Profiling(
-                        "GPU profiling was disabled before batch completion".into(),
-                    )
-                })?;
+            let nanoseconds_per_tick = self
+                .context
+                .profile_tick_nanoseconds
+                .get()
+                .ok_or_else(|| CoreError::ProfilingDisabled)?;
             self.context
                 .kernel_profiles
                 .borrow_mut()
@@ -724,14 +698,12 @@ impl Drop for CommandBatch<'_> {
 
 fn checked_elements(shape: &[usize]) -> Result<usize, CoreError> {
     if shape.is_empty() || shape.contains(&0) {
-        return Err(CoreError::Shape(
-            "rank and dimensions must be non-zero".into(),
-        ));
+        return Err(CoreError::EmptyShape);
     }
     shape.iter().try_fold(1usize, |length, dimension| {
         length
             .checked_mul(*dimension)
-            .ok_or_else(|| CoreError::Shape("element count overflow".into()))
+            .ok_or_else(|| CoreError::ElementCountOverflow)
     })
 }
 
@@ -742,7 +714,7 @@ fn align_up(
     value
         .checked_add(alignment - 1)
         .map(|rounded| rounded / alignment * alignment)
-        .ok_or_else(|| CoreError::Shape("scratch allocation size overflow".into()))
+        .ok_or_else(|| CoreError::ScratchSizeOverflow)
 }
 
 fn check_data_len(
@@ -752,6 +724,6 @@ fn check_data_len(
     if expected == actual {
         Ok(())
     } else {
-        Err(CoreError::DataLength { expected, actual })
+        Err(CoreError::DataLengthMismatch)
     }
 }

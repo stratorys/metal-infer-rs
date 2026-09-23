@@ -23,7 +23,7 @@ impl Library {
         let library = context
             .device
             .newLibraryWithSource_options_error(&source, None)
-            .map_err(CoreError::Shader)?;
+            .map_err(CoreError::ShaderCompilation)?;
         Ok(Self {
             device: context.device.clone(),
             library,
@@ -42,11 +42,11 @@ impl Library {
         let function: Retained<ProtocolObject<dyn MTLFunction>> = self
             .library
             .newFunctionWithName(&function_name)
-            .ok_or_else(|| CoreError::MissingKernel(name.to_owned()))?;
+            .ok_or(CoreError::MissingKernel)?;
         let pipeline = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
-            .map_err(CoreError::Pipeline)?;
+            .map_err(CoreError::PipelineCreation)?;
         self.pipelines
             .borrow_mut()
             .insert(name.to_owned(), pipeline.clone());

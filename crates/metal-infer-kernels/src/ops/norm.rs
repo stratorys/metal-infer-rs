@@ -12,20 +12,15 @@ impl KernelBatch<'_> {
     ) -> Result<Tensor, CoreError> {
         require_f16(input)?;
         require_f16(weight)?;
-        let width = *input
-            .shape()
-            .last()
-            .ok_or_else(|| CoreError::Shape("rms_norm requires rank >= 1".into()))?;
+        let width = *input.shape().last().ok_or_else(|| CoreError::RmsNormRank)?;
         if weight.shape() != [width] {
-            return Err(CoreError::Shape(format!(
-                "rms_norm weight must have shape [{width}]"
-            )));
+            return Err(CoreError::RmsNormWeight);
         }
         let rows = input.len() / width;
         let out = self.empty(input.shape(), DType::F16)?;
         let params = NormParams {
-            rows: to_u32(rows, "rows")?,
-            width: to_u32(width, "width")?,
+            rows: to_u32(rows)?,
+            width: to_u32(width)?,
             epsilon,
             padding: 0,
         };
@@ -33,7 +28,7 @@ impl KernelBatch<'_> {
             "rms_norm_f16",
             &[input, weight, &out],
             &params,
-            size(checked_mul(rows.div_ceil(8), 256, "RMSNorm grid")?, 1, 1),
+            size(checked_mul(rows.div_ceil(8), 256)?, 1, 1),
             size(256, 1, 1),
         )?;
         Ok(out)
@@ -53,18 +48,16 @@ impl KernelBatch<'_> {
         let width = *left
             .shape()
             .last()
-            .ok_or_else(|| CoreError::Shape("add_rms_norm requires rank >= 1".into()))?;
+            .ok_or_else(|| CoreError::AddRmsNormRank)?;
         if weight.shape() != [width] {
-            return Err(CoreError::Shape(format!(
-                "RMSNorm weight must have shape [{width}]"
-            )));
+            return Err(CoreError::AddRmsNormWeight);
         }
         let rows = left.len() / width;
         let residual = self.empty(left.shape(), DType::F16)?;
         let normalized = self.empty(left.shape(), DType::F16)?;
         let params = NormParams {
-            rows: to_u32(rows, "rows")?,
-            width: to_u32(width, "width")?,
+            rows: to_u32(rows)?,
+            width: to_u32(width)?,
             epsilon,
             padding: 0,
         };
@@ -72,11 +65,7 @@ impl KernelBatch<'_> {
             "add_rms_norm_f16",
             &[left, right, weight, &residual, &normalized],
             &params,
-            size(
-                checked_mul(rows.div_ceil(8), 256, "add RMSNorm grid")?,
-                1,
-                1,
-            ),
+            size(checked_mul(rows.div_ceil(8), 256)?, 1, 1),
             size(256, 1, 1),
         )?;
         Ok((residual, normalized))

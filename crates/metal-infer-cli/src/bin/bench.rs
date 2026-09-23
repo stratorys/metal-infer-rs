@@ -101,7 +101,7 @@ fn main() {
         std::process::exit(1);
     }
     if let Err(error) = run(arguments) {
-        tracing::error!(%error, "benchmark failed");
+        tracing::error!(message = "Benchmark failed.", %error);
         std::process::exit(1);
     }
 }
@@ -113,9 +113,7 @@ fn run(arguments: Arguments) -> Result<(), CliError> {
         || (matches!(arguments.test, BenchTest::Tg) && arguments.depth == 0)
         || (arguments.profile && !matches!(arguments.test, BenchTest::Pg))
     {
-        return Err(CliError::InvalidArguments(
-            "invalid test lengths, iterations, or profile mode (profile requires pg)".into(),
-        ));
+        return Err(CliError::InvalidBenchArguments);
     }
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
@@ -317,9 +315,7 @@ fn run_pipelined_decode(
         }
         if slots.slice_1d(step + 1, 1)?.to_u32_vec()?.first().copied() == Some(u32::MAX) {
             drop(next);
-            return Err(CliError::InvalidArguments(
-                "logits contain no finite value".into(),
-            ));
+            return Err(CliError::NoFiniteLogit);
         }
         queued = next;
     }
@@ -332,8 +328,8 @@ fn argmax(values: &[f32]) -> Result<u32, CliError> {
         .enumerate()
         .filter(|(_, value)| value.is_finite())
         .max_by(|left, right| left.1.total_cmp(right.1))
-        .ok_or_else(|| CliError::InvalidArguments("logits contain no finite value".into()))?;
-    u32::try_from(index).map_err(|_| CliError::InvalidArguments("token index exceeds u32".into()))
+        .ok_or(CliError::NoFiniteLogit)?;
+    u32::try_from(index).map_err(|_| CliError::TokenIdOverflow)
 }
 
 fn kernel_rows(

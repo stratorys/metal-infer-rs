@@ -31,18 +31,16 @@ impl KernelBatch<'_> {
             || k1 != width
             || k2 != width
         {
-            return Err(CoreError::Shape(
-                "rms_norm_matmul3 requires one row and matching widths divisible by 256".into(),
-            ));
+            return Err(CoreError::RmsNormMatmul3Shape);
         }
         let out0 = self.empty(&[1, n0], DType::F16)?;
         let out1 = self.empty(&[1, n1], DType::F16)?;
         let out2 = self.empty(&[1, n2], DType::F16)?;
         let params = NormMultiMatrixParams {
-            n0: to_u32(n0, "n0")?,
-            n1: to_u32(n1, "n1")?,
-            n2: to_u32(n2, "n2")?,
-            k: to_u32(width, "width")?,
+            n0: to_u32(n0)?,
+            n1: to_u32(n1)?,
+            n2: to_u32(n2)?,
+            k: to_u32(width)?,
             epsilon,
         };
         let rows = if self.kernels.is_m4_pro() {
@@ -69,11 +67,7 @@ impl KernelBatch<'_> {
                 &out2,
             ],
             &params,
-            size(
-                checked_mul(groups, simdgroups * 32, "rms matmul3 grid")?,
-                1,
-                1,
-            ),
+            size(checked_mul(groups, simdgroups * 32)?, 1, 1),
             size(simdgroups * 32, 1, 1),
         )?;
         Ok((out0, out1, out2))
@@ -103,18 +97,16 @@ impl KernelBatch<'_> {
             || k0 != width
             || k1 != width
         {
-            return Err(CoreError::Shape(
-                "add_rms_norm_matmul2 requires one row and matching widths divisible by 256".into(),
-            ));
+            return Err(CoreError::AddRmsNormMatmul2Shape);
         }
         let residual = self.empty(&[1, width], DType::F16)?;
         let out0 = self.empty(&[1, n0], DType::F16)?;
         let out1 = self.empty(&[1, n1], DType::F16)?;
         let params = NormMultiMatrixParams {
-            n0: to_u32(n0, "n0")?,
-            n1: to_u32(n1, "n1")?,
+            n0: to_u32(n0)?,
+            n1: to_u32(n1)?,
             n2: 0,
-            k: to_u32(width, "width")?,
+            k: to_u32(width)?,
             epsilon,
         };
         let rows = if self.kernels.is_m4_pro() {
@@ -141,11 +133,7 @@ impl KernelBatch<'_> {
                 &out1,
             ],
             &params,
-            size(
-                checked_mul(groups, simdgroups * 32, "add rms matmul2 grid")?,
-                1,
-                1,
-            ),
+            size(checked_mul(groups, simdgroups * 32)?, 1, 1),
             size(simdgroups * 32, 1, 1),
         )?;
         Ok((residual, out0, out1))

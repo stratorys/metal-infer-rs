@@ -70,7 +70,7 @@ fn main() {
         std::process::exit(1);
     }
     if let Err(error) = run(arguments) {
-        tracing::error!(message = "Command failed.", error = %error);
+        tracing::error!(message = "Command failed.", %error);
         std::process::exit(1);
     }
 }
@@ -114,10 +114,7 @@ fn generate(arguments: GenerateArguments) -> Result<(), CliError> {
     );
     let required = prompt.len().saturating_add(arguments.max_tokens);
     if required > arguments.context {
-        return Err(CliError::InvalidArguments(format!(
-            "prompt + generated tokens ({required}) exceeds context {}",
-            arguments.context
-        )));
+        return Err(CliError::ContextExceeded);
     }
     let mut cache = KvCache::new(&context, model.config(), arguments.context)?;
     let generation_started = std::time::Instant::now();

@@ -13,25 +13,19 @@ impl KernelBatch<'_> {
         require_f16(source)?;
         require_f16(cache)?;
         let [source_tokens, source_heads, source_dim] = source.shape() else {
-            return Err(CoreError::Shape("KV source must have rank 3".into()));
+            return Err(CoreError::KvSourceRank);
         };
         let [cache_tokens, cache_heads, cache_dim] = cache.shape() else {
-            return Err(CoreError::Shape("KV cache must have rank 3".into()));
+            return Err(CoreError::KvCacheRank);
         };
         if source_heads != cache_heads || source_dim != cache_dim {
-            return Err(CoreError::Shape(
-                "KV source/cache shapes are incompatible".into(),
-            ));
+            return Err(CoreError::KvShape);
         }
         if offset + *source_tokens > *cache_tokens {
-            return Err(CoreError::Shape("KV cache capacity exceeded".into()));
+            return Err(CoreError::KvCapacity);
         }
         let stride = source_heads * source_dim;
-        let params = [
-            to_u32(*source_tokens, "tokens")?,
-            to_u32(offset, "offset")?,
-            to_u32(stride, "stride")?,
-        ];
+        let params = [to_u32(*source_tokens)?, to_u32(offset)?, to_u32(stride)?];
         self.dispatch(
             "copy_kv_f16",
             &[source, cache],

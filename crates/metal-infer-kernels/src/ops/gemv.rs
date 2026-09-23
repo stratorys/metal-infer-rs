@@ -17,7 +17,7 @@ impl KernelBatch<'_> {
         require_f16(weight0)?;
         require_f16(weight1)?;
         if k != k0 || k != k1 {
-            return Err(CoreError::Shape("matmul2 inner dimensions differ".into()));
+            return Err(CoreError::Matmul2InnerDimension);
         }
         if m != 1 {
             return Ok((self.matmul(input, weight0)?, self.matmul(input, weight1)?));
@@ -25,10 +25,10 @@ impl KernelBatch<'_> {
         let out0 = self.empty(&[1, n0], DType::F16)?;
         let out1 = self.empty(&[1, n1], DType::F16)?;
         let params = MultiMatrixParams {
-            n0: to_u32(n0, "n0")?,
-            n1: to_u32(n1, "n1")?,
+            n0: to_u32(n0)?,
+            n1: to_u32(n1)?,
             n2: 0,
-            k: to_u32(k, "k")?,
+            k: to_u32(k)?,
         };
         let outputs = n0.max(n1);
         let rows = if k.is_multiple_of(256) && self.kernels.is_m4_pro() {
@@ -47,7 +47,7 @@ impl KernelBatch<'_> {
             },
             &[input, weight0, weight1, &out0, &out1],
             &params,
-            size(checked_mul(groups, threads, "matmul2 grid")?, 1, 1),
+            size(checked_mul(groups, threads)?, 1, 1),
             size(threads, 1, 1),
         )?;
         Ok((out0, out1))
@@ -69,7 +69,7 @@ impl KernelBatch<'_> {
         require_f16(weight1)?;
         require_f16(weight2)?;
         if k != k0 || k != k1 || k != k2 {
-            return Err(CoreError::Shape("matmul3 inner dimensions differ".into()));
+            return Err(CoreError::Matmul3InnerDimension);
         }
         if m != 1 {
             return Ok((
@@ -82,10 +82,10 @@ impl KernelBatch<'_> {
         let out1 = self.empty(&[1, n1], DType::F16)?;
         let out2 = self.empty(&[1, n2], DType::F16)?;
         let params = MultiMatrixParams {
-            n0: to_u32(n0, "n0")?,
-            n1: to_u32(n1, "n1")?,
-            n2: to_u32(n2, "n2")?,
-            k: to_u32(k, "k")?,
+            n0: to_u32(n0)?,
+            n1: to_u32(n1)?,
+            n2: to_u32(n2)?,
+            k: to_u32(k)?,
         };
         let outputs = n0.max(n1).max(n2);
         let rows = if k.is_multiple_of(256) && self.kernels.is_m4_pro() {
@@ -104,7 +104,7 @@ impl KernelBatch<'_> {
             },
             &[input, weight0, weight1, weight2, &out0, &out1, &out2],
             &params,
-            size(checked_mul(groups, threads, "matmul3 grid")?, 1, 1),
+            size(checked_mul(groups, threads)?, 1, 1),
             size(threads, 1, 1),
         )?;
         Ok((out0, out1, out2))

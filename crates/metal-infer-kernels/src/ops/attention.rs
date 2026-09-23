@@ -69,13 +69,13 @@ impl KernelBatch<'_> {
         require_f16(key)?;
         require_f16(value)?;
         let [tokens, query_heads, query_dim] = query.shape() else {
-            return Err(CoreError::Shape("query must have rank 3".into()));
+            return Err(CoreError::QueryRank);
         };
         let [kv_length, key_heads, key_dim] = key.shape() else {
-            return Err(CoreError::Shape("key must have rank 3".into()));
+            return Err(CoreError::KeyRank);
         };
         let [value_length, value_heads, value_dim] = value.shape() else {
-            return Err(CoreError::Shape("value must have rank 3".into()));
+            return Err(CoreError::ValueRank);
         };
         if *query_heads != config.query_heads
             || *query_dim != config.head_dim
@@ -85,29 +85,21 @@ impl KernelBatch<'_> {
             || value_heads != key_heads
             || value_dim != key_dim
         {
-            return Err(CoreError::Shape(
-                "attention tensor shapes do not match config".into(),
-            ));
+            return Err(CoreError::AttentionShape);
         }
         if config.kv_heads == 0 || !config.query_heads.is_multiple_of(config.kv_heads) {
-            return Err(CoreError::Shape(
-                "query_heads must be divisible by kv_heads".into(),
-            ));
+            return Err(CoreError::AttentionHeadRatio);
         }
         if kind != AttentionKind::Reference
             && (!config.head_dim.is_power_of_two() || config.head_dim > 256)
         {
-            return Err(CoreError::Shape(
-                "tiled attention requires a power-of-two head_dim <= 256".into(),
-            ));
+            return Err(CoreError::TiledAttentionHeadDim);
         }
         let flash_block_keys = if kind == AttentionKind::FlashDecode {
             let block = flash_block
                 .unwrap_or_else(|| self.kernels.flash_decode_block_for_length(*kv_length));
             if !matches!(block, 32 | 64 | 128 | 256) {
-                return Err(CoreError::Shape(
-                    "flash decode block size must be 32, 64, 128, or 256".into(),
-                ));
+                return Err(CoreError::FlashDecodeBlockSize);
             }
             block
         } else {
@@ -115,29 +107,25 @@ impl KernelBatch<'_> {
         };
         let out = self.empty(query.shape(), DType::F16)?;
         let params = AttentionParams {
-            tokens: to_u32(*tokens, "tokens")?,
-            q_heads: to_u32(config.query_heads, "query_heads")?,
-            kv_heads: to_u32(config.kv_heads, "kv_heads")?,
-            head_dim: to_u32(config.head_dim, "head_dim")?,
+            tokens: to_u32(*tokens)?,
+            q_heads: to_u32(config.query_heads)?,
+            kv_heads: to_u32(config.kv_heads)?,
+            head_dim: to_u32(config.head_dim)?,
             causal: u32::from(config.causal),
-            query_offset: to_u32(config.query_offset, "query_offset")?,
-            kv_length: to_u32(*kv_length, "kv_length")?,
-            padding: to_u32(flash_block_keys, "flash decode block size")?,
+            query_offset: to_u32(config.query_offset)?,
+            kv_length: to_u32(*kv_length)?,
+            padding: to_u32(flash_block_keys)?,
         };
         if matches!(
             kind,
             AttentionKind::DecodeSplitKv | AttentionKind::FlashDecode
         ) && *tokens != 1
         {
-            return Err(CoreError::Shape(
-                "decode attention requires exactly one query token".into(),
-            ));
+            return Err(CoreError::DecodeAttentionTokens);
         }
         if kind == AttentionKind::FlashDecode {
             if config.query_heads / config.kv_heads != 2 {
-                return Err(CoreError::Shape(
-                    "flash decode requires two query heads per KV head".into(),
-                ));
+                return Err(CoreError::FlashDecodeHeadRatio);
             }
             let available = if config.causal {
                 (*kv_length).min(config.query_offset.saturating_add(1))
@@ -145,33 +133,27 @@ impl KernelBatch<'_> {
                 *kv_length
             };
             if available == 0 {
-                return Err(CoreError::Shape(
-                    "flash decode requires at least one available key".into(),
-                ));
+                return Err(CoreError::FlashDecodeEmpty);
             }
             let blocks = available.div_ceil(flash_block_keys);
             let partial_width = config
                 .head_dim
                 .checked_add(2)
-                .ok_or_else(|| CoreError::Shape("flash decode partial width overflow".into()))?;
+                .ok_or_else(|| CoreError::FlashDecodePartialOverflow)?;
             let scratch = self.empty(&[config.kv_heads, blocks, 2, partial_width], DType::F32)?;
-            let groups = checked_mul(config.kv_heads, blocks, "flash decode groups")?;
+            let groups = checked_mul(config.kv_heads, blocks)?;
             self.dispatch(
                 "attention_flash_decode_partial_f16",
                 &[query, key, value, &scratch],
                 &params,
-                size(checked_mul(groups, 128, "flash decode grid")?, 1, 1),
+                size(checked_mul(groups, 128)?, 1, 1),
                 size(128, 1, 1),
             )?;
             self.dispatch(
                 "attention_flash_decode_reduce_f16",
                 &[&scratch, &out],
                 &params,
-                size(
-                    checked_mul(config.query_heads, 128, "flash decode reduction grid")?,
-                    1,
-                    1,
-                ),
+                size(checked_mul(config.query_heads, 128)?, 1, 1),
                 size(128, 1, 1),
             )?;
             return Ok(out);
@@ -189,22 +171,16 @@ impl KernelBatch<'_> {
                 size(config.head_dim.min(256), 1, 1),
             ),
             AttentionKind::DecodeSplitKv => {
-                let groups = checked_mul(config.query_heads, *tokens, "attention groups")?;
-                (
-                    size(checked_mul(groups, 256, "decode attention grid")?, 1, 1),
-                    size(256, 1, 1),
-                )
+                let groups = checked_mul(config.query_heads, *tokens)?;
+                (size(checked_mul(groups, 256)?, 1, 1), size(256, 1, 1))
             }
             AttentionKind::Tiled => {
-                let groups = checked_mul(config.query_heads, *tokens, "attention groups")?;
-                (
-                    size(checked_mul(groups, 32, "attention grid")?, 1, 1),
-                    size(32, 1, 1),
-                )
+                let groups = checked_mul(config.query_heads, *tokens)?;
+                (size(checked_mul(groups, 32)?, 1, 1), size(32, 1, 1))
             }
             AttentionKind::FlashPrefill => (
                 size(
-                    checked_mul(tokens.div_ceil(32), 128, "flash prefill grid")?,
+                    checked_mul(tokens.div_ceil(32), 128)?,
                     config.query_heads,
                     1,
                 ),

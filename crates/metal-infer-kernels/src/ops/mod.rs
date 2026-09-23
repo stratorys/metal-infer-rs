@@ -182,10 +182,7 @@ fn require_f16(tensor: &Tensor) -> Result<(), CoreError> {
     if tensor.dtype() == DType::F16 {
         Ok(())
     } else {
-        Err(CoreError::DType {
-            expected: "f16",
-            actual: tensor.dtype().name(),
-        })
+        Err(CoreError::ExpectedF16)
     }
 }
 
@@ -196,11 +193,7 @@ fn require_same_shape(
     if left.shape() == right.shape() {
         Ok(())
     } else {
-        Err(CoreError::Shape(format!(
-            "shape mismatch: {:?} and {:?}",
-            left.shape(),
-            right.shape()
-        )))
+        Err(CoreError::ShapeMismatch)
     }
 }
 
@@ -208,34 +201,25 @@ fn matrix_shape(tensor: &Tensor) -> Result<[usize; 2], CoreError> {
     tensor
         .shape()
         .try_into()
-        .map_err(|_| CoreError::Shape(format!("expected matrix, got {:?}", tensor.shape())))
+        .map_err(|_| CoreError::ExpectedMatrix)
 }
 
-fn to_u32(
-    value: usize,
-    label: &str,
-) -> Result<u32, CoreError> {
-    value
-        .try_into()
-        .map_err(|_| CoreError::Shape(format!("{label} does not fit in u32")))
+fn to_u32(value: usize) -> Result<u32, CoreError> {
+    value.try_into().map_err(|_| CoreError::U32Overflow)
 }
 
 fn checked_mul(
     left: usize,
     right: usize,
-    label: &str,
 ) -> Result<usize, CoreError> {
-    left.checked_mul(right)
-        .ok_or_else(|| CoreError::Shape(format!("{label} overflow")))
+    left.checked_mul(right).ok_or(CoreError::DispatchOverflow)
 }
 
 fn checked_add(
     left: usize,
     right: usize,
-    label: &str,
 ) -> Result<usize, CoreError> {
-    left.checked_add(right)
-        .ok_or_else(|| CoreError::Shape(format!("{label} overflow")))
+    left.checked_add(right).ok_or(CoreError::DispatchOverflow)
 }
 
 fn round_up(
@@ -245,7 +229,7 @@ fn round_up(
     value
         .checked_add(multiple - 1)
         .map(|rounded| rounded / multiple * multiple)
-        .ok_or_else(|| CoreError::Shape("dispatch size overflow".into()))
+        .ok_or(CoreError::DispatchOverflow)
 }
 
 const fn size(

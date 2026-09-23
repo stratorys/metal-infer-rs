@@ -121,13 +121,10 @@ impl Tensor {
         let length = shape.iter().try_fold(1usize, |value, dimension| {
             value
                 .checked_mul(*dimension)
-                .ok_or_else(|| CoreError::Shape("reshape element count overflow".into()))
+                .ok_or_else(|| CoreError::ReshapeOverflow)
         })?;
         if shape.is_empty() || shape.contains(&0) || length != self.len() {
-            return Err(CoreError::Shape(format!(
-                "cannot reshape {:?} into {shape:?}",
-                self.shape
-            )));
+            return Err(CoreError::ReshapeMismatch);
         }
         Ok(Self {
             buffer: self.buffer.clone(),
@@ -143,17 +140,13 @@ impl Tensor {
         first_dimension: usize,
     ) -> Result<Self, CoreError> {
         let Some(capacity) = self.shape.first().copied() else {
-            return Err(CoreError::Shape("prefix requires rank >= 1".into()));
+            return Err(CoreError::PrefixRank);
         };
         if first_dimension == 0 || first_dimension > capacity {
-            return Err(CoreError::Shape(format!(
-                "prefix {first_dimension} is outside capacity {capacity}"
-            )));
+            return Err(CoreError::PrefixOutOfRange);
         }
         let mut shape = self.shape.clone();
-        let first = shape
-            .first_mut()
-            .ok_or_else(|| CoreError::Shape("prefix requires rank >= 1".into()))?;
+        let first = shape.first_mut().ok_or_else(|| CoreError::PrefixRank)?;
         *first = first_dimension;
         Ok(Self {
             buffer: self.buffer.clone(),
@@ -169,16 +162,10 @@ impl Tensor {
         row: usize,
     ) -> Result<Self, CoreError> {
         let [rows, width] = self.shape.as_slice() else {
-            return Err(CoreError::Shape(format!(
-                "row {row} is outside matrix {:?}",
-                self.shape
-            )));
+            return Err(CoreError::RowRank);
         };
         if row >= *rows {
-            return Err(CoreError::Shape(format!(
-                "row {row} is outside matrix {:?}",
-                self.shape
-            )));
+            return Err(CoreError::RowOutOfRange);
         }
         Ok(Self {
             buffer: self.buffer.clone(),
@@ -195,16 +182,13 @@ impl Tensor {
         len: usize,
     ) -> Result<Self, CoreError> {
         let [capacity] = self.shape.as_slice() else {
-            return Err(CoreError::Shape("slice_1d requires a rank-1 tensor".into()));
+            return Err(CoreError::SliceRank);
         };
         let end = start
             .checked_add(len)
-            .ok_or_else(|| CoreError::Shape("slice_1d range overflow".into()))?;
+            .ok_or_else(|| CoreError::SliceOverflow)?;
         if len == 0 || end > *capacity {
-            return Err(CoreError::Shape(format!(
-                "slice_1d range {start}..{end} is outside {:?}",
-                self.shape
-            )));
+            return Err(CoreError::SliceOutOfRange);
         }
         Ok(Self {
             buffer: self.buffer.clone(),
@@ -220,10 +204,7 @@ impl Tensor {
         read: impl FnOnce(&[u16]) -> T,
     ) -> Result<T, CoreError> {
         if self.dtype != DType::F16 {
-            return Err(CoreError::DType {
-                expected: "f16",
-                actual: self.dtype.name(),
-            });
+            return Err(CoreError::ExpectedF16);
         }
         // SAFETY: the caller reads only after command completion; Tensor owns
         // the shared buffer and checked views remain within its allocation.
@@ -235,10 +216,7 @@ impl Tensor {
 
     pub fn to_f32_vec(&self) -> Result<Vec<f32>, CoreError> {
         if self.dtype != DType::F16 {
-            return Err(CoreError::DType {
-                expected: "f16",
-                actual: self.dtype.name(),
-            });
+            return Err(CoreError::ExpectedF16);
         }
         // SAFETY: offset_bytes was derived from a checked tensor view.
         let pointer =
@@ -255,10 +233,7 @@ impl Tensor {
 
     pub fn to_u32_vec(&self) -> Result<Vec<u32>, CoreError> {
         if self.dtype != DType::U32 {
-            return Err(CoreError::DType {
-                expected: "u32",
-                actual: self.dtype.name(),
-            });
+            return Err(CoreError::ExpectedU32);
         }
         // SAFETY: offset_bytes was derived from a checked tensor view.
         let pointer =

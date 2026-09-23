@@ -20,7 +20,7 @@ pub struct ChatMessage {
 impl ModelTokenizer {
     pub fn from_directory(directory: &Path) -> Result<Self, ModelError> {
         let path = directory.join("tokenizer.json");
-        let inner = Tokenizer::from_file(&path).map_err(|_| ModelError::TokenizerLoad(path))?;
+        let inner = Tokenizer::from_file(&path).map_err(|_| ModelError::TokenizerLoad)?;
         let mut eos_token_ids = Vec::new();
         let tokenizer_config = directory.join("tokenizer_config.json");
         if tokenizer_config.exists() {
@@ -78,9 +78,7 @@ impl ModelTokenizer {
 
 fn render_qwen_chat(messages: &[ChatMessage]) -> Result<String, ModelError> {
     if messages.is_empty() {
-        return Err(ModelError::Config(
-            "chat completion requires at least one message".into(),
-        ));
+        return Err(ModelError::EmptyChat);
     }
     let mut prompt = String::new();
     for message in messages {
@@ -88,10 +86,7 @@ fn render_qwen_chat(messages: &[ChatMessage]) -> Result<String, ModelError> {
             message.role.as_str(),
             "system" | "user" | "assistant" | "tool"
         ) {
-            return Err(ModelError::Config(format!(
-                "unsupported chat role `{}`",
-                message.role
-            )));
+            return Err(ModelError::UnsupportedChatRole);
         }
         prompt.push_str("<|im_start|>");
         prompt.push_str(&message.role);

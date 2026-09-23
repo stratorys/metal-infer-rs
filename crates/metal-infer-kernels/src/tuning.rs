@@ -175,9 +175,7 @@ impl KernelSelection {
     pub fn validate(&self) -> Result<(), CoreError> {
         for entry in &self.flash_decode_blocks {
             if !matches!(entry.block, 32 | 64 | 128 | 256) {
-                return Err(CoreError::Shape(
-                    "flash decode blocks must use 32, 64, 128, or 256 keys".into(),
-                ));
+                return Err(CoreError::FlashDecodeBlockSize);
             }
         }
         Ok(())

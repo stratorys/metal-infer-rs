@@ -62,9 +62,7 @@ impl KvCache {
         capacity: usize,
     ) -> Result<Self, ModelError> {
         if capacity == 0 {
-            return Err(ModelError::Config(
-                "KV cache capacity must be non-zero".into(),
-            ));
+            return Err(ModelError::EmptyKvCache);
         }
         let shape = [capacity, config.num_key_value_heads, config.head_dim];
         let layers = (0..config.num_hidden_layers)
@@ -151,7 +149,7 @@ impl TokenSampler {
                             .then_with(|| right.0.cmp(&left.0))
                     })
                     .map(|(index, _)| index as u32)
-                    .ok_or_else(|| ModelError::Config("logits contain no finite value".into()))
+                    .ok_or(ModelError::NoFiniteLogit)
             } else {
                 sample_token_f16(bits, &self.options, &mut self.random)
             }
@@ -182,16 +180,11 @@ impl Qwen3Model {
         caches: &mut [&mut KvCache],
     ) -> Result<Tensor, ModelError> {
         if tokens.is_empty() || tokens.len() != caches.len() {
-            return Err(ModelError::Config(
-                "decode batch needs one cache per token".into(),
-            ));
+            return Err(ModelError::DecodeBatchMismatch);
         }
         for cache in caches.iter() {
             if cache.filled == 0 || cache.filled >= cache.capacity {
-                return Err(ModelError::CacheCapacity {
-                    capacity: cache.capacity,
-                    requested: cache.filled.saturating_add(1),
-                });
+                return Err(ModelError::CacheCapacity);
             }
         }
         let input = self.context.tensor_u32(tokens, &[tokens.len()])?;
@@ -220,7 +213,7 @@ impl Qwen3Model {
                 let layer_cache = cache
                     .layers
                     .get(layer_index)
-                    .ok_or_else(|| ModelError::Config("missing KV cache layer".into()))?;
+                    .ok_or(ModelError::MissingCacheLayer)?;
                 let offset = cache.filled;
                 let query_row = query.row(row)?.reshape(&[
                     1,
@@ -357,11 +350,7 @@ impl Qwen3Model {
         config.validate()?;
         let mut weights = WeightMap::load(directory, context)?;
         let embedding = weights.take("model.embed_tokens.weight")?;
-        expect_shape(
-            &embedding,
-            &[config.vocab_size, config.hidden_size],
-            "embedding",
-        )?;
+        expect_shape(&embedding, &[config.vocab_size, config.hidden_size])?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{index}");
@@ -393,12 +382,8 @@ impl Qwen3Model {
         } else {
             weights.take("lm_head.weight")?
         };
-        expect_shape(&final_norm, &[config.hidden_size], "final norm")?;
-        expect_shape(
-            &lm_head,
-            &[config.vocab_size, config.hidden_size],
-            "LM head",
-        )?;
+        expect_shape(&final_norm, &[config.hidden_size])?;
+        expect_shape(&lm_head, &[config.vocab_size, config.hidden_size])?;
         kernels.select(
             &kernels.device_selection(config.num_attention_heads, config.num_key_value_heads),
         )?;
@@ -463,9 +448,7 @@ impl Qwen3Model {
         cache: &mut KvCache,
     ) -> Result<(Tensor, DispatchStats), ModelError> {
         if tokens.is_empty() {
-            return Err(ModelError::Config(
-                "prefill requires at least one token".into(),
-            ));
+            return Err(ModelError::EmptyPrefill);
         }
         cache.reset();
         self.forward_with_stats(tokens, cache)
@@ -495,9 +478,7 @@ impl Qwen3Model {
         output: &Tensor,
     ) -> Result<(Tensor, DispatchStats), ModelError> {
         if tokens.is_empty() {
-            return Err(ModelError::Config(
-                "prefill requires at least one token".into(),
-            ));
+            return Err(ModelError::EmptyPrefill);
         }
         cache.reset();
         let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
@@ -519,7 +500,7 @@ impl Qwen3Model {
         output: &Tensor,
     ) -> Result<(Tensor, PendingBatch<'model>), ModelError> {
         if token.shape() != [1] || token.dtype() != DType::U32 {
-            return Err(ModelError::Config("decode token must be one u32".into()));
+            return Err(ModelError::DecodeTokenShape);
         }
         self.forward_async(token, cache, Some(output))
     }
@@ -595,14 +576,14 @@ impl Qwen3Model {
                 .to_u32_vec()?
                 .first()
                 .copied()
-                .ok_or_else(|| ModelError::Config("missing argmax token".into()))?;
+                .ok_or(ModelError::MissingArgmaxToken)?;
             if token == u32::MAX {
                 if let Some((pending, previous)) = prefetched.take() {
                     let result = pending.wait();
                     cache.filled = previous;
                     result?;
                 }
-                return Err(ModelError::Config("logits contain no finite value".into()));
+                return Err(ModelError::NoFiniteLogit);
             }
             let pending = if step + 1 < options.max_tokens {
                 if let Some(pending) = prefetched.take() {
@@ -662,7 +643,7 @@ impl Qwen3Model {
         tokens: &[u32],
     ) -> Result<Tensor, ModelError> {
         if tokens.is_empty() {
-            return Err(ModelError::Config("block benchmark requires tokens".into()));
+            return Err(ModelError::EmptyBlock);
         }
         let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
         let mut batch = self.kernels.begin_batch()?;
@@ -676,10 +657,7 @@ impl Qwen3Model {
             key: self.context.empty(&shape, DType::F16)?,
             value: self.context.empty(&shape, DType::F16)?,
         };
-        let layer = self
-            .layers
-            .first()
-            .ok_or_else(|| ModelError::Config("model has no transformer layer".into()))?;
+        let layer = self.layers.first().ok_or(ModelError::NoLayer)?;
         let output = self.forward_layer(&mut batch, hidden, layer, &cache, 0, tokens.len())?;
         batch.finish()?;
         Ok(output)
@@ -709,21 +687,14 @@ impl Qwen3Model {
         argmax_output: Option<&Tensor>,
     ) -> Result<(Tensor, PendingBatch<'model>), ModelError> {
         if tokens.dtype() != DType::U32 || tokens.shape().len() != 1 || tokens.is_empty() {
-            return Err(ModelError::Config(
-                "tokens must be a nonempty u32 vector".into(),
-            ));
+            return Err(ModelError::TokensShape);
         }
         if cache.layers.len() != self.layers.len() {
-            return Err(ModelError::Config(
-                "KV cache layer count differs from model".into(),
-            ));
+            return Err(ModelError::CacheLayerCount);
         }
         let requested = cache.filled + tokens.len();
         if requested > cache.capacity {
-            return Err(ModelError::CacheCapacity {
-                capacity: cache.capacity,
-                requested,
-            });
+            return Err(ModelError::CacheCapacity);
         }
         let mut batch = self.kernels.begin_batch()?;
         let mut hidden = batch.embedding(tokens, &self.embedding)?;
@@ -732,7 +703,7 @@ impl Qwen3Model {
             let layer_cache = cache
                 .layers
                 .get(layer_index)
-                .ok_or_else(|| ModelError::Config("missing KV cache layer".into()))?;
+                .ok_or(ModelError::MissingCacheLayer)?;
             hidden =
                 self.forward_layer(&mut batch, hidden, layer, layer_cache, offset, requested)?;
         }
@@ -760,7 +731,7 @@ impl Qwen3Model {
             .shape()
             .first()
             .copied()
-            .ok_or_else(|| ModelError::Config("hidden state has no token dimension".into()))?;
+            .ok_or(ModelError::HiddenStateRank)?;
         let fused_qkv = tokens == 1 && self.fusions.decode_norm && self.fusions.qkv;
         let (query, key, value) = if fused_qkv {
             batch.rms_norm_matmul3(
@@ -932,55 +903,29 @@ fn validate_layer(
     expect_shape(
         &attention.query,
         &[config.query_width(), config.hidden_size],
-        "q_proj",
     )?;
-    expect_shape(
-        &attention.key,
-        &[config.kv_width(), config.hidden_size],
-        "k_proj",
-    )?;
-    expect_shape(
-        &attention.value,
-        &[config.kv_width(), config.hidden_size],
-        "v_proj",
-    )?;
+    expect_shape(&attention.key, &[config.kv_width(), config.hidden_size])?;
+    expect_shape(&attention.value, &[config.kv_width(), config.hidden_size])?;
     expect_shape(
         &attention.output,
         &[config.hidden_size, config.query_width()],
-        "o_proj",
     )?;
-    expect_shape(&attention.query_norm, &[config.head_dim], "q_norm")?;
-    expect_shape(&attention.key_norm, &[config.head_dim], "k_norm")?;
-    expect_shape(
-        &mlp.gate,
-        &[config.intermediate_size, config.hidden_size],
-        "gate_proj",
-    )?;
-    expect_shape(
-        &mlp.up,
-        &[config.intermediate_size, config.hidden_size],
-        "up_proj",
-    )?;
-    expect_shape(
-        &mlp.down,
-        &[config.hidden_size, config.intermediate_size],
-        "down_proj",
-    )?;
+    expect_shape(&attention.query_norm, &[config.head_dim])?;
+    expect_shape(&attention.key_norm, &[config.head_dim])?;
+    expect_shape(&mlp.gate, &[config.intermediate_size, config.hidden_size])?;
+    expect_shape(&mlp.up, &[config.intermediate_size, config.hidden_size])?;
+    expect_shape(&mlp.down, &[config.hidden_size, config.intermediate_size])?;
     Ok(())
 }
 
 fn expect_shape(
     tensor: &Tensor,
     expected: &[usize],
-    name: &str,
 ) -> Result<(), ModelError> {
     if tensor.shape() == expected {
         Ok(())
     } else {
-        Err(ModelError::Config(format!(
-            "{name} has shape {:?}, expected {expected:?}",
-            tensor.shape()
-        )))
+        Err(ModelError::WeightShape)
     }
 }
 
@@ -991,20 +936,16 @@ fn argmax(values: &[f32]) -> Result<u32, ModelError> {
         .enumerate()
         .filter(|(_, value)| value.is_finite())
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
-        .ok_or_else(|| ModelError::Config("logits contain no finite value".into()))?;
-    index
-        .try_into()
-        .map_err(|_| ModelError::Config("token id does not fit in u32".into()))
+        .ok_or(ModelError::NoFiniteLogit)?;
+    index.try_into().map_err(|_| ModelError::TokenIdOverflow)
 }
 
 fn validate_generation_options(options: &GenerationOptions) -> Result<(), ModelError> {
     if !options.temperature.is_finite() || options.temperature < 0.0 {
-        return Err(ModelError::Config(
-            "temperature must be finite and non-negative".into(),
-        ));
+        return Err(ModelError::InvalidTemperature);
     }
     if !options.top_p.is_finite() || !(0.0..=1.0).contains(&options.top_p) {
-        return Err(ModelError::Config("top_p must be between 0 and 1".into()));
+        return Err(ModelError::InvalidTopP);
     }
     Ok(())
 }
@@ -1047,7 +988,7 @@ fn sample_candidates(
     random: &mut XorShift64,
 ) -> Result<u32, ModelError> {
     if candidates.is_empty() {
-        return Err(ModelError::Config("logits contain no finite value".into()));
+        return Err(ModelError::NoFiniteLogit);
     }
     if options.top_k > 0 && candidates.len() > options.top_k {
         let mut original = candidates.clone();
@@ -1072,10 +1013,7 @@ fn sample_candidates(
     } else {
         candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
     }
-    let max_logit = candidates
-        .first()
-        .ok_or_else(|| ModelError::Config("logits contain no finite value".into()))?
-        .1;
+    let max_logit = candidates.first().ok_or(ModelError::NoFiniteLogit)?.1;
     let inverse_temperature = options.temperature.recip();
     let mut total = 0.0f64;
     for (_, value) in &mut candidates {
@@ -1103,12 +1041,10 @@ fn sample_candidates(
     for (index, probability) in candidates {
         target -= f64::from(probability);
         if target <= 0.0 {
-            return index
-                .try_into()
-                .map_err(|_| ModelError::Config("token id does not fit in u32".into()));
+            return index.try_into().map_err(|_| ModelError::TokenIdOverflow);
         }
     }
-    Err(ModelError::Config("failed to sample a token".into()))
+    Err(ModelError::SamplingFailed)
 }
 
 struct XorShift64 {

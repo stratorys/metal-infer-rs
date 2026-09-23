@@ -20,19 +20,17 @@ impl KernelBatch<'_> {
         require_f16(input)?;
         let shape = input.shape();
         let [tokens, heads, head_dim] = shape else {
-            return Err(CoreError::Shape(
-                "RoPE expects [tokens, heads, head_dim]".into(),
-            ));
+            return Err(CoreError::RopeRank);
         };
         if !head_dim.is_multiple_of(2) {
-            return Err(CoreError::Shape("RoPE head_dim must be even".into()));
+            return Err(CoreError::RopeOddHeadDim);
         }
         let out = self.empty(shape, DType::F16)?;
         let params = RopeParams {
-            tokens: to_u32(*tokens, "tokens")?,
-            heads: to_u32(*heads, "heads")?,
-            head_dim: to_u32(*head_dim, "head_dim")?,
-            offset: to_u32(offset, "offset")?,
+            tokens: to_u32(*tokens)?,
+            heads: to_u32(*heads)?,
+            head_dim: to_u32(*head_dim)?,
+            offset: to_u32(offset)?,
             theta,
             padding: [0; 3],
         };
@@ -61,13 +59,13 @@ impl KernelBatch<'_> {
         require_f16(key_weight)?;
         require_f16(key_cache)?;
         let [tokens, query_heads, head_dim] = query.shape() else {
-            return Err(CoreError::Shape("query must have rank 3".into()));
+            return Err(CoreError::QueryRank);
         };
         let [key_tokens, kv_heads, key_dim] = key.shape() else {
-            return Err(CoreError::Shape("key must have rank 3".into()));
+            return Err(CoreError::KeyRank);
         };
         let [capacity, cache_heads, cache_dim] = key_cache.shape() else {
-            return Err(CoreError::Shape("key cache must have rank 3".into()));
+            return Err(CoreError::KeyCacheRank);
         };
         if tokens != key_tokens
             || head_dim != key_dim
@@ -76,33 +74,29 @@ impl KernelBatch<'_> {
             || query_weight.shape() != [*head_dim]
             || key_weight.shape() != [*head_dim]
         {
-            return Err(CoreError::Shape(
-                "Q/K transform tensor shapes are incompatible".into(),
-            ));
+            return Err(CoreError::QkTransformShape);
         }
         if !head_dim.is_multiple_of(2) || config.offset + *tokens > *capacity {
-            return Err(CoreError::Shape(
-                "Q/K transform has invalid head_dim or cache offset".into(),
-            ));
+            return Err(CoreError::QkTransformOffset);
         }
         let out = self.empty(query.shape(), DType::F16)?;
         let params = QkTransformParams {
-            tokens: to_u32(*tokens, "tokens")?,
-            query_heads: to_u32(*query_heads, "query heads")?,
-            kv_heads: to_u32(*kv_heads, "KV heads")?,
-            head_dim: to_u32(*head_dim, "head dim")?,
-            offset: to_u32(config.offset, "offset")?,
+            tokens: to_u32(*tokens)?,
+            query_heads: to_u32(*query_heads)?,
+            kv_heads: to_u32(*kv_heads)?,
+            head_dim: to_u32(*head_dim)?,
+            offset: to_u32(config.offset)?,
             theta: config.theta,
-            cache_capacity: to_u32(*capacity, "cache capacity")?,
+            cache_capacity: to_u32(*capacity)?,
             epsilon: config.epsilon,
         };
-        let heads = checked_add(*query_heads, *kv_heads, "Q/K heads")?;
-        let groups = checked_mul(*tokens, heads, "Q/K groups")?;
+        let heads = checked_add(*query_heads, *kv_heads)?;
+        let groups = checked_mul(*tokens, heads)?;
         self.dispatch(
             "qk_norm_rope_cache_f16",
             &[query, key, query_weight, key_weight, &out, key_cache],
             &params,
-            size(checked_mul(groups, 32, "Q/K grid")?, 1, 1),
+            size(checked_mul(groups, 32)?, 1, 1),
             size(32, 1, 1),
         )?;
         Ok(out)

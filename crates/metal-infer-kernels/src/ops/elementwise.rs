@@ -13,15 +13,15 @@ impl KernelBatch<'_> {
         require_f16(source)?;
         require_f16(destination)?;
         let [source_rows, width] = source.shape() else {
-            return Err(CoreError::Shape("source must be a matrix".into()));
+            return Err(CoreError::CopyRowSourceRank);
         };
         let [rows, destination_width] = destination.shape() else {
-            return Err(CoreError::Shape("destination must be a matrix".into()));
+            return Err(CoreError::CopyRowDestinationRank);
         };
         if *source_rows != 1 || width != destination_width || row >= *rows {
-            return Err(CoreError::Shape("copy row shapes are incompatible".into()));
+            return Err(CoreError::CopyRowShape);
         }
-        let params = [to_u32(*width, "row width")?, to_u32(row, "row index")?, 0];
+        let params = [to_u32(*width)?, to_u32(row)?, 0];
         self.dispatch(
             "copy_row_f16",
             &[source, destination],
@@ -39,7 +39,7 @@ impl KernelBatch<'_> {
         require_f16(right)?;
         require_same_shape(left, right)?;
         let out = self.empty(left.shape(), DType::F16)?;
-        let count = to_u32(left.len(), "element count")?;
+        let count = to_u32(left.len())?;
         self.dispatch(
             "add_f16",
             &[left, right, &out],
@@ -59,7 +59,7 @@ impl KernelBatch<'_> {
         require_f16(up)?;
         require_same_shape(gate, up)?;
         let out = self.empty(gate.shape(), DType::F16)?;
-        let count = to_u32(gate.len(), "element count")?;
+        let count = to_u32(gate.len())?;
         self.dispatch(
             "swiglu_f16",
             &[gate, up, &out],
@@ -76,17 +76,12 @@ impl KernelBatch<'_> {
         table: &Tensor,
     ) -> Result<Tensor, CoreError> {
         if tokens.dtype() != DType::U32 || tokens.shape().len() != 1 {
-            return Err(CoreError::Shape(
-                "tokens must be a rank-1 u32 tensor".into(),
-            ));
+            return Err(CoreError::TokensShape);
         }
         require_f16(table)?;
         let [_, width] = matrix_shape(table)?;
         let out = self.empty(&[tokens.len(), width], DType::F16)?;
-        let params = [
-            to_u32(tokens.len(), "token count")?,
-            to_u32(width, "embedding width")?,
-        ];
+        let params = [to_u32(tokens.len())?, to_u32(width)?];
         self.dispatch(
             "embedding_f16",
             &[tokens, table, &out],

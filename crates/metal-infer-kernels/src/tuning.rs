@@ -1,10 +1,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use metal_infer_runtime::CoreError;
 
-use crate::{AttentionConfig, Kernels};
+use crate::Kernels;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeGemvConfig {
@@ -28,6 +27,16 @@ const SINGLE_SHAPES: &[(&str, usize, usize, usize, usize)] = &[
     ("Apple M4 Pro", 1024, 2048, 4, 2),
     ("Apple M4 Pro", 1024, 3072, 4, 1),
     ("Apple M4 Pro", 151_936, 1024, 0, 2),
+];
+
+// (max active length, keys per block, threads) for two query heads per KV head.
+const M4_PRO_FLASH_DECODE_BLOCKS: &[(usize, usize, usize)] = &[
+    (512, 32, 128),
+    (640, 64, 128),
+    (1024, 64, 128),
+    (2048, 128, 128),
+    (4096, 256, 256),
+    (8192, 256, 256),
 ];
 
 // (device, output widths, K, baseline rows, tuned rows).
@@ -180,83 +189,29 @@ impl Kernels {
         )
     }
 
-    pub fn tune_flash_decode(
+    pub fn device_selection(
         &self,
         query_heads: usize,
         kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<(), CoreError> {
-        if !self.tuning.is_m4_pro || query_heads != kv_heads * 2 || head_dim == 0 {
-            return Ok(());
+    ) -> KernelSelection {
+        if !self.tuning.is_m4_pro {
+            return KernelSelection::default();
         }
-        let started = Instant::now();
-        let lengths = [512, 640, 1024, 2048, 4096, 8192];
-        let maximum = 8192;
-        let query = self.context().tensor_f16_bits(
-            &vec![0x3c00; query_heads * head_dim],
-            &[1, query_heads, head_dim],
-        )?;
-        let cache_values = vec![0x3800; maximum * kv_heads * head_dim];
-        let key = self
-            .context()
-            .tensor_f16_bits(&cache_values, &[maximum, kv_heads, head_dim])?;
-        let value = self
-            .context()
-            .tensor_f16_bits(&cache_values, &[maximum, kv_heads, head_dim])?;
-        let mut chosen = Vec::with_capacity(lengths.len());
-        for length in lengths {
-            if started.elapsed() >= Duration::from_secs(2) {
-                break;
-            }
-            let active_key = key.prefix(length)?;
-            let active_value = value.prefix(length)?;
-            let config = AttentionConfig {
-                query_heads,
-                kv_heads,
-                head_dim,
-                causal: true,
-                query_offset: length - 1,
-            };
-            let mut best = (u128::MAX, 64, 256);
-            for (block, threads) in [
-                (64, 256),
-                (32, 256),
-                (128, 256),
-                (256, 256),
-                (64, 128),
-                (32, 128),
-                (128, 128),
-                (256, 128),
-            ] {
-                if started.elapsed() >= Duration::from_secs(2) {
-                    break;
-                }
-                let mut samples = [0_u128; 3];
-                for sample in &mut samples {
-                    let mut batch = self.begin_batch()?;
-                    batch.attention_flash_decode_with_configuration(
-                        &query,
-                        &active_key,
-                        &active_value,
-                        config,
+        KernelSelection {
+            decode_gemv: Some(DecodeGemvConfig::Tuned),
+            flash_decode_blocks: if query_heads == kv_heads * 2 {
+                M4_PRO_FLASH_DECODE_BLOCKS
+                    .iter()
+                    .map(|&(max_length, block, threads)| FlashDecodeBlock {
+                        max_length,
                         block,
                         threads,
-                    )?;
-                    *sample = batch.finish()?.gpu_time.as_nanos();
-                }
-                samples.sort_unstable();
-                if samples[1] < best.0 {
-                    best = (samples[1], block, threads);
-                }
-            }
-            chosen.push(FlashDecodeBlock {
-                max_length: length,
-                block: best.1,
-                threads: best.2,
-            });
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
-        self.tuning.selection.borrow_mut().flash_decode_blocks = chosen;
-        Ok(())
     }
 }
 

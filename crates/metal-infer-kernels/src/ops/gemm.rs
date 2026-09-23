@@ -56,21 +56,14 @@ impl KernelBatch<'_> {
                 size(checked_mul(groups, threads, "matvec grid")?, 1, 1),
                 size(threads, 1, 1),
             )?;
-        } else if m4
-            && m % 32 == 0
-            && n % 32 == 0
-            && k % 32 == 0
-            && m >= 128
-            && n >= 256
-            && k >= 256
-        {
+        } else if m4 && n % 32 == 0 && k % 32 == 0 && m >= 128 && n >= 256 && k >= 256 {
             self.dispatch(
                 "matmul_simd_db_f16",
                 &[input, weight, &out],
                 &params,
                 size(
                     checked_mul(
-                        checked_mul(n / 32, m / 32, "simd matmul groups")?,
+                        checked_mul(n / 32, m.div_ceil(32), "simd matmul groups")?,
                         128,
                         "simd matmul grid",
                     )?,

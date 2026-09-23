@@ -46,6 +46,8 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(default)]
     stop: Option<StopSequences>,
+    #[serde(default)]
+    ignore_eos: bool,
 }
 
 #[derive(Deserialize)]
@@ -204,7 +206,11 @@ fn chat_completion(
         top_p: request.top_p,
         top_k: request.top_k,
         seed: request.seed,
-        stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
+        stop_token_ids: if request.ignore_eos {
+            Vec::new()
+        } else {
+            state.tokenizer.eos_token_ids().to_vec()
+        },
     };
     let id = completion_id();
     if request.stream {
@@ -350,7 +356,12 @@ fn stream_completion(
                 "index": 0,
                 "delta": {},
                 "finish_reason": if generated.len() == options.max_tokens { "length" } else { "stop" }
-            }]
+            }],
+            "usage": {
+                "prompt_tokens": prompt.len(),
+                "completion_tokens": generated.len(),
+                "total_tokens": prompt.len() + generated.len()
+            }
         }),
     )?;
     stream.write_all(b"data: [DONE]\n\n")?;

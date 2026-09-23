@@ -43,7 +43,7 @@ kernel void matmul_simd_db_f16(
   threadgroup half x_tile[2][tile_m * stride];
   threadgroup half weight_tile[2][tile_n * stride];
 
-  uint m_tiles = p.m / tile_m;
+  uint m_tiles = (p.m + tile_m - 1) / tile_m;
   uint n_tiles = p.n / tile_n;
   uint stripe = group / (swizzle_m * n_tiles);
   uint first_m = stripe * swizzle_m;
@@ -55,6 +55,7 @@ kernel void matmul_simd_db_f16(
   uint simd_column = (simdgroup_index % 2) * 16;
   uint load_row = thread_index / 4;
   uint load_column = (thread_index % 4) * 8;
+  bool load_in_rows = output_row + load_row < p.m;
 
   simdgroup_float8x8 c00 = make_filled_simdgroup_matrix<float, 8>(0.0f);
   simdgroup_float8x8 c01 = make_filled_simdgroup_matrix<float, 8>(0.0f);
@@ -66,8 +67,9 @@ kernel void matmul_simd_db_f16(
     uint column = load_column + part * 4;
     *reinterpret_cast<threadgroup half4 *>(x_tile[0] + load_row * stride +
                                            column) =
-        *reinterpret_cast<device const half4 *>(
-            x + (output_row + load_row) * p.k + column);
+        load_in_rows ? *reinterpret_cast<device const half4 *>(
+                           x + (output_row + load_row) * p.k + column)
+                     : half4(0.0h);
     *reinterpret_cast<threadgroup half4 *>(weight_tile[0] + load_row * stride +
                                            column) =
         *reinterpret_cast<device const half4 *>(
@@ -83,8 +85,10 @@ kernel void matmul_simd_db_f16(
         uint column = load_column + part * 4;
         *reinterpret_cast<threadgroup half4 *>(x_tile[next] +
                                                load_row * stride + column) =
-            *reinterpret_cast<device const half4 *>(
-                x + (output_row + load_row) * p.k + base + tile_k + column);
+            load_in_rows ? *reinterpret_cast<device const half4 *>(
+                               x + (output_row + load_row) * p.k + base +
+                               tile_k + column)
+                         : half4(0.0h);
         *reinterpret_cast<threadgroup half4 *>(weight_tile[next] +
                                                load_row * stride + column) =
             *reinterpret_cast<device const half4 *>(
@@ -116,14 +120,19 @@ kernel void matmul_simd_db_f16(
   ushort quad = simd_lane / 4;
   ushort matrix_row = (quad & 4) + (simd_lane / 2) % 4;
   ushort matrix_column = (quad & 2) * 2 + (simd_lane % 2) * 2;
-  device half *destination = out + (output_row + simd_row + matrix_row) * p.n +
-                             output_column + simd_column + matrix_column;
-  destination[0] = half(c00.thread_elements()[0]);
-  destination[1] = half(c00.thread_elements()[1]);
-  destination[8] = half(c01.thread_elements()[0]);
-  destination[9] = half(c01.thread_elements()[1]);
-  destination[8 * p.n] = half(c10.thread_elements()[0]);
-  destination[8 * p.n + 1] = half(c10.thread_elements()[1]);
-  destination[8 * p.n + 8] = half(c11.thread_elements()[0]);
-  destination[8 * p.n + 9] = half(c11.thread_elements()[1]);
+  uint row = output_row + simd_row + matrix_row;
+  device half *destination =
+      out + row * p.n + output_column + simd_column + matrix_column;
+  if (row < p.m) {
+    destination[0] = half(c00.thread_elements()[0]);
+    destination[1] = half(c00.thread_elements()[1]);
+    destination[8] = half(c01.thread_elements()[0]);
+    destination[9] = half(c01.thread_elements()[1]);
+  }
+  if (row + 8 < p.m) {
+    destination[8 * p.n] = half(c10.thread_elements()[0]);
+    destination[8 * p.n + 1] = half(c10.thread_elements()[1]);
+    destination[8 * p.n + 8] = half(c11.thread_elements()[0]);
+    destination[8 * p.n + 9] = half(c11.thread_elements()[1]);
+  }
 }

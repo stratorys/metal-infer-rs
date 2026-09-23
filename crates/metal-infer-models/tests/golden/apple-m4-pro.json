@@ -2780,7 +2780,7 @@
       "attention_flash_prefill_f16": 28,
       "copy_kv_f16": 28,
       "embedding_f16": 1,
-      "matmul_f16": 196,
+      "matmul_simd_db_f16": 196,
       "matvec_vocab_f16": 1,
       "qk_norm_rope_cache_f16": 28,
       "rms_norm_f16": 29,

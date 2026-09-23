@@ -11,16 +11,12 @@ built directly on `objc2-metal` and native Metal Shading Language kernels.
 - RMSNorm, RoPE, GQA, online causal attention, and SwiGLU;
 - dense Qwen3 blocks, KV cache, prefill, decode, greedy and sampled generation;
 - an OpenAI-compatible chat completions server with SSE streaming;
-- Rust benchmarks, MLX comparisons through `uv`, and llama.cpp commands;
+- one benchmark script comparing engines with the standard serving metrics;
 - GPU path currently validated on an Apple M4 Pro.
 
 ## Quick start
 
 ```sh
-# Verify Metal without downloading a model
-cargo run --release --bin metal-infer-bench -- \
-  kernel --m 64 --n 128 --k 128 --iterations 3
-
 # Download Qwen3-0.6B
 uvx --from huggingface-hub hf download Qwen/Qwen3-0.6B \
   --local-dir ./models/Qwen3-0.6B
@@ -54,8 +50,7 @@ Face repository ID resolves to its locally cached snapshot; use
 - `metal-infer-models`: weight loading and the Qwen3 implementation;
 - `metal-infer-cli`: text generation and benchmarks.
 
-See [benchmarks](benchmarks/README.md) for the reproducible MLX and llama.cpp
-comparison methodology and results.
+See [benchmarks](benchmarks/README.md) for the comparison protocol and metrics.
 
 ## Validation
 

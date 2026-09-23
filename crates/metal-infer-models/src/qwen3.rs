@@ -4,7 +4,7 @@ use std::path::Path;
 use half::f16;
 
 use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, DecodeGemvConfig, KernelBatch, Kernels, QkNormRopeCacheConfig,
+    AttentionConfig, AttentionKind, KernelBatch, Kernels, QkNormRopeCacheConfig,
 };
 use metal_infer_planner::{Fusions, Plan};
 use metal_infer_runtime::{DType, DispatchStats, MetalContext, PendingBatch, Tensor};
@@ -204,11 +204,11 @@ impl Qwen3Model {
             &[config.vocab_size, config.hidden_size],
             "LM head",
         )?;
-        let _ = kernels.tune_flash_decode(
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-        );
+        kernels.select(
+            &kernels.device_selection(config.num_attention_heads, config.num_key_value_heads),
+        )?;
+        let decode_norm =
+            context.device_name() == "Apple M4 Pro" && config.hidden_size.is_multiple_of(256);
         let mut model = Self {
             context: context.clone(),
             kernels: kernels.clone(),
@@ -217,15 +217,12 @@ impl Qwen3Model {
             layers,
             final_norm,
             lm_head,
-            fusions: initial.fusions,
+            fusions: Fusions {
+                decode_norm,
+                ..initial.fusions
+            },
             attention: initial.attention,
         };
-        model.tune_fused_decode_norm()?;
-        if kernels.context().device_name() == "Apple M4 Pro" {
-            let mut selection = kernels.selection();
-            selection.decode_gemv = Some(DecodeGemvConfig::Tuned);
-            kernels.select(&selection)?;
-        }
         let mut plan = model.plan();
         for assignment in overrides {
             plan.apply_override(assignment)?;
@@ -236,49 +233,6 @@ impl Qwen3Model {
 
     pub const fn config(&self) -> &Qwen3Config {
         &self.config
-    }
-
-    fn tune_fused_decode_norm(&mut self) -> Result<(), ModelError> {
-        if !self.context.device_name().contains("M4 Pro")
-            || !self.config.hidden_size.is_multiple_of(256)
-        {
-            return Ok(());
-        }
-        let saved_fusions = self.fusions;
-        self.fusions = with_all_fusions(saved_fusions);
-        let mut cache = KvCache::new(&self.context, &self.config, 516)?;
-        self.prefill(&vec![1; 512], &mut cache)?;
-        let mut normal = [0_u128; 3];
-        let mut fused = [0_u128; 3];
-        for index in 0..3 {
-            for enabled in if index % 2 == 0 {
-                [false, true]
-            } else {
-                [true, false]
-            } {
-                self.fusions.decode_norm = enabled;
-                let mut trial_cache = cache.clone();
-                let (_, stats) = self.decode_with_stats(1, &mut trial_cache)?;
-                if enabled {
-                    fused
-                        .get_mut(index)
-                        .expect("three tuning samples")
-                        .clone_from(&stats.gpu_time.as_nanos());
-                } else {
-                    normal
-                        .get_mut(index)
-                        .expect("three tuning samples")
-                        .clone_from(&stats.gpu_time.as_nanos());
-                }
-            }
-        }
-        normal.sort_unstable();
-        fused.sort_unstable();
-        self.fusions = Fusions {
-            decode_norm: fused[1].saturating_mul(100) < normal[1].saturating_mul(99),
-            ..saved_fusions
-        };
-        Ok(())
     }
 
     pub fn plan(&self) -> Plan {
@@ -747,16 +701,6 @@ impl Qwen3Model {
         let activated = batch.swiglu(&gate, &up)?;
         let down = batch.matmul(&activated, &layer.mlp.down)?;
         batch.add(&residual, &down).map_err(Into::into)
-    }
-}
-
-const fn with_all_fusions(fusions: Fusions) -> Fusions {
-    Fusions {
-        qkv: true,
-        gate_up: true,
-        add_rms_norm: true,
-        qk_rope_cache: true,
-        decode_norm: fusions.decode_norm,
     }
 }
 

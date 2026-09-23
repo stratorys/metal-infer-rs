@@ -95,7 +95,13 @@ fn matmul_matches_cpu() -> Result<(), CoreError> {
 fn matmul_variants_match_cpu_reference() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
-    for (m, n, k) in [(128, 256, 256), (32, 32, 32), (31, 35, 37)] {
+    for (m, n, k) in [
+        (128, 256, 256),
+        (129, 256, 256),
+        (511, 256, 256),
+        (32, 32, 32),
+        (31, 35, 37),
+    ] {
         let input_values: Vec<f32> = (0..m * k)
             .map(|index| (index % 19) as f32 / 19.0 - 0.5)
             .collect();

@@ -1,0 +1,6 @@
+{
+  "venvPath": "benchmarks",
+  "venv": ".venv",
+  "extraPaths": ["benchmarks"],
+  "typeCheckingMode": "standard"
+}

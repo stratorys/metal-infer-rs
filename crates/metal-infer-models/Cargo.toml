@@ -6,7 +6,8 @@ license.workspace = true
 
 [dependencies]
 half.workspace = true
-metal-infer-core = { path = "../metal-infer-core" }
+metal-infer-kernels = { path = "../metal-infer-kernels" }
+metal-infer-planner = { path = "../metal-infer-planner" }
 safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true

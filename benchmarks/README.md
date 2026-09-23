@@ -1,240 +1,232 @@
 # Benchmarks
 
-The benchmark suite compares `metal-infer` with native MLX and, for complete
-model runs, llama.cpp. It uses release builds, explicit GPU synchronization,
-warm-up runs, and identical FP16 matrix shapes.
-
-## Run the kernel comparison
+One script, one protocol, the same client for every engine:
 
 ```sh
-uv run benchmarks/compare.py kernels
+uv run --project benchmarks benchmarks/bench.py --model Qwen/Qwen3-0.6B --suite showcase --gguf ~/.cache/metal-infer/gguf/Qwen3-0.6B-F16.gguf
+uv run --project benchmarks benchmarks/bench.py --model Qwen/Qwen3-0.6B
+uv run --project benchmarks benchmarks/bench.py --model Qwen/Qwen3-0.6B --workload sharegpt --mode server
 ```
 
-The cases, warm-up count, and measured iterations are defined in `suite.json`.
-They include `m=1` decode projections for Qwen3 hidden, MLP, and vocabulary
-dimensions, followed by larger prefill-oriented matrix multiplications.
-The command creates a run directory under `results/<machine>/` containing raw
-JSON, an SVG graph, and a standalone README. Commands and their complete output
-are displayed as they run; each step ends with its elapsed time and primary
-metrics.
+The script builds the release binaries, then runs each engine alone. It creates
+`results/<chip>/<date>-<commit>/` as soon as it starts, with:
 
-For dispatch tuning, build the release binary and run repeated, alternating
-`reference-msl`, `native-msl`, and `auto` measurements. This reports median
-GPU and wall latency across rounds and can save every raw sample:
+- `run.json`: every parameter and the full list of planned measurements;
+- `progress.jsonl`: one line per finished measurement, appended as the run goes;
+- `results.json`, `results.svg` and `README.md`: the aggregates, the chart, and
+  the tables with every parameter and the exact commands. They are rewritten
+  after every measurement, with an "in progress" banner until the run ends.
+
+Each finished measurement prints one line, for example
+`[12/60] round 2 · mlx · ctx 8192 · pp 3,950 tok/s · tg 98.4 tok/s · TTFT 2.07 s · left ~14 min`.
+
+If a run stops (Ctrl-C, crash, error), `--resume results/<chip>/<run>` continues
+it and skips the measurements already saved. A finished run rebuilds the
+[results index](results/README.md) and `results/<chip>/latest-<model>.svg`.
+Unfinished runs are never listed.
+
+`--render results.json` writes the report of an existing results file, older
+formats included, without measuring.
+
+The code lives in `bench.py` (command line and run loop) and `benchlib/`
+(one module per concern: engines, client, workloads, calibration, statistics,
+progress, reports, chart).
+
+## Latest results
+
+![Latest Apple M4 Pro results for Qwen3-0.6B](results/apple-m4-pro/latest-qwen-qwen3-0-6b.svg)
+
+Reproduce:
 
 ```sh
-cargo build --release --bin metal-infer-bench
-uv run benchmarks/tune.py --rounds 3 --iterations 100 --warmup 10 \
-  --output /tmp/metal-infer-tuning.json
+uv run --project benchmarks benchmarks/bench.py --model Qwen/Qwen3-0.6B --suite showcase --gguf ~/.cache/metal-infer/gguf/Qwen3-0.6B-F16.gguf
 ```
 
-Pass `--model-config /path/to/Qwen3-0.6B` (repeatable for other Qwen3 model
-directories) to derive GEMM and GEMV shapes from each `config.json`.
-`--prompt-lengths 32 128 512` selects prefill M values.
+All runs: [results index](results/README.md).
 
-For decode GEMV bandwidth, rotate distinct FP16 weight buffers in one command
-buffer. Choose a copy count whose `working_set` in the benchmark name exceeds
-the cache size; for a 1024×1024 matrix, 129 copies occupy 258 MiB:
+## Showcase suite
+
+`--suite showcase` is a three-engine long-context preset:
+
+```
+--workload context --prompt 512 2048 8192 32000 --generate 128
+--engines metal-infer mlx llama.cpp --rounds 5 --requests 3 --mode server
+```
+
+Any option given explicitly overrides the suite, for example
+`--suite showcase --prompt 512 8192 --rounds 1` for a quick check.
+
+Every engine runs its own OpenAI-compatible server and is measured by the same
+client, one request at a time. Prompts are calibrated to the same token count
+per server, but their exact text may differ. For each engine and context length,
+the report gives the median of the per-round medians of observed TTFT and TPOT
+with a 95 % bootstrap interval (2,000 draws, fixed seed). The verdict against the first engine of `--engines` is
+"faster" or "slower" only when the two intervals do not overlap, "tie (noise)"
+otherwise.
+
+## Workloads
+
+Offline (`--mode offline`, diagnostic) runs each engine's own benchmark tool at
+every `--prompt` length: `metal-infer-bench`, `mlx_lm.benchmark` and
+`llama-bench` (prefill of N tokens, then decode after N tokens of context).
+The tools do not time exactly the same things, so the published numbers come
+from the server workloads.
+
+Server (`--mode server`) starts each engine's OpenAI-compatible server and sends
+streamed chat completions:
+
+| Workload | Requests | Load |
+|---|---|---|
+| `context` | ShareGPT text cut to exactly each `--prompt` length, `--generate` output tokens | `--requests` requests one at a time, per context length |
+| `synthetic` | fixed English text cut to exactly the first `--prompt` length, `--generate` output tokens | `--requests` per level at `--concurrency 1 2 4 8` |
+| `sharegpt` | ShareGPT V3 conversations: first human turn as prompt, first assistant turn length as output length | `--num-prompts` requests per rate, Poisson arrivals at `--request-rate 1 2 4 inf` |
+
+The ShareGPT file is downloaded once to `~/.cache/metal-infer/datasets/` and
+never committed. The `context` text is every ShareGPT turn in file order, joined
+by blank lines and cut to its first 400,000 characters.
+
+The `sharegpt` sampling is the one of `vllm bench serve --dataset-name
+sharegpt`: conversations with at least two turns, shuffled with `--seed`,
+prompt 4–1024 tokens, output at least 4, prompt + output at most 2048. With the
+same `--num-prompts` and `--seed`, `vllm bench serve` replays the same requests
+against any OpenAI-compatible server. Each run README prints the exact command:
 
 ```sh
-target/release/metal-infer-bench kernel --m 1 --n 1024 --k 1024 \
-  --rotate 129 --warmup 3 --iterations 10
+vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
+  --base-url http://127.0.0.1:8931 --model Qwen/Qwen3-0.6B --tokenizer Qwen/Qwen3-0.6B \
+  --dataset-name sharegpt --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 100 --seed 0 --request-rate 2 --ignore-eos
 ```
 
-The rotated report divides wall and GPU batch durations by the copy count and
-reports effective GPU weight bandwidth in decimal GB/s. `--rows 0|1|2|4|8`
-selects a single-matrix GEMV row count on M4 Pro; `--split-k 2|4|8` selects a
-two-pass split-K variant. These options require `--matmul-backend auto`. The
-ordinary kernel benchmark retains its original single-matrix TFLOP/s metric.
-`--rows 1 --half8` selects the 16-byte load variant of the one-row kernel.
+### Exact prompt lengths
 
-The same rotation is available for fused decode projections. For Qwen3-0.6B,
-QKV uses widths 2048, 1024, 1024 and gate/up uses 3072, 3072. The commands below
-use more than 256 MiB of distinct weights and report both fused and unfused GPU
-times per set of projections:
+For the `context` and `synthetic` workloads, the prompt is calibrated against
+each server: probe requests with one output token read `usage.prompt_tokens`,
+and a search on the text length finds the prefix that gives exactly N prompt
+tokens with that engine's own tokenizer and chat template. Any measured request
+that reports another count stops the run. The report shows the calibrated and
+observed counts for each engine.
+
+### Same work for every engine
+
+Every request is greedy, uses `ignore_eos` and sets `max_tokens` to the output
+length. A unique, fixed-length prefix (`Request 000001.`) defeats prompt caches.
+Engine-specific settings:
+
+- `mlx_lm.server` has no `ignore_eos`: the model's end-of-sequence ids (from
+  `generation_config.json`) get `logit_bias` −100. It runs with
+  `--prompt-cache-size 1` so that long prompts do not fill memory.
+- `llama-server` runs with one slot (`-np 1`), full GPU offload (`-ngl 99`),
+  and requests set `cache_prompt: false`.
+- metal-infer and llama.cpp get a context of the longest prompt + output + 64.
+
+Current metal-infer limits, visible in the server results: requests are
+served one at a time (no batching), and the KV cache is rebuilt for every
+request (no prefix cache).
+
+## llama.cpp and the F16 GGUF
 
 ```sh
-target/release/metal-infer-bench fusion --kind qkv --k 1024 \
-  --query-heads 16 --kv-heads 8 --head-dim 128 \
-  --rotate 33 --rows 2 --warmup 5 --iterations 30 --format json
-target/release/metal-infer-bench fusion --kind gate-up --k 1024 \
-  --intermediate 3072 --rotate 22 --rows 2 \
-  --warmup 5 --iterations 30 --format json
+brew install llama.cpp
+llama-server --version
 ```
 
-`--rows 0|2|4|8` selects the fused projection variant. Each iteration dispatches
-all copies in one command buffer. The `throughput` field divides the total
-projection weight bytes by the fused GPU time; `comparison` gives both paths.
-
-For automation, suppress child output and progress messages with:
+There is no official F16 GGUF of Qwen3 (`Qwen/Qwen3-0.6B-GGUF` has Q8_0 only).
+Convert the same Hugging Face weights that metal-infer loads, with the converter
+of the installed llama.cpp build (Homebrew does not ship it):
 
 ```sh
-uv run benchmarks/compare.py --quiet kernels
+build=$(llama-server --version 2>&1 | sed -nE 's/^version: .*build ([0-9]+).*/\1/p; s/^version: ([0-9]+) \(.*/\1/p')
+git clone --depth 1 --branch b$build https://github.com/ggml-org/llama.cpp /tmp/llama.cpp
+mkdir -p ~/.cache/metal-infer/gguf
+uv run --no-project --with torch --with transformers --with sentencepiece --with /tmp/llama.cpp/gguf-py \
+  python /tmp/llama.cpp/convert_hf_to_gguf.py \
+  ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<revision> \
+  --outtype f16 --outfile ~/.cache/metal-infer/gguf/Qwen3-0.6B-F16.gguf
 ```
 
-## Run the model comparison
+Pass the file with `--gguf`; its path and sha256 are recorded in each run.
+Lighter alternative: download `Qwen3-0.6B-BF16.gguf` from
+`unsloth/Qwen3-0.6B-GGUF` at a fixed revision, then
+`llama-quantize Qwen3-0.6B-BF16.gguf Qwen3-0.6B-F16.gguf F16`.
+
+## Protocol
+
+- One engine at a time. Its server or benchmark process is started alone,
+  measured, stopped, and followed by a cooldown (30 s by default). The script
+  refuses to start while another engine process runs or the port is busy.
+  Server output goes to `server-<engine>.log` in the run directory.
+- Rounds alternate the engine order (A, B, C then C, B, A) so no engine always
+  runs on a cooler or warmer machine.
+- Same model family, with the actual weight format recorded for each engine;
+  greedy decoding and fixed output length;
+  outputs that stop early are flagged and failed requests are counted.
+- Recorded with each run: chip, macOS, memory, power source, thermal state,
+  metal-infer commit (and whether the tree is dirty), MLX and llama.cpp
+  versions, GGUF sha256.
+- Run on AC power, with other applications closed.
+
+## Metrics
+
+The server client uses observed streamed output and server-reported token usage.
+Its values must not be treated as bit-for-bit identical to a separate run of
+`vllm bench serve`; offline measurements use each engine's own benchmark tool.
+
+Offline:
+
+| Metric | Definition |
+|---|---|
+| ppN | prompt tokens per second for an N-token prefill (llama-bench format) |
+| tgN | generated tokens per second for N tokens after the prefill |
+
+Server:
+
+| Metric | Definition |
+|---|---|
+| TTFT | request sent → first output-bearing chunk received (content or reasoning) |
+| TPOT | (E2EL − TTFT) / (output tokens − 1) |
+| ITL | time between two consecutive output-bearing chunks |
+| E2EL | request sent → last output-bearing chunk received |
+| req/s, output tok/s | completed requests or output tokens / wall time of the level |
+| Goodput | completed requests per second with TTFT ≤ `--slo-ttft-ms` (1000) and TPOT ≤ `--slo-tpot-ms` (50) |
+
+Every latency is reported as p50, p90, p99, mean and standard deviation, and
+the main metrics also as a median with a 95 % bootstrap interval over rounds.
+
+`--energy` adds joules per output token: `powermetrics` combined CPU + GPU +
+ANE power during the measurement, minus the idle power measured first. It needs
+sudo; run `sudo -v` just before.
+
+## Options
+
+| Option | Use |
+|---|---|
+| `--suite showcase` | three-engine long-context preset; explicit options win |
+| `--engines metal-infer mlx llama.cpp` | engines to compare; the first one is the verdict reference |
+| `--gguf PATH_OR_REPO` | local BF16/F16 file or cached `unsloth/Qwen3-0.6B-GGUF` for llama.cpp |
+| `--candidate KEY=VALUE` | add a metal-infer variant with a plan override, for A/B |
+| `--mode offline\|server\|all` | which measurements to run |
+| `--workload context\|synthetic\|sharegpt` | server requests |
+| `--prompt 512 2048 --generate 128` | prompt or context lengths and generated tokens |
+| `--num-prompts`, `--request-rate`, `--seed` | ShareGPT sample and arrivals |
+| `--slo-ttft-ms`, `--slo-tpot-ms` | goodput limits |
+| `--rounds`, `--iterations`, `--requests`, `--concurrency`, `--cooldown` | repetitions |
+| `--peak-bandwidth`, `--peak-tflops` | legacy inputs; MBU/MFU are no longer reported |
+| `--resume RUN_DIRECTORY` | continue an interrupted run |
+| `--render results.json` | rewrite the report of an existing run, without measuring |
+
+A/B example (same machine state, alternated):
 
 ```sh
-uv run benchmarks/compare.py model \
-  --metal-model ./models/Qwen3-0.6B \
-  --mlx-model ./models/Qwen3-0.6B
+uv run --project benchmarks benchmarks/bench.py --model Qwen/Qwen3-0.6B --engines metal-infer \
+  --candidate fusion.qkv=off --mode offline
 ```
 
-Add llama.cpp when an FP16 GGUF converted from the same checkpoint is
-available:
+## Kernel profile
 
 ```sh
-uv run benchmarks/compare.py model \
-  --metal-model ./models/Qwen3-0.6B \
-  --mlx-model ./models/Qwen3-0.6B \
-  --gguf ./models/Qwen3-0.6B-f16.gguf \
-  --llama-bench /path/to/llama-bench
+target/release/metal-infer-bench --model Qwen/Qwen3-0.6B --profile
 ```
 
-Choose an explicit destination when needed:
-
-```sh
-uv run benchmarks/compare.py \
-  --result-dir benchmarks/results/apple-m4-pro/manual-run \
-  kernels
-```
-
-Model results report prefill and decode separately. Tokenization and sampling
-are excluded. Comparisons are meaningful only when the checkpoint, precision,
-prompt length, generation length, and power conditions match. llama.cpp is not
-included in the kernel table because `llama-bench` measures model execution,
-not an isolated generic matrix multiplication.
-
-Use `--prompt` and `--generate` to override the model suite's default lengths.
-Repeat with `--matmul-backend reference-msl` and `--matmul-backend auto` to
-measure the full-model effect of the dispatch selection.
-
-The model benchmark starts with every optional fusion disabled. Enable one or
-more families explicitly with `--fuse-qkv`, `--fuse-gate-up`,
-`--fuse-add-rms-norm`, and `--fuse-qk-rope-cache`. These flags are available on
-both `metal-infer-bench model` and `benchmarks/compare.py model`; the inference
-CLI is unchanged.
-
-On Apple M4 Pro, Qwen3 selects the measured decode GEMV row counts by default
-for the Qwen3-0.6B projection shapes. The model benchmark reports
-`decode_gemv_config: "tuned"` in JSON. To compare the previous and current
-selection with the same binary and workload, run the model benchmark twice,
-changing only `--gemv-config`:
-
-```sh
-for config in baseline tuned; do
-  target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
-    --prompt 512 --generate 128 --warmup 1 --iterations 5 \
-    --fuse-qkv --fuse-gate-up --fuse-add-rms-norm --fuse-qk-rope-cache \
-    --gemv-config "$config" --format json
-done
-```
-
-`benchmarks/compare.py model` uses the tuned default on M4 Pro. Its MLX-LM
-result is indicative: the two existing model benchmarks use different token
-sequences, despite matching the checkpoint and prompt/decode lengths.
-
-To test whether reusing the normalized gate/up input within each threadgroup
-improves the fused decode kernel, compare the model benchmark with and without
-`--shared-gate-up-input`. Keep all other arguments the same, including
-`--fuse-gate-up --fuse-add-rms-norm`. The existing kernel remains the default.
-The JSON field `shared_gate_up_input` records which path ran. For example:
-
-```sh
-target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
-  --prompt 512 --generate 128 --warmup 1 --iterations 5 \
-  --fuse-qkv --fuse-gate-up --fuse-add-rms-norm --fuse-qk-rope-cache \
-  --shared-gate-up-input --format json
-```
-
-The same flag is available on `benchmarks/compare.py model` when comparing the
-experimental path with MLX-LM. The variant requires Qwen3-0.6B dimensions and
-auto matmul on Apple M4 Pro. Use unprofiled runs for throughput comparisons.
-
-For small differences, `model_ab.py` repeats the complete model benchmark in
-alternating A/B and B/A order. It builds the release binary once, runs both
-variants with the same four fusions and workload, and reports the median of
-paired decode differences. Save the commands and raw benchmark JSON with
-`--output`:
-
-```sh
-uv run python benchmarks/model_ab.py --model ./models/Qwen3-0.6B \
-  --candidate-args=--shared-gate-up-input --rounds 4 \
-  --output /tmp/qwen3-model-ab.json
-```
-
-`--baseline-args` defaults to an empty string. Both variant arguments are
-split as shell words without invoking a shell. For example, compare two GEMV
-configurations with `--baseline-args='--gemv-config baseline'` and
-`--candidate-args='--gemv-config tuned'`. Pass `--skip-build` when the release
-binary has already been built.
-
-Choose the matrix implementation with `--matmul-backend auto`,
-`--matmul-backend reference-msl`, `--matmul-backend native-msl`, or
-`--matmul-backend mps`. The comparison pins
-`mlx-lm==0.31.3` and `mlx==0.32.2` so successive reports use a stable baseline.
-
-To diagnose the GPU cost by kernel, run the model benchmark with
-`--profile-kernels` after building the release binary:
-
-```sh
-target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
-  --prompt 512 --generate 128 --iterations 1 --warmup 1 \
-  --fuse-qkv --fuse-gate-up --matmul-backend auto \
-  --profile-kernels --format json
-```
-
-The optional `kernel_profile` field groups dispatch counts and GPU timestamp
-durations by kernel, separately for prefill and decode. Warm-up runs are excluded.
-The profiler creates a separate compute pass for each dispatch, so its latency and tokens/s must not be used
-for performance comparisons. Compare throughput with a separate run that omits
-`--profile-kernels`. `unattributed_ms` is the phase GPU time minus the sum of
-timed Metal compute dispatches; it includes work outside those dispatches and
-measurement gaps.
-
-## Run the fusion microbenchmarks
-
-Compare each fused kernel with its individual operations using Qwen3-0.6B
-dimensions:
-
-```sh
-target/release/metal-infer-bench fusion --kind qkv
-target/release/metal-infer-bench fusion --kind gate-up
-target/release/metal-infer-bench fusion --kind add-rms-norm
-target/release/metal-infer-bench fusion --kind qk-rope-cache
-```
-
-On M4 Pro, `--matmul-backend auto` selects the tuned fused decode GEMV kernels
-when `k` is divisible by 256. Use `--matmul-backend native-msl` to select them
-explicitly.
-
-Projection benchmarks default to the vectorized `K=1024` path. Pass `--k 1023`
-to QKV or gate/up to measure the scalar fallback. Reports contain separate GPU
-and wall-clock distributions plus the fused/unfused speedup.
-
-Measure decode attention independently at the target cache length with:
-
-```sh
-target/release/metal-infer-bench attention --tokens 1 --length 512
-```
-
-For prefill, run `attention --tokens 512 --length 512`; `--kind compare` also
-reports flash-prefill for multiple query tokens. The model selects flash-prefill
-from 32 query tokens onward, flash-decode for single-token attention from 256
-active KV tokens onward when there are two query heads per KV head, and split-KV
-for shorter decode contexts. QKV and QK+RoPE+cache are the default model
-fusions; benchmark flags still select an explicit fusion set so unfused
-baselines remain reproducible.
-
-## Results
-
-See the [results index](results/README.md). Each entry contains its exact
-values and graph. Lower latency is better; higher TFLOP/s and tokens/s are
-better.
-
-These numbers are measurements, not correctness tests. Run the GPU test suite
-before collecting them:
-
-```sh
-cargo test -p metal-infer-core --test gpu -- --ignored
-```
+prints the GPU time of each kernel per iteration. Profiling uses separate
+compute passes, so its timings are diagnostic only.

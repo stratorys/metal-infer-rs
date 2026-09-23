@@ -1,17 +1,18 @@
-mod server;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 
-use std::path::PathBuf;
-
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use metal_infer_cli::{CliError, resolve_model_path};
-use metal_infer_core::{AttentionKind, MetalContext};
-use metal_infer_models::{GenerationOptions, KvCache, ModelTokenizer, Qwen3Model};
-
-use crate::server::{ServerOptions, serve};
+use clap::{Args, Parser, Subcommand};
+use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model};
+use metal_infer_kernels::MetalContext;
+use metal_infer_models::{GenerationOptions, KvCache, ModelSource, ModelTokenizer};
+use metal_infer_runtime::{ServerOptions, WorkerOptions, serve};
 
 #[derive(Parser)]
 #[command(name = "metal-infer", about = "Qwen3 inference on Apple Metal")]
 struct Arguments {
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Command,
 }
@@ -40,8 +41,8 @@ struct GenerateArguments {
     top_k: usize,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    #[arg(long, value_enum, default_value_t = Attention::Tiled)]
-    attention: Attention,
+    #[arg(long = "with", value_name = "KEY=VALUE")]
+    with: Vec<String>,
 }
 
 #[derive(Args)]
@@ -54,55 +55,86 @@ struct ServeArguments {
     bind: String,
     #[arg(long, default_value_t = 8192)]
     context: usize,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum Attention {
-    Reference,
-    Tiled,
-    FlashPrefill,
+    #[arg(long, default_value = "4")]
+    max_active_requests: NonZeroUsize,
+    #[arg(long = "with", value_name = "KEY=VALUE")]
+    with: Vec<String>,
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let arguments = Arguments::parse();
+    if let Err(error) = init_tracing(arguments.log_format) {
         eprintln!("{error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = run(arguments) {
+        tracing::error!(message = "Command failed.", %error);
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), CliError> {
-    match Arguments::parse().command {
+fn run(arguments: Arguments) -> Result<(), CliError> {
+    match arguments.command {
         Command::Generate(arguments) => generate(arguments),
-        Command::Serve(arguments) => serve(ServerOptions {
-            model: arguments.model,
-            model_id: arguments.model_id,
-            bind: arguments.bind,
-            context: arguments.context,
-        }),
+        Command::Serve(arguments) => serve_command(arguments),
     }
 }
 
-fn generate(arguments: GenerateArguments) -> Result<(), CliError> {
-    let model_path = resolve_model_path(&arguments.model)?;
+fn serve_command(arguments: ServeArguments) -> Result<(), CliError> {
+    if arguments.with.iter().any(|value| value == "list") {
+        return list_plan(&arguments.model, &arguments.with);
+    }
+    serve(ServerOptions {
+        worker: WorkerOptions {
+            model: arguments.model,
+            model_id: arguments.model_id,
+            context: arguments.context,
+            max_active_requests: arguments.max_active_requests,
+            with: arguments.with,
+        },
+        bind: arguments.bind,
+    })
+    .map_err(CliError::from)
+}
+
+fn list_plan(
+    model: &Path,
+    with: &[String],
+) -> Result<(), CliError> {
+    let model_path = ModelSource::resolve(model)?.directory;
     let context = MetalContext::new()?;
-    eprintln!("Metal device: {}", context.device_name());
-    eprintln!("Loading {}", model_path.display());
+    load_model(&model_path, &context, with).map(|_| ())
+}
+
+fn generate(arguments: GenerateArguments) -> Result<(), CliError> {
+    let started = std::time::Instant::now();
+    let span = tracing::info_span!(
+        "generate",
+        max_tokens = arguments.max_tokens,
+        context = arguments.context
+    );
+    let _guard = span.enter();
+    let model_path = ModelSource::resolve(&arguments.model)?.directory;
+    let context = MetalContext::new()?;
+    tracing::info!(device = %context.device_name(), "Metal device ready");
+    tracing::info!(path = %model_path.display(), "loading model");
+    let load_started = std::time::Instant::now();
     let tokenizer = ModelTokenizer::from_directory(&model_path)?;
     let prompt = tokenizer.encode(&arguments.prompt)?;
-    let mut model = Qwen3Model::load(&model_path, &context)?;
-    model.set_attention_kind(match arguments.attention {
-        Attention::Reference => AttentionKind::Reference,
-        Attention::Tiled => AttentionKind::Tiled,
-        Attention::FlashPrefill => AttentionKind::FlashPrefill,
-    });
+    let Some(model) = load_model(&model_path, &context, &arguments.with)? else {
+        return Ok(());
+    };
+    tracing::info!(
+        load_ms = load_started.elapsed().as_secs_f64() * 1000.0,
+        prompt_tokens = prompt.len(),
+        "model loaded"
+    );
     let required = prompt.len().saturating_add(arguments.max_tokens);
     if required > arguments.context {
-        return Err(CliError::InvalidArguments(format!(
-            "prompt + generated tokens ({required}) exceeds context {}",
-            arguments.context
-        )));
+        return Err(CliError::ContextExceeded);
     }
     let mut cache = KvCache::new(&context, model.config(), arguments.context)?;
+    let generation_started = std::time::Instant::now();
     let generated = model.generate_with(
         &prompt,
         &GenerationOptions {
@@ -116,6 +148,13 @@ fn generate(arguments: GenerateArguments) -> Result<(), CliError> {
         &mut cache,
         |_| true,
     )?;
-    print!("{}", tokenizer.decode(&generated)?);
+    tracing::info!(
+        generated_tokens = generated.len(),
+        generation_ms = generation_started.elapsed().as_secs_f64() * 1000.0,
+        total_ms = started.elapsed().as_secs_f64() * 1000.0,
+        allocated_bytes = context.allocated_bytes(),
+        "generation complete"
+    );
+    std::io::stdout().write_all(tokenizer.decode(&generated)?.as_bytes())?;
     Ok(())
 }

@@ -1,4 +1,5 @@
 mod completion;
+mod detokenizer;
 mod engine;
 mod error;
 mod job;
@@ -11,6 +12,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
+pub use crate::worker::detokenizer::Detokenizer;
 use crate::worker::engine::Engine;
 pub use crate::worker::error::{SubmitError, WorkerError};
 pub use crate::worker::job::{Event, FinishReason, Job, JobOptions, Summary};

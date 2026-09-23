@@ -6,11 +6,13 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::Span;
 
+use crate::worker::detokenizer::Detokenizer;
 use crate::worker::engine::Engine;
 use crate::worker::error::WorkerError;
 use crate::worker::job::{Event, FinishReason, Job, JobOptions, Summary};
 use crate::worker::text::{
-    Channels, final_channels, safe_stream_boundary, stream_channels, truncate_stop,
+    Channels, ThinkState, advance_think, final_channels, find_stop_in_tail, safe_stream_boundary,
+    stream_channels, truncate_stop,
 };
 
 pub struct Completion {
@@ -25,11 +27,23 @@ pub struct Completion {
     stop: Vec<String>,
     cache: KvCache,
     sampler: TokenSampler,
-    generated: Vec<u32>,
+    detokenizer: Detokenizer,
+    stop_at: Option<usize>,
+    think: ThinkState,
     emitted_reasoning: usize,
     emitted_content: usize,
     events: mpsc::Sender<Event>,
     done: bool,
+}
+
+struct Delta {
+    text: String,
+    end: usize,
+}
+
+struct Deltas {
+    reasoning: Option<Delta>,
+    content: Option<Delta>,
 }
 
 struct Prepared {
@@ -67,7 +81,9 @@ impl Completion {
                 stop: options.stop,
                 cache: prepared.cache,
                 sampler: prepared.sampler,
-                generated: Vec::with_capacity(options.max_tokens),
+                detokenizer: Detokenizer::with_capacity(options.max_tokens),
+                stop_at: None,
+                think: ThinkState::Undecided,
                 emitted_reasoning: 0,
                 emitted_content: 0,
                 events,
@@ -87,7 +103,7 @@ impl Completion {
     }
 
     pub fn last_token(&self) -> Option<u32> {
-        self.generated.last().copied()
+        self.detokenizer.last_token()
     }
 
     pub const fn cache_mut(&mut self) -> &mut KvCache {
@@ -165,23 +181,21 @@ impl Completion {
         if self.stop_token_ids.contains(&token) {
             return self.finish(engine);
         }
-        self.generated.push(token);
-        if self.generated.len() == 1 {
+        let delta_bytes = self
+            .detokenizer
+            .push(token, &engine.tokenizer)
+            .map_err(WorkerError::Inference)?;
+        if self.detokenizer.token_count() == 1 {
             self.first_token_ms = Some(milliseconds(self.received.elapsed()));
         }
-        let decoded = engine
-            .tokenizer
-            .decode(&self.generated)
-            .map_err(WorkerError::Inference)?;
-        let stopped = self.stop.iter().any(|stop| decoded.contains(stop.as_str()));
-        let visible = truncate_stop(&decoded, &self.stop);
-        let safe_end = if stopped {
-            visible.len()
-        } else {
-            safe_stream_boundary(visible, &self.stop)
-        };
-        self.emit_channels(stream_channels(visible.get(..safe_end).unwrap_or_default()))?;
-        if stopped || self.generated.len() == self.max_tokens {
+        if delta_bytes > 0 {
+            self.stop_at = self
+                .stop_at
+                .or_else(|| find_stop_in_tail(self.detokenizer.text(), delta_bytes, &self.stop));
+            let deltas = self.stream_deltas();
+            self.emit_deltas(deltas)?;
+        }
+        if self.stop_at.is_some() || self.detokenizer.token_count() == self.max_tokens {
             return self.finish(engine);
         }
         Ok(())
@@ -194,12 +208,16 @@ impl Completion {
         if self.done {
             return Ok(());
         }
-        let decoded = engine
-            .tokenizer
-            .decode(&self.generated)
+        self.detokenizer
+            .flush(&engine.tokenizer)
             .map_err(WorkerError::Inference)?;
-        self.emit_channels(final_channels(truncate_stop(&decoded, &self.stop)))?;
-        let reason = if self.generated.len() == self.max_tokens {
+        let deltas = Deltas::unsent(
+            final_channels(truncate_stop(self.detokenizer.text(), &self.stop)),
+            self.emitted_reasoning,
+            self.emitted_content,
+        );
+        self.emit_deltas(deltas)?;
+        let reason = if self.detokenizer.token_count() == self.max_tokens {
             FinishReason::Length
         } else {
             FinishReason::Stop
@@ -207,12 +225,12 @@ impl Completion {
         self.emit(Event::Finished(Summary {
             reason,
             prompt_tokens: self.prompt.len(),
-            completion_tokens: self.generated.len(),
+            completion_tokens: self.detokenizer.token_count(),
         }))?;
         self.done = true;
         tracing::info!(
             prompt_tokens = self.prompt.len(),
-            generated_tokens = self.generated.len(),
+            generated_tokens = self.detokenizer.token_count(),
             queue_ms = milliseconds(self.started.duration_since(self.received)),
             prefill_ms = self.prefill_ms,
             first_token_ms = self.first_token_ms,
@@ -222,25 +240,34 @@ impl Completion {
         Ok(())
     }
 
-    fn emit_channels(
+    fn stream_deltas(&mut self) -> Deltas {
+        let text = self.detokenizer.text();
+        let released = self
+            .stop_at
+            .and_then(|end| text.get(..end))
+            .unwrap_or_else(|| {
+                text.get(..safe_stream_boundary(text, &self.stop))
+                    .unwrap_or_default()
+            });
+        self.think = advance_think(self.think, released);
+        Deltas::unsent(
+            stream_channels(released, self.think),
+            self.emitted_reasoning,
+            self.emitted_content,
+        )
+    }
+
+    fn emit_deltas(
         &mut self,
-        channels: Channels<'_>,
+        deltas: Deltas,
     ) -> Result<(), WorkerError> {
-        if let Some(delta) = channels
-            .reasoning
-            .get(self.emitted_reasoning..)
-            .filter(|delta| !delta.is_empty())
-        {
-            self.emit(Event::Reasoning(delta.to_owned()))?;
-            self.emitted_reasoning = channels.reasoning.len();
+        if let Some(delta) = deltas.reasoning {
+            self.emit(Event::Reasoning(delta.text))?;
+            self.emitted_reasoning = delta.end;
         }
-        if let Some(delta) = channels
-            .content
-            .get(self.emitted_content..)
-            .filter(|delta| !delta.is_empty())
-        {
-            self.emit(Event::Content(delta.to_owned()))?;
-            self.emitted_content = channels.content.len();
+        if let Some(delta) = deltas.content {
+            self.emit(Event::Content(delta.text))?;
+            self.emitted_content = delta.end;
         }
         Ok(())
     }
@@ -274,6 +301,34 @@ impl Completion {
     ) {
         tracing::error!(message = "Completion failed.", operation, %error);
         self.fail(error);
+    }
+}
+
+impl Delta {
+    fn unsent(
+        channel: &str,
+        emitted: usize,
+    ) -> Option<Self> {
+        channel
+            .get(emitted..)
+            .filter(|delta| !delta.is_empty())
+            .map(|delta| Self {
+                text: delta.to_owned(),
+                end: channel.len(),
+            })
+    }
+}
+
+impl Deltas {
+    fn unsent(
+        channels: Channels<'_>,
+        emitted_reasoning: usize,
+        emitted_content: usize,
+    ) -> Self {
+        Self {
+            reasoning: Delta::unsent(channels.reasoning, emitted_reasoning),
+            content: Delta::unsent(channels.content, emitted_content),
+        }
     }
 }
 

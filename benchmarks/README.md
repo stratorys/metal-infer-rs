@@ -106,73 +106,39 @@ included in the kernel table because `llama-bench` measures model execution,
 not an isolated generic matrix multiplication.
 
 Use `--prompt` and `--generate` to override the model suite's default lengths.
-Repeat with `--matmul-backend reference-msl` and `--matmul-backend auto` to
-measure the full-model effect of the dispatch selection.
 
-The model benchmark starts with every optional fusion disabled. Enable one or
-more families explicitly with `--fuse-qkv`, `--fuse-gate-up`,
-`--fuse-add-rms-norm`, and `--fuse-qk-rope-cache`. These flags are available on
-both `metal-infer-bench model` and `benchmarks/compare.py model`; the inference
-CLI is unchanged.
-
-On Apple M4 Pro, Qwen3 selects the measured decode GEMV row counts by default
-for the Qwen3-0.6B projection shapes. The model benchmark reports
-`decode_gemv_config: "tuned"` in JSON. To compare the previous and current
-selection with the same binary and workload, run the model benchmark twice,
-changing only `--gemv-config`:
+The model benchmark runs the same plan as `metal-infer generate`: every fusion
+and kernel variant is chosen by the autotune at load time. The JSON report
+contains the plan that ran in its `plan` field. To test a variant, override one
+decision with `--with KEY=VALUE` (repeatable). `--with list` prints every key
+with its current value:
 
 ```sh
-for config in baseline tuned; do
-  target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
-    --prompt 512 --generate 128 --warmup 1 --iterations 5 \
-    --fuse-qkv --fuse-gate-up --fuse-add-rms-norm --fuse-qk-rope-cache \
-    --gemv-config "$config" --format json
-done
-```
-
-`benchmarks/compare.py model` uses the tuned default on M4 Pro. Its MLX-LM
-result is indicative: the two existing model benchmarks use different token
-sequences, despite matching the checkpoint and prompt/decode lengths.
-
-To test whether reusing the normalized gate/up input within each threadgroup
-improves the fused decode kernel, compare the model benchmark with and without
-`--shared-gate-up-input`. Keep all other arguments the same, including
-`--fuse-gate-up --fuse-add-rms-norm`. The existing kernel remains the default.
-The JSON field `shared_gate_up_input` records which path ran. For example:
-
-```sh
+target/release/metal-infer-bench model --model ./models/Qwen3-0.6B --with list
 target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
-  --prompt 512 --generate 128 --warmup 1 --iterations 5 \
-  --fuse-qkv --fuse-gate-up --fuse-add-rms-norm --fuse-qk-rope-cache \
-  --shared-gate-up-input --format json
+  --with fusion.qkv=off --with gemv.config=baseline --format json
 ```
 
-The same flag is available on `benchmarks/compare.py model` when comparing the
-experimental path with MLX-LM. The variant requires Qwen3-0.6B dimensions and
-auto matmul on Apple M4 Pro. Use unprofiled runs for throughput comparisons.
+The same option is available on `metal-infer generate`, `metal-infer serve`,
+and `benchmarks/compare.py model`. The MLX-LM result of `compare.py` is
+indicative: the two model benchmarks use different token sequences, despite
+matching the checkpoint and prompt/decode lengths. The comparison pins
+`mlx-lm==0.31.3` and `mlx==0.32.2` so successive reports use a stable baseline.
 
 For small differences, `model_ab.py` repeats the complete model benchmark in
 alternating A/B and B/A order. It builds the release binary once, runs both
-variants with the same four fusions and workload, and reports the median of
-paired decode differences. Save the commands and raw benchmark JSON with
-`--output`:
+variants with the same workload, and reports the median of paired decode
+differences. Save the commands and raw benchmark JSON with `--output`:
 
 ```sh
 uv run python benchmarks/model_ab.py --model ./models/Qwen3-0.6B \
-  --candidate-args=--shared-gate-up-input --rounds 4 \
+  --candidate-args='--with fusion.qkv=off' --rounds 4 \
   --output /tmp/qwen3-model-ab.json
 ```
 
 `--baseline-args` defaults to an empty string. Both variant arguments are
-split as shell words without invoking a shell. For example, compare two GEMV
-configurations with `--baseline-args='--gemv-config baseline'` and
-`--candidate-args='--gemv-config tuned'`. Pass `--skip-build` when the release
-binary has already been built.
-
-Choose the matrix implementation with `--matmul-backend auto`,
-`--matmul-backend reference-msl`, `--matmul-backend native-msl`, or
-`--matmul-backend mps`. The comparison pins
-`mlx-lm==0.31.3` and `mlx==0.32.2` so successive reports use a stable baseline.
+split as shell words without invoking a shell. Pass `--skip-build` when the
+release binary has already been built.
 
 To diagnose the GPU cost by kernel, run the model benchmark with
 `--profile-kernels` after building the release binary:
@@ -180,7 +146,6 @@ To diagnose the GPU cost by kernel, run the model benchmark with
 ```sh
 target/release/metal-infer-bench model --model ./models/Qwen3-0.6B \
   --prompt 512 --generate 128 --iterations 1 --warmup 1 \
-  --fuse-qkv --fuse-gate-up --matmul-backend auto \
   --profile-kernels --format json
 ```
 
@@ -222,9 +187,8 @@ For prefill, run `attention --tokens 512 --length 512`; `--kind compare` also
 reports flash-prefill for multiple query tokens. The model selects flash-prefill
 from 32 query tokens onward, flash-decode for single-token attention from 256
 active KV tokens onward when there are two query heads per KV head, and split-KV
-for shorter decode contexts. QKV and QK+RoPE+cache are the default model
-fusions; benchmark flags still select an explicit fusion set so unfused
-baselines remain reproducible.
+for shorter decode contexts. Override the attention choice of a complete model
+with `--with attention=...`.
 
 ## Results
 

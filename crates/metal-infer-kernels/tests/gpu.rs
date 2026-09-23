@@ -1,6 +1,7 @@
 use half::f16;
 use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, Kernels, MatmulBackend, QkNormRopeCacheConfig,
+    AttentionConfig, AttentionKind, KernelSelection, Kernels, MatmulBackend, MatvecRows,
+    QkNormRopeCacheConfig,
 };
 use metal_infer_runtime::{CoreError, MetalContext};
 
@@ -102,9 +103,13 @@ fn mps_matmul_matches_native_msl() -> Result<(), CoreError> {
         .collect();
     let input = context.tensor_f16(&input_values, &[17, 33])?;
     let weight = context.tensor_f16(&weight_values, &[29, 33])?;
-    kernels.set_matmul_backend(MatmulBackend::NativeMsl);
+    select(&kernels, |selection| {
+        selection.matmul_backend = MatmulBackend::NativeMsl
+    })?;
     let expected = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-    kernels.set_matmul_backend(MatmulBackend::Mps);
+    select(&kernels, |selection| {
+        selection.matmul_backend = MatmulBackend::Mps
+    })?;
     let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
     assert_close(&actual, &expected);
     Ok(())
@@ -124,9 +129,13 @@ fn simdgroup_matmul_matches_reference_msl() -> Result<(), CoreError> {
             .collect();
         let input = context.tensor_f16(&input_values, &[m, k])?;
         let weight = context.tensor_f16(&weight_values, &[n, k])?;
-        kernels.set_matmul_backend(MatmulBackend::ReferenceMsl);
+        select(&kernels, |selection| {
+            selection.matmul_backend = MatmulBackend::ReferenceMsl
+        })?;
         let expected = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-        kernels.set_matmul_backend(MatmulBackend::NativeMsl);
+        select(&kernels, |selection| {
+            selection.matmul_backend = MatmulBackend::NativeMsl
+        })?;
         let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
         assert_close(&actual, &expected);
     }
@@ -211,18 +220,30 @@ fn one_row_and_split_k_matvec_match_reference() -> Result<(), CoreError> {
         .collect();
     let input = context.tensor_f16(&input_values, &[1, k])?;
     let weight = context.tensor_f16(&weight_values, &[n, k])?;
-    kernels.set_matmul_backend(MatmulBackend::ReferenceMsl);
+    select(&kernels, |selection| {
+        selection.matmul_backend = MatmulBackend::ReferenceMsl
+    })?;
     let expected = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-    kernels.set_matmul_backend(MatmulBackend::Auto);
-    kernels.set_auto_matvec_rows(1, 2, 2, 0)?;
+    select(&kernels, |selection| {
+        selection.matmul_backend = MatmulBackend::Auto
+    })?;
+    select(&kernels, |selection| {
+        selection.matvec_rows = MatvecRows {
+            single: 1,
+            fused2: 2,
+            fused3: 2,
+            vocab: 0,
+        };
+        selection.matvec_rows_manual = true;
+    })?;
     let one_row = kernels.matmul(&input, &weight)?.to_f32_vec()?;
     assert_close(&one_row, &expected);
-    kernels.set_auto_matvec_half8(true);
+    select(&kernels, |selection| selection.half8 = true)?;
     let half8 = kernels.matmul(&input, &weight)?.to_f32_vec()?;
     assert_close(&half8, &expected);
-    kernels.set_auto_matvec_half8(false);
+    select(&kernels, |selection| selection.half8 = false)?;
     for splits in [2, 4, 8] {
-        kernels.set_auto_matvec_split_k(splits)?;
+        select(&kernels, |selection| selection.split_k = splits)?;
         let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
         assert_close(&actual, &expected);
     }
@@ -243,12 +264,18 @@ fn tuned_matvec_matches_reference_across_qwen_shapes() -> Result<(), CoreError> 
             .collect();
         let input = context.tensor_f16(&input_values, &[1, k])?;
         let weight = context.tensor_f16(&weight_values, &[n, k])?;
-        kernels.set_matmul_backend(MatmulBackend::ReferenceMsl);
+        select(&kernels, |selection| {
+            selection.matmul_backend = MatmulBackend::ReferenceMsl
+        })?;
         let expected = kernels.matmul(&input, &weight)?.to_f32_vec()?;
-        kernels.set_matmul_backend(MatmulBackend::NativeMsl);
+        select(&kernels, |selection| {
+            selection.matmul_backend = MatmulBackend::NativeMsl
+        })?;
         let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
         assert_close(&actual, &expected);
-        kernels.set_matmul_backend(MatmulBackend::Auto);
+        select(&kernels, |selection| {
+            selection.matmul_backend = MatmulBackend::Auto
+        })?;
         let auto = kernels.matmul(&input, &weight)?.to_f32_vec()?;
         assert_close(&auto, &expected);
     }
@@ -299,12 +326,14 @@ fn fused_projections_match_individual_matvecs() -> Result<(), CoreError> {
         let weight0 = context.tensor_f16(&weights(35, 19), &[35, k])?;
         let weight1 = context.tensor_f16(&weights(17, 23), &[17, k])?;
         let weight2 = context.tensor_f16(&weights(6, 29), &[6, k])?;
-        kernels.set_matmul_backend(MatmulBackend::ReferenceMsl);
+        select(&kernels, |selection| {
+            selection.matmul_backend = MatmulBackend::ReferenceMsl
+        })?;
         let expected0 = kernels.matmul(&input, &weight0)?.to_f32_vec()?;
         let expected1 = kernels.matmul(&input, &weight1)?.to_f32_vec()?;
         let expected2 = kernels.matmul(&input, &weight2)?.to_f32_vec()?;
         for backend in [MatmulBackend::NativeMsl, MatmulBackend::Auto] {
-            kernels.set_matmul_backend(backend);
+            select(&kernels, |selection| selection.matmul_backend = backend)?;
 
             let mut batch = kernels.begin_batch()?;
             let (actual0, actual1, actual2) =
@@ -345,14 +374,18 @@ fn auto_fused_projections_match_reference_at_qwen_dimensions() -> Result<(), Cor
     let gate = make_weight(3072, 47)?;
     let up = make_weight(3072, 53)?;
 
-    kernels.set_matmul_backend(MatmulBackend::ReferenceMsl);
+    select(&kernels, |selection| {
+        selection.matmul_backend = MatmulBackend::ReferenceMsl
+    })?;
     let expected_query = kernels.matmul(&input, &query)?.to_f32_vec()?;
     let expected_key = kernels.matmul(&input, &key)?.to_f32_vec()?;
     let expected_value = kernels.matmul(&input, &value)?.to_f32_vec()?;
     let expected_gate = kernels.matmul(&input, &gate)?.to_f32_vec()?;
     let expected_up = kernels.matmul(&input, &up)?.to_f32_vec()?;
 
-    kernels.set_matmul_backend(MatmulBackend::Auto);
+    select(&kernels, |selection| {
+        selection.matmul_backend = MatmulBackend::Auto
+    })?;
     let mut batch = kernels.begin_batch()?;
     let (actual_query, actual_key, actual_value) = batch.matmul3(&input, &query, &key, &value)?;
     let (actual_gate, actual_up) = batch.matmul2(&input, &gate, &up)?;
@@ -432,7 +465,10 @@ fn fused_decode_norm_projections_match_separate_ops() -> Result<(), CoreError> {
     assert_close(&actual_up.to_f32_vec()?, &expected_up.to_f32_vec()?);
     if context.device_name() == "Apple M4 Pro" {
         for rows in [1, 4, 8] {
-            kernels.set_fused_norm_matvec_rows(rows, rows)?;
+            select(&kernels, |selection| {
+                selection.fused_norm_qkv_rows = rows;
+                selection.fused_norm_gate_up_rows = rows;
+            })?;
             let mut batch = kernels.begin_batch()?;
             let (query, key, value) = batch.rms_norm_matmul3(
                 &input,
@@ -464,59 +500,6 @@ fn fused_decode_norm_projections_match_separate_ops() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn shared_gate_up_input_matches_fused_decode() -> Result<(), CoreError> {
-    let context = MetalContext::new()?;
-    let kernels = Kernels::new(&context)?;
-    if context.device_name() != "Apple M4 Pro" {
-        return Ok(());
-    }
-    let width = 1024;
-    let input_values: Vec<f32> = (0..width).map(|i| (i % 29) as f32 / 29.0 - 0.5).collect();
-    let right_values: Vec<f32> = (0..width).map(|i| (i % 19) as f32 / 38.0 - 0.25).collect();
-    let norm_values: Vec<f32> = (0..width).map(|i| 0.5 + (i % 17) as f32 / 34.0).collect();
-    let make_weight = |rows: usize, modulus: usize| {
-        let values: Vec<f32> = (0..rows * width)
-            .map(|i| (i % modulus) as f32 / modulus as f32 - 0.5)
-            .collect();
-        context.tensor_f16(&values, &[rows, width])
-    };
-    let input = context.tensor_f16(&input_values, &[1, width])?;
-    let right = context.tensor_f16(&right_values, &[1, width])?;
-    let norm_weight = context.tensor_f16(&norm_values, &[width])?;
-    let weight0 = make_weight(40, 31)?;
-    let weight1 = make_weight(24, 37)?;
-    kernels.set_fused_norm_matvec_rows(1, 1)?;
-    let mut batch = kernels.begin_batch()?;
-    let (reference_residual, normalized) =
-        batch.add_rms_norm(&input, &right, &norm_weight, 1.0e-6)?;
-    let (reference_gate, reference_up) = batch.matmul2(&normalized, &weight0, &weight1)?;
-    batch.finish()?;
-    let mut batch = kernels.begin_batch()?;
-    let (expected_residual, expected_gate, expected_up) =
-        batch.add_rms_norm_matmul2(&input, &right, &norm_weight, &weight0, &weight1, 1.0e-6)?;
-    batch.finish()?;
-    assert_close(
-        &expected_residual.to_f32_vec()?,
-        &reference_residual.to_f32_vec()?,
-    );
-    assert_close(&expected_gate.to_f32_vec()?, &reference_gate.to_f32_vec()?);
-    assert_close(&expected_up.to_f32_vec()?, &reference_up.to_f32_vec()?);
-    kernels.set_shared_gate_up_input(true);
-    let mut batch = kernels.begin_batch()?;
-    let (actual_residual, actual_gate, actual_up) =
-        batch.add_rms_norm_matmul2(&input, &right, &norm_weight, &weight0, &weight1, 1.0e-6)?;
-    batch.finish()?;
-    assert_close(
-        &actual_residual.to_f32_vec()?,
-        &expected_residual.to_f32_vec()?,
-    );
-    assert_close(&actual_gate.to_f32_vec()?, &expected_gate.to_f32_vec()?);
-    assert_close(&actual_up.to_f32_vec()?, &expected_up.to_f32_vec()?);
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires direct access to an Apple Metal device"]
 fn auto_matvec_row_variants_match_reference() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
@@ -534,13 +517,25 @@ fn auto_matvec_row_variants_match_reference() -> Result<(), CoreError> {
     let weight0 = make_weight(40, 19)?;
     let weight1 = make_weight(24, 29)?;
     let weight2 = make_weight(16, 31)?;
-    kernels.set_matmul_backend(MatmulBackend::ReferenceMsl);
+    select(&kernels, |selection| {
+        selection.matmul_backend = MatmulBackend::ReferenceMsl
+    })?;
     let expected0 = kernels.matmul(&input, &weight0)?.to_f32_vec()?;
     let expected1 = kernels.matmul(&input, &weight1)?.to_f32_vec()?;
     let expected2 = kernels.matmul(&input, &weight2)?.to_f32_vec()?;
-    kernels.set_matmul_backend(MatmulBackend::Auto);
+    select(&kernels, |selection| {
+        selection.matmul_backend = MatmulBackend::Auto
+    })?;
     for rows in [0, 2, 4, 8] {
-        kernels.set_auto_matvec_rows(rows, rows, rows, 0)?;
+        select(&kernels, |selection| {
+            selection.matvec_rows = MatvecRows {
+                single: rows,
+                fused2: rows,
+                fused3: rows,
+                vocab: 0,
+            };
+            selection.matvec_rows_manual = true;
+        })?;
         assert_close(&kernels.matmul(&input, &weight0)?.to_f32_vec()?, &expected0);
         let mut batch = kernels.begin_batch()?;
         let (two0, two1) = batch.matmul2(&input, &weight0, &weight1)?;
@@ -843,4 +838,13 @@ fn assert_close(
             "element {index}: actual={actual}, expected={expected}"
         );
     }
+}
+
+fn select(
+    kernels: &Kernels,
+    change: impl FnOnce(&mut KernelSelection),
+) -> Result<(), CoreError> {
+    let mut selection = kernels.selection();
+    change(&mut selection);
+    kernels.select(&selection)
 }

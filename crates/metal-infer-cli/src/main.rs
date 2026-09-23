@@ -2,10 +2,9 @@ mod server;
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use metal_infer_cli::{CliError, resolve_model_path};
-use metal_infer_kernels::AttentionKind;
-use metal_infer_models::{GenerationOptions, KvCache, ModelTokenizer, Qwen3Model};
+use clap::{Args, Parser, Subcommand};
+use metal_infer_cli::{CliError, load_model, resolve_model_path};
+use metal_infer_models::{GenerationOptions, KvCache, ModelTokenizer};
 use metal_infer_runtime::MetalContext;
 
 use crate::server::{ServerOptions, serve};
@@ -41,8 +40,8 @@ struct GenerateArguments {
     top_k: usize,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    #[arg(long, value_enum, default_value_t = Attention::Tiled)]
-    attention: Attention,
+    #[arg(long = "with", value_name = "KEY=VALUE")]
+    with: Vec<String>,
 }
 
 #[derive(Args)]
@@ -55,13 +54,8 @@ struct ServeArguments {
     bind: String,
     #[arg(long, default_value_t = 8192)]
     context: usize,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum Attention {
-    Reference,
-    Tiled,
-    FlashPrefill,
+    #[arg(long = "with", value_name = "KEY=VALUE")]
+    with: Vec<String>,
 }
 
 fn main() {
@@ -79,6 +73,7 @@ fn run() -> Result<(), CliError> {
             model_id: arguments.model_id,
             bind: arguments.bind,
             context: arguments.context,
+            with: arguments.with,
         }),
     }
 }
@@ -90,12 +85,9 @@ fn generate(arguments: GenerateArguments) -> Result<(), CliError> {
     eprintln!("Loading {}", model_path.display());
     let tokenizer = ModelTokenizer::from_directory(&model_path)?;
     let prompt = tokenizer.encode(&arguments.prompt)?;
-    let mut model = Qwen3Model::load(&model_path, &context)?;
-    model.set_attention_kind(match arguments.attention {
-        Attention::Reference => AttentionKind::Reference,
-        Attention::Tiled => AttentionKind::Tiled,
-        Attention::FlashPrefill => AttentionKind::FlashPrefill,
-    });
+    let Some(model) = load_model(&model_path, &context, &arguments.with)? else {
+        return Ok(());
+    };
     let required = prompt.len().saturating_add(arguments.max_tokens);
     if required > arguments.context {
         return Err(CliError::InvalidArguments(format!(

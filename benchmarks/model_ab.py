@@ -16,15 +16,9 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target" / "release" / "metal-infer-bench"
-FUSIONS = (
-    "--fuse-qkv",
-    "--fuse-gate-up",
-    "--fuse-add-rms-norm",
-    "--fuse-qk-rope-cache",
-)
 COMMON_OPTIONS = frozenset((
     "--model", "--prompt", "--generate", "--warmup", "--iterations",
-    "--format", "--profile-kernels", *FUSIONS,
+    "--format", "--profile-kernels",
 ))
 
 
@@ -96,12 +90,6 @@ def decode_tps(report: Any, prompt: int, generate: int, iterations: int) -> floa
         raise BenchmarkError("model benchmark has no prefill or decode result")
     if prefill.get("tokens") != prompt or decode.get("tokens") != generate:
         raise BenchmarkError("model benchmark returned different prompt or decode lengths")
-    fusions = report.get("fusions", {})
-    if not isinstance(fusions, dict) or not all(
-        fusions.get(flag) is True
-        for flag in ("qkv", "gate_up", "add_rms_norm", "qk_rope_cache")
-    ):
-        raise BenchmarkError("model benchmark did not enable all four fusions")
     try:
         tps = float(decode["tokens_per_second"])
     except (KeyError, TypeError, ValueError) as error:
@@ -116,7 +104,7 @@ def model_command(args: argparse.Namespace, extra: list[str]) -> list[str]:
         str(BINARY), "model", "--model", str(args.model),
         "--prompt", str(args.prompt), "--generate", str(args.generate),
         "--warmup", str(args.warmup), "--iterations", str(args.iterations),
-        *FUSIONS, *extra, "--format", "json",
+        *extra, "--format", "json",
     ]
 
 
@@ -185,7 +173,6 @@ def main() -> None:
                 "generate": args.generate,
                 "warmup": args.warmup,
                 "iterations": args.iterations,
-                "fusions": list(FUSIONS),
             },
             "variants": variants,
             "runs": runs,

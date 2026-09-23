@@ -3,6 +3,7 @@ members = [
     "crates/metal-infer-cli",
     "crates/metal-infer-kernels",
     "crates/metal-infer-models",
+    "crates/metal-infer-planner",
     "crates/metal-infer-runtime",
 ]
 resolver = "3"

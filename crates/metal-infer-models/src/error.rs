@@ -5,6 +5,8 @@ pub enum ModelError {
     #[error(transparent)]
     Core(#[from] metal_infer_runtime::CoreError),
     #[error(transparent)]
+    Plan(#[from] metal_infer_planner::PlanError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),

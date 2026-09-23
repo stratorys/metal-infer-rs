@@ -134,15 +134,13 @@ def arguments() -> argparse.Namespace:
     model.add_argument("--generate", type=int, help="override suite decode tokens")
     model.add_argument("--gguf", type=pathlib.Path)
     model.add_argument("--llama-bench", type=pathlib.Path)
-    model.add_argument("--fuse-qkv", action="store_true")
-    model.add_argument("--fuse-gate-up", action="store_true")
-    model.add_argument("--fuse-add-rms-norm", action="store_true")
-    model.add_argument("--fuse-qk-rope-cache", action="store_true")
-    model.add_argument("--shared-gate-up-input", action="store_true")
     model.add_argument(
-        "--matmul-backend",
-        choices=("auto", "reference-msl", "native-msl", "mps"),
-        default="auto",
+        "--with",
+        action="append",
+        default=[],
+        dest="plan_overrides",
+        metavar="KEY=VALUE",
+        help="override one plan decision of metal-infer (repeatable)",
     )
     return parser.parse_args()
 
@@ -333,16 +331,10 @@ def model_results(
     generate = int(config["generation_tokens"])
     iterations = int(config["iterations"])
     warmup = int(config["warmup"])
-    fusion_flags = [
+    plan_flags = [
         flag
-        for enabled, flag in (
-            (args.fuse_qkv, "--fuse-qkv"),
-            (args.fuse_gate_up, "--fuse-gate-up"),
-            (args.fuse_add_rms_norm, "--fuse-add-rms-norm"),
-            (args.fuse_qk_rope_cache, "--fuse-qk-rope-cache"),
-            (args.shared_gate_up_input, "--shared-gate-up-input"),
-        )
-        if enabled
+        for override in args.plan_overrides
+        for flag in ("--with", override)
     ]
     metal, elapsed = runner.run_json(
         [
@@ -358,9 +350,7 @@ def model_results(
             str(iterations),
             "--warmup",
             str(warmup),
-            "--matmul-backend",
-            args.matmul_backend,
-            *fusion_flags,
+            *plan_flags,
             "--format",
             "json",
         ],

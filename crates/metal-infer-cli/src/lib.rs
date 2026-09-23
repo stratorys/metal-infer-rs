@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use metal_infer_models::ModelError;
-use metal_infer_runtime::CoreError;
+use metal_infer_kernels::Kernels;
+use metal_infer_models::{ModelError, Qwen3Model};
+use metal_infer_planner::Plan;
+use metal_infer_runtime::{CoreError, MetalContext};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,6 +18,39 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("invalid command-line arguments: {0}")]
     InvalidArguments(String),
+}
+
+pub fn load_model(
+    model_path: &Path,
+    context: &MetalContext,
+    with: &[String],
+) -> Result<Option<Qwen3Model>, CliError> {
+    load_model_with(model_path, Kernels::new(context)?, with)
+}
+
+pub fn load_model_with(
+    model_path: &Path,
+    kernels: Kernels,
+    with: &[String],
+) -> Result<Option<Qwen3Model>, CliError> {
+    let list = with.iter().any(|value| value == "list");
+    let overrides = with
+        .iter()
+        .filter(|value| *value != "list")
+        .cloned()
+        .collect::<Vec<_>>();
+    let model = Qwen3Model::load_with(model_path, kernels, &overrides)?;
+    if list {
+        print_plan(&model.plan());
+        return Ok(None);
+    }
+    Ok(Some(model))
+}
+
+pub fn print_plan(plan: &Plan) {
+    for (key, value) in plan.entries() {
+        println!("{key}={value}");
+    }
 }
 
 pub fn resolve_model_path(model: &Path) -> Result<PathBuf, CliError> {

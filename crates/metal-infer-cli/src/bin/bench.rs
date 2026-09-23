@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use metal_infer_cli::CliError;
+use metal_infer_cli::{CliError, load_model_with};
 use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, DecodeGemvConfig, Kernels, MatmulBackend, QkNormRopeCacheConfig,
+    AttentionConfig, AttentionKind, KernelSelection, Kernels, MatmulBackend, MatvecRows,
+    QkNormRopeCacheConfig,
 };
-use metal_infer_models::{FusionOptions, KvCache, Qwen3Model};
+use metal_infer_models::{KvCache, Qwen3Model};
+use metal_infer_planner::Plan;
 use metal_infer_runtime::{DispatchStats, KernelDispatchProfile, MetalContext, Tensor};
 use serde::Serialize;
 
@@ -131,28 +133,8 @@ enum Command {
         iterations: usize,
         #[arg(long, default_value_t = 1)]
         warmup: usize,
-        #[arg(long)]
-        fuse_qkv: bool,
-        #[arg(long)]
-        fuse_gate_up: bool,
-        #[arg(long)]
-        fuse_add_rms_norm: bool,
-        #[arg(long)]
-        fuse_qk_rope_cache: bool,
-        /// Rows per SIMD group in the fused decode QKV plus RMSNorm kernel.
-        #[arg(long)]
-        qkv_rms_rows: Option<usize>,
-        /// Rows per SIMD group in the fused decode gate/up plus add/RMSNorm kernel.
-        #[arg(long)]
-        gate_up_add_rms_rows: Option<usize>,
-        /// Fixed decode GEMV configuration for a same-binary A/B comparison.
-        #[arg(long, value_enum)]
-        gemv_config: Option<DecodeGemvConfigArgument>,
-        /// Reuse normalized gate/up input in the fused K=1024 decode GEMV.
-        #[arg(long)]
-        shared_gate_up_input: bool,
-        #[arg(long, value_enum, default_value_t = MatmulBackendArgument::Auto)]
-        matmul_backend: MatmulBackendArgument,
+        #[arg(long = "with", value_name = "KEY=VALUE")]
+        with: Vec<String>,
         #[arg(long)]
         profile_kernels: bool,
         #[arg(long, value_enum, default_value_t = DecodeMode::Pipelined)]
@@ -201,21 +183,6 @@ impl From<MatmulBackendArgument> for MatmulBackend {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum DecodeGemvConfigArgument {
-    Baseline,
-    Tuned,
-}
-
-impl From<DecodeGemvConfigArgument> for DecodeGemvConfig {
-    fn from(value: DecodeGemvConfigArgument) -> Self {
-        match value {
-            DecodeGemvConfigArgument::Baseline => Self::Baseline,
-            DecodeGemvConfigArgument::Tuned => Self::Tuned,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
 enum FusionKind {
     Qkv,
     GateUp,
@@ -254,15 +221,11 @@ struct Report {
     allocated_bytes: usize,
     matmul_backend: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    decode_gemv_config: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     decode_mode: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    shared_gate_up_input: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allocation_growth_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    fusions: Option<FusionSelection>,
+    plan: Option<BTreeMap<&'static str, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<FusionComparison>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -306,25 +269,6 @@ struct PhaseReport {
     gpu_median_ms: f64,
     gpu_p95_ms: f64,
     tokens_per_second: f64,
-}
-
-#[derive(Clone, Copy, Serialize)]
-struct FusionSelection {
-    qkv: bool,
-    gate_up: bool,
-    add_rms_norm: bool,
-    qk_rope_cache: bool,
-}
-
-impl From<FusionOptions> for FusionSelection {
-    fn from(options: FusionOptions) -> Self {
-        Self {
-            qkv: options.qkv,
-            gate_up: options.gate_up,
-            add_rms_norm: options.add_rms_norm,
-            qk_rope_cache: options.qk_rope_cache,
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -451,7 +395,9 @@ fn run() -> Result<(), CliError> {
             matmul_backend,
         } => {
             require_iterations(iterations)?;
-            kernels.set_matmul_backend(matmul_backend.into());
+            select(&kernels, |selection| {
+                selection.matmul_backend = matmul_backend.into()
+            })?;
             if let Some(rows) = rows {
                 if matmul_backend != MatmulBackendArgument::Auto || m != 1 || split_k.is_some() {
                     return Err(CliError::InvalidArguments(
@@ -463,7 +409,15 @@ fn run() -> Result<(), CliError> {
                         "--rows 1 is unavailable for vocabulary GEMV".into(),
                     ));
                 }
-                kernels.set_auto_matvec_rows(rows, 2, 2, if n >= 65_536 { rows } else { 0 })?;
+                select(&kernels, |selection| {
+                    selection.matvec_rows = MatvecRows {
+                        single: rows,
+                        fused2: 2,
+                        fused3: 2,
+                        vocab: if n >= 65_536 { rows } else { 0 },
+                    };
+                    selection.matvec_rows_manual = true;
+                })?;
             }
             if let Some(splits) = split_k {
                 if matmul_backend != MatmulBackendArgument::Auto || m != 1 {
@@ -471,7 +425,7 @@ fn run() -> Result<(), CliError> {
                         "--split-k requires --matmul-backend auto and m=1".into(),
                     ));
                 }
-                kernels.set_auto_matvec_split_k(splits)?;
+                select(&kernels, |selection| selection.split_k = splits)?;
             }
             if half8 {
                 if matmul_backend != MatmulBackendArgument::Auto || m != 1 || rows != Some(1) {
@@ -479,7 +433,7 @@ fn run() -> Result<(), CliError> {
                         "--half8 requires auto GEMV, m=1, and --rows 1".into(),
                     ));
                 }
-                kernels.set_auto_matvec_half8(true);
+                select(&kernels, |selection| selection.half8 = true)?;
             }
             if let Some(copies) = rotate {
                 run_rotated_matvec(
@@ -520,7 +474,9 @@ fn run() -> Result<(), CliError> {
             matmul_backend,
         } => {
             require_iterations(iterations)?;
-            kernels.set_matmul_backend(matmul_backend.into());
+            select(&kernels, |selection| {
+                selection.matmul_backend = matmul_backend.into()
+            })?;
             if let Some(rows) = rows {
                 if matmul_backend != MatmulBackendArgument::Auto
                     || !matches!(
@@ -536,9 +492,20 @@ fn run() -> Result<(), CliError> {
                     ));
                 }
                 if matches!(kind, FusionKind::QkvRms | FusionKind::GateUpAddRms) {
-                    kernels.set_fused_norm_matvec_rows(rows, rows)?;
+                    select(&kernels, |selection| {
+                        selection.fused_norm_qkv_rows = rows;
+                        selection.fused_norm_gate_up_rows = rows;
+                    })?;
                 } else {
-                    kernels.set_auto_matvec_rows(4, rows, rows, 0)?;
+                    select(&kernels, |selection| {
+                        selection.matvec_rows = MatvecRows {
+                            single: 4,
+                            fused2: rows,
+                            fused3: rows,
+                            vocab: 0,
+                        };
+                        selection.matvec_rows_manual = true;
+                    })?;
                 }
             }
             run_fusion_benchmark(
@@ -587,8 +554,7 @@ fn run() -> Result<(), CliError> {
             warmup,
         } => {
             require_iterations(iterations)?;
-            let mut model = Qwen3Model::load_with(&model, kernels.clone())?;
-            model.set_attention_kind(AttentionKind::Tiled);
+            let model = Qwen3Model::load_with(&model, kernels.clone(), &[])?;
             let token_ids = vec![1; tokens];
             for _ in 0..warmup {
                 let _ = model.run_first_block(&token_ids)?;
@@ -602,15 +568,7 @@ fn run() -> Result<(), CliError> {
             generate,
             iterations,
             warmup,
-            fuse_qkv,
-            fuse_gate_up,
-            fuse_add_rms_norm,
-            fuse_qk_rope_cache,
-            qkv_rms_rows,
-            gate_up_add_rms_rows,
-            gemv_config,
-            shared_gate_up_input,
-            matmul_backend,
+            with,
             profile_kernels,
             decode_mode,
         } => {
@@ -619,67 +577,10 @@ fn run() -> Result<(), CliError> {
                     "model prompt, generate, and iterations must be greater than zero".into(),
                 ));
             }
-            if gemv_config.is_some() && (qkv_rms_rows.is_some() || gate_up_add_rms_rows.is_some()) {
-                return Err(CliError::InvalidArguments(
-                    "--gemv-config cannot be combined with individual fused norm row overrides"
-                        .into(),
-                ));
-            }
-            if gemv_config.is_some()
-                && (matmul_backend != MatmulBackendArgument::Auto
-                    || context.device_name() != "Apple M4 Pro")
-            {
-                return Err(CliError::InvalidArguments(
-                    "--gemv-config requires auto matmul on Apple M4 Pro".into(),
-                ));
-            }
-            if shared_gate_up_input && !(fuse_gate_up && fuse_add_rms_norm) {
-                return Err(CliError::InvalidArguments(
-                    "--shared-gate-up-input requires --fuse-gate-up and --fuse-add-rms-norm".into(),
-                ));
-            }
-            if shared_gate_up_input
-                && matches!(gemv_config, Some(DecodeGemvConfigArgument::Baseline))
-            {
-                return Err(CliError::InvalidArguments(
-                    "--shared-gate-up-input requires the tuned GEMV configuration".into(),
-                ));
-            }
-            kernels.set_matmul_backend(matmul_backend.into());
-            let mut model = Qwen3Model::load_with(&model, kernels.clone())?;
-            if shared_gate_up_input {
-                if context.device_name() != "Apple M4 Pro"
-                    || model.config().hidden_size != 1024
-                    || model.config().intermediate_size != 3072
-                    || matmul_backend != MatmulBackendArgument::Auto
-                {
-                    return Err(CliError::InvalidArguments(
-                        "--shared-gate-up-input requires Qwen3-0.6B dimensions and auto matmul on Apple M4 Pro".into(),
-                    ));
-                }
-                kernels.set_shared_gate_up_input(true);
-            }
-            if let Some(config) = gemv_config {
-                kernels.set_decode_gemv_config(config.into());
-            }
-            if qkv_rms_rows.is_some() || gate_up_add_rms_rows.is_some() {
-                if matmul_backend != MatmulBackendArgument::Auto {
-                    return Err(CliError::InvalidArguments(
-                        "fused norm row overrides require --matmul-backend auto".into(),
-                    ));
-                }
-                kernels.set_fused_norm_matvec_rows(
-                    qkv_rms_rows.unwrap_or(2),
-                    gate_up_add_rms_rows.unwrap_or(2),
-                )?;
-            }
-            let fusion_options = FusionOptions {
-                qkv: fuse_qkv,
-                gate_up: fuse_gate_up,
-                add_rms_norm: fuse_add_rms_norm,
-                qk_rope_cache: fuse_qk_rope_cache,
+            let Some(model) = load_model_with(&model, kernels.clone(), &with)? else {
+                return Ok(());
             };
-            model.set_fusion_options(fusion_options);
+            let plan = model.plan();
             let effective_decode_mode = if profile_kernels {
                 DecodeMode::Synchronous
             } else {
@@ -729,7 +630,7 @@ fn run() -> Result<(), CliError> {
             });
             let mut report = model_report(
                 &kernels,
-                fusion_options,
+                &plan,
                 allocated_before_measurement,
                 prompt,
                 generate,
@@ -737,7 +638,6 @@ fn run() -> Result<(), CliError> {
                 decode_samples,
                 kernel_profile,
             );
-            report.decode_gemv_config = kernels.decode_gemv_config().map(DecodeGemvConfig::name);
             report.decode_mode = Some(effective_decode_mode.name());
             report
         }
@@ -748,8 +648,10 @@ fn run() -> Result<(), CliError> {
             println!("benchmark: {}", report.benchmark);
             println!("device: {}", report.device);
             println!("matmul backend: {}", report.matmul_backend);
-            if let Some(shared) = report.shared_gate_up_input {
-                println!("shared gate/up input: {shared}");
+            if let Some(plan) = &report.plan {
+                for (key, value) in plan {
+                    println!("plan: {key}={value}");
+                }
             }
             println!(
                 "mean: {:.3} ms, median: {:.3} ms, p95: {:.3} ms",
@@ -805,6 +707,16 @@ fn run() -> Result<(), CliError> {
             println!("Metal allocated: {} bytes", report.allocated_bytes);
         }
     }
+    Ok(())
+}
+
+fn select(
+    kernels: &Kernels,
+    change: impl FnOnce(&mut KernelSelection),
+) -> Result<(), CliError> {
+    let mut selection = kernels.selection();
+    change(&mut selection);
+    kernels.select(&selection)?;
     Ok(())
 }
 
@@ -1089,12 +1001,10 @@ fn run_attention_benchmark(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: kernels.matmul_backend().name(),
-        decode_gemv_config: None,
+        matmul_backend: kernels.selection().matmul_backend.name(),
         decode_mode: None,
-        shared_gate_up_input: None,
         allocation_growth_bytes: None,
-        fusions: None,
+        plan: None,
         comparison: None,
         attention_comparison: Some(AttentionComparison {
             reference,
@@ -1602,16 +1512,14 @@ fn measure_fusion_pair<E>(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: kernels.matmul_backend().name(),
-        decode_gemv_config: None,
+        matmul_backend: kernels.selection().matmul_backend.name(),
         decode_mode: None,
-        shared_gate_up_input: None,
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()
                 .saturating_sub(allocated_before_measurement),
         ),
-        fusions: None,
+        plan: None,
         comparison: Some(comparison),
         attention_comparison: None,
         prefill: None,
@@ -1766,12 +1674,10 @@ fn report(
         throughput,
         throughput_unit,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: kernels.matmul_backend().name(),
-        decode_gemv_config: None,
+        matmul_backend: kernels.selection().matmul_backend.name(),
         decode_mode: None,
-        shared_gate_up_input: None,
         allocation_growth_bytes: None,
-        fusions: None,
+        plan: None,
         comparison: None,
         attention_comparison: None,
         prefill: None,
@@ -1959,7 +1865,7 @@ fn print_kernel_phase(
 #[allow(clippy::too_many_arguments)]
 fn model_report(
     kernels: &Kernels,
-    fusion_options: FusionOptions,
+    plan: &Plan,
     allocated_before_measurement: usize,
     prompt_tokens: usize,
     decode_tokens: usize,
@@ -1983,16 +1889,14 @@ fn model_report(
         throughput: None,
         throughput_unit: None,
         allocated_bytes: context.allocated_bytes(),
-        matmul_backend: kernels.matmul_backend().name(),
-        decode_gemv_config: None,
+        matmul_backend: kernels.selection().matmul_backend.name(),
         decode_mode: None,
-        shared_gate_up_input: Some(kernels.shared_gate_up_input()),
         allocation_growth_bytes: Some(
             context
                 .allocated_bytes()
                 .saturating_sub(allocated_before_measurement),
         ),
-        fusions: Some(fusion_options.into()),
+        plan: Some(plan.entries().into_iter().collect()),
         comparison: None,
         attention_comparison: None,
         prefill: Some(prefill),

@@ -111,7 +111,7 @@ mod tests {
         );
         assert_eq!(
             source.matches("\nkernel void").count(),
-            48,
+            47,
             "every kernel must be part of the shader source"
         );
     }

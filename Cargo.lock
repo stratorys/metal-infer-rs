@@ -489,6 +489,7 @@ dependencies = [
  "clap",
  "metal-infer-kernels",
  "metal-infer-models",
+ "metal-infer-planner",
  "metal-infer-runtime",
  "serde",
  "serde_json",
@@ -512,12 +513,21 @@ version = "0.1.0"
 dependencies = [
  "half",
  "metal-infer-kernels",
+ "metal-infer-planner",
  "metal-infer-runtime",
  "safetensors",
  "serde",
  "serde_json",
  "thiserror",
  "tokenizers",
+]
+
+[[package]]
+name = "metal-infer-planner"
+version = "0.1.0"
+dependencies = [
+ "metal-infer-kernels",
+ "thiserror",
 ]
 
 [[package]]

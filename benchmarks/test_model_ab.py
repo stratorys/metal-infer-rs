@@ -22,12 +22,6 @@ def report(tps: float) -> dict:
         "iterations": 5,
         "prefill": {"tokens": 512},
         "decode": {"tokens": 128, "tokens_per_second": tps},
-        "fusions": {
-            "qkv": True,
-            "gate_up": True,
-            "add_rms_norm": True,
-            "qk_rope_cache": True,
-        },
     }
 
 
@@ -36,7 +30,7 @@ class ModelAbTests(unittest.TestCase):
         args = argparse.Namespace(
             model=pathlib.Path("/tmp/Qwen3-0.6B"),
             baseline_args=[],
-            candidate_args=["--shared-gate-up-input"],
+            candidate_args=["--with", "fusion.qkv=off"],
             rounds=2,
             prompt=512,
             generate=128,
@@ -48,7 +42,7 @@ class ModelAbTests(unittest.TestCase):
         calls: list[bool] = []
 
         def fake_run(command: list[str]) -> str:
-            candidate = "--shared-gate-up-input" in command
+            candidate = "fusion.qkv=off" in command
             calls.append(candidate)
             return json.dumps(report([150.0, 152.0, 151.0, 149.0][len(calls) - 1]))
 

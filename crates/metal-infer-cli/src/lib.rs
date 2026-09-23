@@ -9,7 +9,7 @@ use metal_infer_models::Qwen3Model;
 use metal_infer_planner::Plan;
 use tracing_subscriber::EnvFilter;
 
-pub use crate::error::{CliError, ServerError};
+pub use crate::error::{CliError, RequestError, ServerError};
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum LogFormat {
@@ -21,9 +21,9 @@ pub enum LogFormat {
 pub fn init_tracing(format: LogFormat) -> Result<(), CliError> {
     let filter = match std::env::var("RUST_LOG") {
         Ok(value) => EnvFilter::try_new(value).map_err(CliError::LogFilter)?,
-        Err(std::env::VarError::NotPresent) => {
-            EnvFilter::new("warn,metal_infer=info,metal_infer_bench=info,metal_infer_cli=info")
-        }
+        Err(std::env::VarError::NotPresent) => EnvFilter::new(
+            "warn,metal_infer=info,metal_infer_bench=info,metal_infer_cli=info,metal_infer_runtime=info",
+        ),
         Err(error) => return Err(CliError::LogEnvironment(error)),
     };
     match format {

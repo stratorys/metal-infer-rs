@@ -1,5 +1,6 @@
 use metal_infer_kernels::GpuError;
 use metal_infer_models::ModelError;
+use metal_infer_runtime::{SubmitError, WorkerError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -10,6 +11,8 @@ pub enum CliError {
     Gpu(#[from] GpuError),
     #[error(transparent)]
     Model(#[from] ModelError),
+    #[error(transparent)]
+    Worker(#[from] WorkerError),
     #[error("JSON serialization failed")]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -22,12 +25,6 @@ pub enum CliError {
     TracingInit(#[source] tracing::subscriber::SetGlobalDefaultError),
     #[error("prompt and generated tokens exceed the context")]
     ContextExceeded,
-    #[error("--max-active-requests must be positive")]
-    NoActiveRequests,
-    #[error("requested model is not loaded")]
-    ModelNotLoaded,
-    #[error("message content part type is not supported")]
-    UnsupportedContentPart,
     #[error("invalid test lengths, iterations, or profile mode (profile requires pg)")]
     InvalidBenchArguments,
     #[error("logits contain no finite value")]
@@ -44,30 +41,31 @@ pub enum ServerError {
     Bind(#[source] std::io::Error),
     #[error("HTTP server failed")]
     Http(#[source] std::io::Error),
-    #[error("inference worker stopped before it was ready")]
-    WorkerStopped(#[source] tokio::sync::oneshot::error::RecvError),
-    #[error("inference worker panicked or was cancelled")]
-    WorkerJoin(#[source] tokio::task::JoinError),
-    #[error("model initialization failed")]
-    ModelInitialization(#[source] Box<CliError>),
-    #[error("the plan was listed, there is no model to serve")]
-    PlanListed,
+}
+
+#[derive(Debug, Error)]
+pub enum RequestError {
     #[error("invalid completion request")]
     InvalidJson(#[source] serde_json::Error),
-    #[error("invalid completion request")]
-    InvalidRequest(#[source] Box<CliError>),
-    #[error("invalid generation options")]
-    InvalidOptions(#[source] ModelError),
-    #[error("stream flag does not match the reply channel")]
-    StreamModeMismatch,
-    #[error("cannot allocate KV cache")]
-    CacheAllocation(#[source] ModelError),
-    #[error("inference failed")]
-    Inference(#[source] Box<CliError>),
-    #[error("active completion has no token to decode")]
-    MissingDecodeInput,
-    #[error("client disconnected")]
-    Disconnected,
-    #[error("stream client is too slow")]
-    SlowClient,
+    #[error("requested model is not loaded")]
+    ModelNotLoaded,
+    #[error("message content part type is not supported")]
+    UnsupportedContentPart,
+    #[error("max_tokens exceeds the context")]
+    MaxTokensExceedContext,
+    #[error("request queue is full")]
+    QueueFull,
+    #[error("inference worker stopped")]
+    WorkerStopped,
+    #[error(transparent)]
+    Worker(#[from] WorkerError),
+}
+
+impl From<SubmitError> for RequestError {
+    fn from(error: SubmitError) -> Self {
+        match error {
+            SubmitError::QueueFull => Self::QueueFull,
+            SubmitError::Stopped => Self::WorkerStopped,
+        }
+    }
 }

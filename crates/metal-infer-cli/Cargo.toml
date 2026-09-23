@@ -16,8 +16,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 axum = "0.8.9"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "signal"] }
 tokio-stream = "0.1.19"
+metal-infer-runtime = { version = "0.1.0", path = "../metal-infer-runtime" }
 
 [[bin]]
 name = "metal-infer"

@@ -6,3 +6,14 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+metal-infer-kernels = { version = "0.1.0", path = "../metal-infer-kernels" }
+metal-infer-models = { version = "0.1.0", path = "../metal-infer-models" }
+thiserror.workspace = true
+tokio = { version = "1.53.1", features = ["sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "macros"] }
+tokio-stream = "0.1.19"

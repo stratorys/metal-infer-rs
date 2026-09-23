@@ -1,12 +1,14 @@
 mod server;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model};
 use metal_infer_kernels::MetalContext;
 use metal_infer_models::{GenerationOptions, KvCache, ModelSource, ModelTokenizer};
+use metal_infer_runtime::WorkerOptions;
 
 use crate::server::{ServerOptions, serve};
 
@@ -57,8 +59,8 @@ struct ServeArguments {
     bind: String,
     #[arg(long, default_value_t = 8192)]
     context: usize,
-    #[arg(long, default_value_t = 4)]
-    max_active_requests: usize,
+    #[arg(long, default_value = "4")]
+    max_active_requests: NonZeroUsize,
     #[arg(long = "with", value_name = "KEY=VALUE")]
     with: Vec<String>,
 }
@@ -78,15 +80,33 @@ fn main() {
 fn run(arguments: Arguments) -> Result<(), CliError> {
     match arguments.command {
         Command::Generate(arguments) => generate(arguments),
-        Command::Serve(arguments) => serve(ServerOptions {
+        Command::Serve(arguments) => serve_command(arguments),
+    }
+}
+
+fn serve_command(arguments: ServeArguments) -> Result<(), CliError> {
+    if arguments.with.iter().any(|value| value == "list") {
+        return list_plan(&arguments.model, &arguments.with);
+    }
+    serve(ServerOptions {
+        worker: WorkerOptions {
             model: arguments.model,
             model_id: arguments.model_id,
-            bind: arguments.bind,
             context: arguments.context,
             max_active_requests: arguments.max_active_requests,
             with: arguments.with,
-        }),
-    }
+        },
+        bind: arguments.bind,
+    })
+}
+
+fn list_plan(
+    model: &Path,
+    with: &[String],
+) -> Result<(), CliError> {
+    let model_path = ModelSource::resolve(model)?.directory;
+    let context = MetalContext::new()?;
+    load_model(&model_path, &context, with).map(|_| ())
 }
 
 fn generate(arguments: GenerateArguments) -> Result<(), CliError> {

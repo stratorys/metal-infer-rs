@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model, resolve_model_path};
+use metal_infer_kernels::MetalContext;
 use metal_infer_models::{GenerationOptions, KvCache, ModelTokenizer};
-use metal_infer_runtime::MetalContext;
 
 use crate::server::{ServerOptions, serve};
 

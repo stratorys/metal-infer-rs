@@ -698,7 +698,6 @@ dependencies = [
  "metal-infer-kernels",
  "metal-infer-models",
  "metal-infer-planner",
- "metal-infer-runtime",
  "serde",
  "serde_json",
  "thiserror",
@@ -713,8 +712,10 @@ name = "metal-infer-kernels"
 version = "0.1.0"
 dependencies = [
  "half",
- "metal-infer-runtime",
+ "objc2",
+ "objc2-foundation",
  "objc2-metal",
+ "thiserror",
 ]
 
 [[package]]
@@ -724,7 +725,6 @@ dependencies = [
  "half",
  "metal-infer-kernels",
  "metal-infer-planner",
- "metal-infer-runtime",
  "safetensors",
  "serde",
  "serde_json",
@@ -743,13 +743,6 @@ dependencies = [
 [[package]]
 name = "metal-infer-runtime"
 version = "0.1.0"
-dependencies = [
- "half",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "thiserror",
-]
 
 [[package]]
 name = "mime"

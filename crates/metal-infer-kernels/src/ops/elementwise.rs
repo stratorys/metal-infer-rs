@@ -1,7 +1,5 @@
-use metal_infer_runtime::{CoreError, DType, Tensor};
-
 use super::{matrix_shape, require_f16, require_same_shape, size, to_u32};
-use crate::KernelBatch;
+use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
     pub fn copy_row(
@@ -9,17 +7,17 @@ impl KernelBatch<'_> {
         source: &Tensor,
         destination: &Tensor,
         row: usize,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), KernelError> {
         require_f16(source)?;
         require_f16(destination)?;
         let [source_rows, width] = source.shape() else {
-            return Err(CoreError::CopyRowSourceRank);
+            return Err(KernelError::CopyRowSourceRank);
         };
         let [rows, destination_width] = destination.shape() else {
-            return Err(CoreError::CopyRowDestinationRank);
+            return Err(KernelError::CopyRowDestinationRank);
         };
         if *source_rows != 1 || width != destination_width || row >= *rows {
-            return Err(CoreError::CopyRowShape);
+            return Err(KernelError::CopyRowShape);
         }
         let params = [to_u32(*width)?, to_u32(row)?, 0];
         self.dispatch(
@@ -34,7 +32,7 @@ impl KernelBatch<'_> {
         &mut self,
         left: &Tensor,
         right: &Tensor,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         require_f16(left)?;
         require_f16(right)?;
         require_same_shape(left, right)?;
@@ -54,7 +52,7 @@ impl KernelBatch<'_> {
         &mut self,
         gate: &Tensor,
         up: &Tensor,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         require_f16(gate)?;
         require_f16(up)?;
         require_same_shape(gate, up)?;
@@ -74,9 +72,9 @@ impl KernelBatch<'_> {
         &mut self,
         tokens: &Tensor,
         table: &Tensor,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         if tokens.dtype() != DType::U32 || tokens.shape().len() != 1 {
-            return Err(CoreError::TokensShape);
+            return Err(KernelError::TokensShape);
         }
         require_f16(table)?;
         let [_, width] = matrix_shape(table)?;

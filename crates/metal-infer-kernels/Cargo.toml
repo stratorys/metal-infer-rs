@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-metal-infer-runtime = { path = "../metal-infer-runtime" }
-objc2-metal.workspace = true
-
-[dev-dependencies]
 half.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

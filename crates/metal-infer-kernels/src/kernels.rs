@@ -1,10 +1,11 @@
 use std::rc::Rc;
 
-use metal_infer_runtime::{
-    CommandBatch, CoreError, DType, DispatchStats, Library, MetalContext, PendingBatch, Tensor,
-};
 use objc2_metal::MTLSize;
 
+use crate::KernelError;
+use crate::gpu::{
+    CommandBatch, DType, DispatchStats, GpuError, Library, MetalContext, PendingBatch, Tensor,
+};
 use crate::tuning::Tuning;
 
 const PRELUDE: &str = include_str!("../metal/prelude.metal");
@@ -37,7 +38,7 @@ pub struct Kernels {
 }
 
 impl Kernels {
-    pub fn new(context: &MetalContext) -> Result<Self, CoreError> {
+    pub fn new(context: &MetalContext) -> Result<Self, GpuError> {
         let library = Library::new(context, &shader_source())?;
         Ok(Self {
             context: context.clone(),
@@ -50,7 +51,7 @@ impl Kernels {
         &self.context
     }
 
-    pub fn begin_batch(&self) -> Result<KernelBatch<'_>, CoreError> {
+    pub fn begin_batch(&self) -> Result<KernelBatch<'_>, GpuError> {
         Ok(KernelBatch {
             batch: self.context.begin_batch()?,
             kernels: self,
@@ -64,11 +65,11 @@ pub struct KernelBatch<'kernels> {
 }
 
 impl<'kernels> KernelBatch<'kernels> {
-    pub fn commit(self) -> Result<PendingBatch<'kernels>, CoreError> {
+    pub fn commit(self) -> Result<PendingBatch<'kernels>, GpuError> {
         self.batch.commit()
     }
 
-    pub fn finish(self) -> Result<DispatchStats, CoreError> {
+    pub fn finish(self) -> Result<DispatchStats, GpuError> {
         self.batch.finish()
     }
 
@@ -76,7 +77,7 @@ impl<'kernels> KernelBatch<'kernels> {
         &self,
         shape: &[usize],
         dtype: DType,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, GpuError> {
         self.batch.empty(shape, dtype)
     }
 
@@ -87,10 +88,11 @@ impl<'kernels> KernelBatch<'kernels> {
         params: &T,
         grid: MTLSize,
         threadgroup: MTLSize,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), KernelError> {
         let pipeline = self.kernels.library.pipeline(kernel)?;
         self.batch
-            .dispatch(&pipeline, kernel, tensors, params, grid, threadgroup)
+            .dispatch(&pipeline, kernel, tensors, params, grid, threadgroup)?;
+        Ok(())
     }
 }
 

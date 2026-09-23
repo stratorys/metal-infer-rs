@@ -1,20 +1,18 @@
-use metal_infer_runtime::{CoreError, DType, Tensor};
-
 use super::{require_f16, size, to_u32};
-use crate::KernelBatch;
+use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
     pub fn argmax(
         &mut self,
         logits: &Tensor,
         output: &Tensor,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), KernelError> {
         require_f16(logits)?;
         if logits.shape().len() != 1 || logits.is_empty() {
-            return Err(CoreError::ArgmaxLogitsShape);
+            return Err(KernelError::ArgmaxLogitsShape);
         }
         if output.dtype() != DType::U32 || output.shape() != [1] {
-            return Err(CoreError::ArgmaxOutputShape);
+            return Err(KernelError::ArgmaxOutputShape);
         }
         let count = to_u32(logits.len())?;
         let groups = count.div_ceil(2048);

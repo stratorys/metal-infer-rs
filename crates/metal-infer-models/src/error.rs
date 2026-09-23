@@ -3,7 +3,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error(transparent)]
-    Core(#[from] metal_infer_runtime::CoreError),
+    Gpu(#[from] metal_infer_kernels::GpuError),
+    #[error(transparent)]
+    Kernel(#[from] metal_infer_kernels::KernelError),
     #[error(transparent)]
     Plan(#[from] metal_infer_planner::PlanError),
     #[error("model file I/O failed")]

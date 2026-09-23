@@ -5,9 +5,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model_with, resolve_model_path};
-use metal_infer_kernels::Kernels;
+use metal_infer_kernels::{KernelDispatchProfile, Kernels, MetalContext, Tensor};
 use metal_infer_models::{KvCache, Qwen3Model};
-use metal_infer_runtime::{KernelDispatchProfile, MetalContext, Tensor};
 use serde::Serialize;
 
 #[derive(Parser)]

@@ -1,20 +1,18 @@
-use metal_infer_runtime::{CoreError, DType, Tensor};
-
 use super::{MatrixParams, checked_mul, matrix_shape, require_f16, round_up, size, to_u32};
-use crate::KernelBatch;
+use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
     pub fn matmul(
         &mut self,
         input: &Tensor,
         weight: &Tensor,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         require_f16(input)?;
         require_f16(weight)?;
         let [m, k] = matrix_shape(input)?;
         let [n, weight_k] = matrix_shape(weight)?;
         if k != weight_k {
-            return Err(CoreError::MatmulInnerDimension);
+            return Err(KernelError::MatmulInnerDimension);
         }
         let out = self.empty(&[m, n], DType::F16)?;
         let params = MatrixParams {

@@ -4,10 +4,10 @@ use std::path::Path;
 use half::f16;
 
 use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, KernelBatch, Kernels, QkNormRopeCacheConfig,
+    AttentionConfig, AttentionKind, DType, DispatchStats, KernelBatch, Kernels, MetalContext,
+    PendingBatch, QkNormRopeCacheConfig, Tensor,
 };
 use metal_infer_planner::{Fusions, Plan};
-use metal_infer_runtime::{DType, DispatchStats, MetalContext, PendingBatch, Tensor};
 
 use crate::weights::WeightMap;
 use crate::{ModelError, Qwen3Config};
@@ -1078,7 +1078,7 @@ mod tests {
         AttentionKind, GenerationOptions, KvCache, Qwen3Model, XorShift64, argmax,
         attention_kind_for_tokens, sample_token,
     };
-    use metal_infer_runtime::MetalContext;
+    use metal_infer_kernels::MetalContext;
 
     #[test]
     fn tiled_attention_selects_flash_decode_for_long_gqa_decode() {

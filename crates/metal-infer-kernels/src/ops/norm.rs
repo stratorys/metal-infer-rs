@@ -1,7 +1,5 @@
-use metal_infer_runtime::{CoreError, DType, Tensor};
-
 use super::{NormParams, checked_mul, require_f16, require_same_shape, size, to_u32};
-use crate::KernelBatch;
+use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
     pub fn rms_norm(
@@ -9,12 +7,15 @@ impl KernelBatch<'_> {
         input: &Tensor,
         weight: &Tensor,
         epsilon: f32,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         require_f16(input)?;
         require_f16(weight)?;
-        let width = *input.shape().last().ok_or_else(|| CoreError::RmsNormRank)?;
+        let width = *input
+            .shape()
+            .last()
+            .ok_or_else(|| KernelError::RmsNormRank)?;
         if weight.shape() != [width] {
-            return Err(CoreError::RmsNormWeight);
+            return Err(KernelError::RmsNormWeight);
         }
         let rows = input.len() / width;
         let out = self.empty(input.shape(), DType::F16)?;
@@ -40,7 +41,7 @@ impl KernelBatch<'_> {
         right: &Tensor,
         weight: &Tensor,
         epsilon: f32,
-    ) -> Result<(Tensor, Tensor), CoreError> {
+    ) -> Result<(Tensor, Tensor), KernelError> {
         require_f16(left)?;
         require_f16(right)?;
         require_f16(weight)?;
@@ -48,9 +49,9 @@ impl KernelBatch<'_> {
         let width = *left
             .shape()
             .last()
-            .ok_or_else(|| CoreError::AddRmsNormRank)?;
+            .ok_or_else(|| KernelError::AddRmsNormRank)?;
         if weight.shape() != [width] {
-            return Err(CoreError::AddRmsNormWeight);
+            return Err(KernelError::AddRmsNormWeight);
         }
         let rows = left.len() / width;
         let residual = self.empty(left.shape(), DType::F16)?;

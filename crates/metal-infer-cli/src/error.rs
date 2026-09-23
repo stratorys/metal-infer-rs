@@ -1,5 +1,5 @@
+use metal_infer_kernels::GpuError;
 use metal_infer_models::ModelError;
-use metal_infer_runtime::CoreError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -7,7 +7,7 @@ pub enum CliError {
     #[error("I/O operation failed")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Core(#[from] CoreError),
+    Gpu(#[from] GpuError),
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error("JSON serialization failed")]

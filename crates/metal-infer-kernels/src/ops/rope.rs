@@ -1,7 +1,5 @@
-use metal_infer_runtime::{CoreError, DType, Tensor};
-
 use super::{QkTransformParams, RopeParams, checked_add, checked_mul, require_f16, size, to_u32};
-use crate::KernelBatch;
+use crate::{DType, KernelBatch, KernelError, Tensor};
 
 #[derive(Clone, Copy, Debug)]
 pub struct QkNormRopeCacheConfig {
@@ -16,14 +14,14 @@ impl KernelBatch<'_> {
         input: &Tensor,
         offset: usize,
         theta: f32,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         require_f16(input)?;
         let shape = input.shape();
         let [tokens, heads, head_dim] = shape else {
-            return Err(CoreError::RopeRank);
+            return Err(KernelError::RopeRank);
         };
         if !head_dim.is_multiple_of(2) {
-            return Err(CoreError::RopeOddHeadDim);
+            return Err(KernelError::RopeOddHeadDim);
         }
         let out = self.empty(shape, DType::F16)?;
         let params = RopeParams {
@@ -52,20 +50,20 @@ impl KernelBatch<'_> {
         key_weight: &Tensor,
         key_cache: &Tensor,
         config: QkNormRopeCacheConfig,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         require_f16(query)?;
         require_f16(key)?;
         require_f16(query_weight)?;
         require_f16(key_weight)?;
         require_f16(key_cache)?;
         let [tokens, query_heads, head_dim] = query.shape() else {
-            return Err(CoreError::QueryRank);
+            return Err(KernelError::QueryRank);
         };
         let [key_tokens, kv_heads, key_dim] = key.shape() else {
-            return Err(CoreError::KeyRank);
+            return Err(KernelError::KeyRank);
         };
         let [capacity, cache_heads, cache_dim] = key_cache.shape() else {
-            return Err(CoreError::KeyCacheRank);
+            return Err(KernelError::KeyCacheRank);
         };
         if tokens != key_tokens
             || head_dim != key_dim
@@ -74,10 +72,10 @@ impl KernelBatch<'_> {
             || query_weight.shape() != [*head_dim]
             || key_weight.shape() != [*head_dim]
         {
-            return Err(CoreError::QkTransformShape);
+            return Err(KernelError::QkTransformShape);
         }
         if !head_dim.is_multiple_of(2) || config.offset + *tokens > *capacity {
-            return Err(CoreError::QkTransformOffset);
+            return Err(KernelError::QkTransformOffset);
         }
         let out = self.empty(query.shape(), DType::F16)?;
         let params = QkTransformParams {

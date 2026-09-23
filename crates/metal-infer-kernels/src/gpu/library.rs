@@ -4,26 +4,28 @@ use std::collections::HashMap;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
-use objc2_metal::{MTLDevice, MTLFunction, MTLLibrary};
+use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary};
 
-use crate::{CoreError, MetalContext, Pipeline};
+use crate::gpu::{GpuError, MetalContext};
 
-pub struct Library {
+pub(crate) type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+pub(crate) struct Library {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: RefCell<HashMap<String, Pipeline>>,
 }
 
 impl Library {
-    pub fn new(
+    pub(crate) fn new(
         context: &MetalContext,
         source: &str,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, GpuError> {
         let source = NSString::from_str(source);
         let library = context
             .device
             .newLibraryWithSource_options_error(&source, None)
-            .map_err(CoreError::ShaderCompilation)?;
+            .map_err(GpuError::ShaderCompilation)?;
         Ok(Self {
             device: context.device.clone(),
             library,
@@ -31,10 +33,10 @@ impl Library {
         })
     }
 
-    pub fn pipeline(
+    pub(crate) fn pipeline(
         &self,
         name: &str,
-    ) -> Result<Pipeline, CoreError> {
+    ) -> Result<Pipeline, GpuError> {
         if let Some(pipeline) = self.pipelines.borrow().get(name) {
             return Ok(pipeline.clone());
         }
@@ -42,11 +44,11 @@ impl Library {
         let function: Retained<ProtocolObject<dyn MTLFunction>> = self
             .library
             .newFunctionWithName(&function_name)
-            .ok_or(CoreError::MissingKernel)?;
+            .ok_or(GpuError::MissingKernel)?;
         let pipeline = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
-            .map_err(CoreError::PipelineCreation)?;
+            .map_err(GpuError::PipelineCreation)?;
         self.pipelines
             .borrow_mut()
             .insert(name.to_owned(), pipeline.clone());

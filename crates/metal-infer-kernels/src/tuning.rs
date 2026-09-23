@@ -1,9 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use metal_infer_runtime::CoreError;
-
-use crate::Kernels;
+use crate::{KernelError, Kernels};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeGemvConfig {
@@ -172,10 +170,10 @@ pub struct KernelSelection {
 }
 
 impl KernelSelection {
-    pub fn validate(&self) -> Result<(), CoreError> {
+    pub fn validate(&self) -> Result<(), KernelError> {
         for entry in &self.flash_decode_blocks {
             if !matches!(entry.block, 32 | 64 | 128 | 256) {
-                return Err(CoreError::FlashDecodeBlockSize);
+                return Err(KernelError::FlashDecodeBlockSize);
             }
         }
         Ok(())
@@ -207,7 +205,7 @@ impl Kernels {
     pub fn select(
         &self,
         selection: &KernelSelection,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), KernelError> {
         selection.validate()?;
         *self.tuning.selection.borrow_mut() = selection.clone();
         Ok(())

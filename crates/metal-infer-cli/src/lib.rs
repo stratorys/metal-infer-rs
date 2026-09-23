@@ -4,10 +4,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use metal_infer_kernels::Kernels;
+use metal_infer_kernels::{Kernels, MetalContext};
 use metal_infer_models::Qwen3Model;
 use metal_infer_planner::Plan;
-use metal_infer_runtime::MetalContext;
 use tracing_subscriber::EnvFilter;
 
 pub use crate::error::{CliError, ServerError};

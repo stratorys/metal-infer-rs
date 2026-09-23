@@ -8,13 +8,12 @@ mod norm;
 mod rope;
 mod sampling;
 
-use metal_infer_runtime::{CoreError, DType, Tensor};
 use objc2_metal::MTLSize;
 
 pub use attention::{AttentionConfig, AttentionKind};
 pub use rope::QkNormRopeCacheConfig;
 
-use crate::{KernelBatch, Kernels};
+use crate::{DType, GpuError, KernelBatch, KernelError, Kernels, Tensor};
 
 #[repr(C)]
 struct MatrixParams {
@@ -86,8 +85,8 @@ struct AttentionParams {
 impl Kernels {
     fn immediate<T>(
         &self,
-        encode: impl FnOnce(&mut KernelBatch<'_>) -> Result<T, CoreError>,
-    ) -> Result<T, CoreError> {
+        encode: impl FnOnce(&mut KernelBatch<'_>) -> Result<T, KernelError>,
+    ) -> Result<T, KernelError> {
         let mut batch = self.begin_batch()?;
         let output = encode(&mut batch)?;
         batch.finish()?;
@@ -98,7 +97,7 @@ impl Kernels {
         &self,
         left: &Tensor,
         right: &Tensor,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.immediate(|batch| batch.add(left, right))
     }
 
@@ -106,7 +105,7 @@ impl Kernels {
         &self,
         input: &Tensor,
         weight: &Tensor,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.immediate(|batch| batch.matmul(input, weight))
     }
 
@@ -115,7 +114,7 @@ impl Kernels {
         input: &Tensor,
         weight: &Tensor,
         epsilon: f32,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.immediate(|batch| batch.rms_norm(input, weight, epsilon))
     }
 
@@ -123,7 +122,7 @@ impl Kernels {
         &self,
         gate: &Tensor,
         up: &Tensor,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.immediate(|batch| batch.swiglu(gate, up))
     }
 
@@ -131,7 +130,7 @@ impl Kernels {
         &self,
         tokens: &Tensor,
         table: &Tensor,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.immediate(|batch| batch.embedding(tokens, table))
     }
 
@@ -140,7 +139,7 @@ impl Kernels {
         input: &Tensor,
         offset: usize,
         theta: f32,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.immediate(|batch| batch.rope(input, offset, theta))
     }
 
@@ -151,7 +150,7 @@ impl Kernels {
         value: &Tensor,
         config: AttentionConfig,
         kind: AttentionKind,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.immediate(|batch| batch.attention(query, key, value, config, kind))
     }
 
@@ -162,7 +161,7 @@ impl Kernels {
         value: &Tensor,
         config: AttentionConfig,
         block_keys: usize,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.immediate(|batch| {
             batch.attention_flash_decode_with_block(query, key, value, config, block_keys)
         })
@@ -173,63 +172,63 @@ impl Kernels {
         source: &Tensor,
         cache: &Tensor,
         offset: usize,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), KernelError> {
         self.immediate(|batch| batch.copy_into_cache(source, cache, offset))
     }
 }
 
-fn require_f16(tensor: &Tensor) -> Result<(), CoreError> {
+fn require_f16(tensor: &Tensor) -> Result<(), KernelError> {
     if tensor.dtype() == DType::F16 {
         Ok(())
     } else {
-        Err(CoreError::ExpectedF16)
+        Err(KernelError::Gpu(GpuError::ExpectedF16))
     }
 }
 
 fn require_same_shape(
     left: &Tensor,
     right: &Tensor,
-) -> Result<(), CoreError> {
+) -> Result<(), KernelError> {
     if left.shape() == right.shape() {
         Ok(())
     } else {
-        Err(CoreError::ShapeMismatch)
+        Err(KernelError::ShapeMismatch)
     }
 }
 
-fn matrix_shape(tensor: &Tensor) -> Result<[usize; 2], CoreError> {
+fn matrix_shape(tensor: &Tensor) -> Result<[usize; 2], KernelError> {
     tensor
         .shape()
         .try_into()
-        .map_err(|_| CoreError::ExpectedMatrix)
+        .map_err(|_| KernelError::ExpectedMatrix)
 }
 
-fn to_u32(value: usize) -> Result<u32, CoreError> {
-    value.try_into().map_err(|_| CoreError::U32Overflow)
+fn to_u32(value: usize) -> Result<u32, KernelError> {
+    value.try_into().map_err(|_| KernelError::U32Overflow)
 }
 
 fn checked_mul(
     left: usize,
     right: usize,
-) -> Result<usize, CoreError> {
-    left.checked_mul(right).ok_or(CoreError::DispatchOverflow)
+) -> Result<usize, KernelError> {
+    left.checked_mul(right).ok_or(KernelError::DispatchOverflow)
 }
 
 fn checked_add(
     left: usize,
     right: usize,
-) -> Result<usize, CoreError> {
-    left.checked_add(right).ok_or(CoreError::DispatchOverflow)
+) -> Result<usize, KernelError> {
+    left.checked_add(right).ok_or(KernelError::DispatchOverflow)
 }
 
 fn round_up(
     value: usize,
     multiple: usize,
-) -> Result<usize, CoreError> {
+) -> Result<usize, KernelError> {
     value
         .checked_add(multiple - 1)
         .map(|rounded| rounded / multiple * multiple)
-        .ok_or(CoreError::DispatchOverflow)
+        .ok_or(KernelError::DispatchOverflow)
 }
 
 const fn size(

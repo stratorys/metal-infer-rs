@@ -8,7 +8,6 @@ license.workspace = true
 half.workspace = true
 metal-infer-kernels = { path = "../metal-infer-kernels" }
 metal-infer-planner = { path = "../metal-infer-planner" }
-metal-infer-runtime = { path = "../metal-infer-runtime" }
 safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true

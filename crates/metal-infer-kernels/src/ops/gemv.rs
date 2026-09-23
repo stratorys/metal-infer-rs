@@ -1,7 +1,5 @@
-use metal_infer_runtime::{CoreError, DType, Tensor};
-
 use super::{MultiMatrixParams, checked_mul, matrix_shape, require_f16, size, to_u32};
-use crate::KernelBatch;
+use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
     pub fn matmul2(
@@ -9,7 +7,7 @@ impl KernelBatch<'_> {
         input: &Tensor,
         weight0: &Tensor,
         weight1: &Tensor,
-    ) -> Result<(Tensor, Tensor), CoreError> {
+    ) -> Result<(Tensor, Tensor), KernelError> {
         let [m, k] = matrix_shape(input)?;
         let [n0, k0] = matrix_shape(weight0)?;
         let [n1, k1] = matrix_shape(weight1)?;
@@ -17,7 +15,7 @@ impl KernelBatch<'_> {
         require_f16(weight0)?;
         require_f16(weight1)?;
         if k != k0 || k != k1 {
-            return Err(CoreError::Matmul2InnerDimension);
+            return Err(KernelError::Matmul2InnerDimension);
         }
         if m != 1 {
             return Ok((self.matmul(input, weight0)?, self.matmul(input, weight1)?));
@@ -59,7 +57,7 @@ impl KernelBatch<'_> {
         weight0: &Tensor,
         weight1: &Tensor,
         weight2: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor), CoreError> {
+    ) -> Result<(Tensor, Tensor, Tensor), KernelError> {
         let [m, k] = matrix_shape(input)?;
         let [n0, k0] = matrix_shape(weight0)?;
         let [n1, k1] = matrix_shape(weight1)?;
@@ -69,7 +67,7 @@ impl KernelBatch<'_> {
         require_f16(weight1)?;
         require_f16(weight2)?;
         if k != k0 || k != k1 || k != k2 {
-            return Err(CoreError::Matmul3InnerDimension);
+            return Err(KernelError::Matmul3InnerDimension);
         }
         if m != 1 {
             return Ok((

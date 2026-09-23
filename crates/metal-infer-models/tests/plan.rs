@@ -1,9 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use metal_infer_kernels::Kernels;
+use metal_infer_kernels::{Kernels, MetalContext};
 use metal_infer_models::{KvCache, Qwen3Model};
-use metal_infer_runtime::MetalContext;
 
 const PROMPT_TOKENS: usize = 600;
 const DECODE_STEPS: usize = 8;

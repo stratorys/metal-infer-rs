@@ -10,7 +10,6 @@ clap.workspace = true
 metal-infer-kernels = { path = "../metal-infer-kernels" }
 metal-infer-models = { path = "../metal-infer-models" }
 metal-infer-planner = { path = "../metal-infer-planner" }
-metal-infer-runtime = { path = "../metal-infer-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

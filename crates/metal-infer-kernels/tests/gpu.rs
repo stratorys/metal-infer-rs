@@ -1,15 +1,14 @@
 use half::f16;
 use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, DecodeGemvConfig, KernelSelection, Kernels,
-    QkNormRopeCacheConfig,
+    AttentionConfig, AttentionKind, DecodeGemvConfig, KernelError, KernelSelection, Kernels,
+    MetalContext, QkNormRopeCacheConfig,
 };
-use metal_infer_runtime::{CoreError, MetalContext};
 
 const TOLERANCE: f32 = 0.02;
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn argmax_f16_matches_cpu() -> Result<(), CoreError> {
+fn argmax_f16_matches_cpu() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     for size in [1, 2, 31, 32, 33, 2048, 2049, 151_936] {
@@ -59,7 +58,7 @@ fn argmax_f16_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn speculative_embedding_handles_missing_argmax() -> Result<(), CoreError> {
+fn speculative_embedding_handles_missing_argmax() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let logits = context.tensor_f16_bits(&[0x7c00, 0x7e00], &[2])?;
@@ -80,7 +79,7 @@ fn speculative_embedding_handles_missing_argmax() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn matmul_matches_cpu() -> Result<(), CoreError> {
+fn matmul_matches_cpu() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input = context.tensor_f16(&[1.0, 2.0, 3.0, 4.0], &[2, 2])?;
@@ -92,7 +91,7 @@ fn matmul_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn matmul_variants_match_cpu_reference() -> Result<(), CoreError> {
+fn matmul_variants_match_cpu_reference() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     for (m, n, k) in [
@@ -122,7 +121,7 @@ fn matmul_variants_match_cpu_reference() -> Result<(), CoreError> {
 }
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn matvec_matches_cpu() -> Result<(), CoreError> {
+fn matvec_matches_cpu() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input = context.tensor_f16(&[1.0, 2.0, 3.0], &[1, 3])?;
@@ -134,7 +133,7 @@ fn matvec_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn kernel_profiler_records_only_enabled_dispatches() -> Result<(), CoreError> {
+fn kernel_profiler_records_only_enabled_dispatches() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input = context.tensor_f16(&[1.0, 2.0, 3.0], &[1, 3])?;
@@ -155,7 +154,7 @@ fn kernel_profiler_records_only_enabled_dispatches() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
+fn vectorized_matvec_matches_cpu() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input_values: Vec<f32> = (0..128).map(|index| index as f32 / 128.0 - 0.5).collect();
@@ -182,7 +181,7 @@ fn vectorized_matvec_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn matvec_variants_match_cpu_reference_at_qwen_shapes() -> Result<(), CoreError> {
+fn matvec_variants_match_cpu_reference_at_qwen_shapes() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     for (n, k) in [(1024, 1024), (1024, 2048), (1024, 3072), (65_537, 256)] {
@@ -209,7 +208,7 @@ fn matvec_variants_match_cpu_reference_at_qwen_shapes() -> Result<(), CoreError>
 }
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn simd_rms_norm_matches_cpu() -> Result<(), CoreError> {
+fn simd_rms_norm_matches_cpu() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input_values: Vec<f32> = (0..3 * 65)
@@ -235,7 +234,7 @@ fn simd_rms_norm_matches_cpu() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn fused_projections_match_cpu_reference() -> Result<(), CoreError> {
+fn fused_projections_match_cpu_reference() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     for k in [1024, 128, 127] {
@@ -273,7 +272,7 @@ fn fused_projections_match_cpu_reference() -> Result<(), CoreError> {
 }
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn fused_projections_match_cpu_reference_at_qwen_dimensions() -> Result<(), CoreError> {
+fn fused_projections_match_cpu_reference_at_qwen_dimensions() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input_values: Vec<f32> = (0..1024)
@@ -324,7 +323,7 @@ fn fused_projections_match_cpu_reference_at_qwen_dimensions() -> Result<(), Core
 }
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn fused_add_rms_norm_matches_individual_ops() -> Result<(), CoreError> {
+fn fused_add_rms_norm_matches_individual_ops() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let left = context.tensor_f16(&[1.0, -2.0, 3.0, 0.5, 0.25, -0.75], &[2, 3])?;
@@ -346,7 +345,7 @@ fn fused_add_rms_norm_matches_individual_ops() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn fused_decode_norm_projections_match_separate_ops() -> Result<(), CoreError> {
+fn fused_decode_norm_projections_match_separate_ops() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input_values: Vec<f32> = (0..256).map(|i| (i % 29) as f32 / 29.0 - 0.5).collect();
@@ -392,7 +391,8 @@ fn fused_decode_norm_projections_match_separate_ops() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn fused_decode_norm_projections_match_separate_ops_at_qwen_dimensions() -> Result<(), CoreError> {
+fn fused_decode_norm_projections_match_separate_ops_at_qwen_dimensions() -> Result<(), KernelError>
+{
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let values = |count: usize, modulus: usize, scale: f32| {
@@ -442,7 +442,7 @@ fn fused_decode_norm_projections_match_separate_ops_at_qwen_dimensions() -> Resu
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn fused_qk_transform_matches_individual_ops() -> Result<(), CoreError> {
+fn fused_qk_transform_matches_individual_ops() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let query_values: Vec<f32> = (0..32).map(|index| index as f32 / 16.0 - 1.0).collect();
@@ -481,7 +481,7 @@ fn fused_qk_transform_matches_individual_ops() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn batched_dependent_kernels_match_eager_execution() -> Result<(), CoreError> {
+fn batched_dependent_kernels_match_eager_execution() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let left = context.tensor_f16(&[1.0, 2.0, 3.0, 4.0], &[2, 2])?;
@@ -503,7 +503,7 @@ fn batched_dependent_kernels_match_eager_execution() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn invalid_batch_can_be_abandoned() -> Result<(), CoreError> {
+fn invalid_batch_can_be_abandoned() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let input = context.tensor_f16(&[1.0, 2.0], &[1, 2])?;
@@ -518,7 +518,7 @@ fn invalid_batch_can_be_abandoned() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn tiled_attention_matches_reference() -> Result<(), CoreError> {
+fn tiled_attention_matches_reference() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let query_values: Vec<f32> = (0..2 * 2 * 128)
@@ -587,7 +587,7 @@ fn tiled_attention_matches_reference() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn flash_prefill_matches_reference_at_tile_edges() -> Result<(), CoreError> {
+fn flash_prefill_matches_reference_at_tile_edges() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     for head_dim in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
@@ -636,7 +636,7 @@ fn flash_prefill_matches_reference_at_tile_edges() -> Result<(), CoreError> {
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn flash_decode_matches_reference_across_block_boundaries() -> Result<(), CoreError> {
+fn flash_decode_matches_reference_across_block_boundaries() -> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let query_values: Vec<f32> = (0..2 * 128)
@@ -674,8 +674,8 @@ fn flash_decode_matches_reference_across_block_boundaries() -> Result<(), CoreEr
 
 #[test]
 #[ignore = "requires direct access to an Apple Metal device"]
-fn flash_decode_matches_reference_for_multiple_gqa_groups_and_causal_limit() -> Result<(), CoreError>
-{
+fn flash_decode_matches_reference_for_multiple_gqa_groups_and_causal_limit()
+-> Result<(), KernelError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     let query_values: Vec<f32> = (0..16 * 128)
@@ -753,7 +753,7 @@ fn cpu_matmul(
 fn select(
     kernels: &Kernels,
     change: impl FnOnce(&mut KernelSelection),
-) -> Result<(), CoreError> {
+) -> Result<(), KernelError> {
     let mut selection = kernels.selection();
     change(&mut selection);
     kernels.select(&selection)

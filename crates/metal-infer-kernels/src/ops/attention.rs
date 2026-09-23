@@ -1,7 +1,5 @@
-use metal_infer_runtime::{CoreError, DType, Tensor};
-
 use super::{AttentionParams, checked_mul, require_f16, size, to_u32};
-use crate::KernelBatch;
+use crate::{DType, KernelBatch, KernelError, Tensor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttentionKind {
@@ -29,7 +27,7 @@ impl KernelBatch<'_> {
         value: &Tensor,
         config: AttentionConfig,
         kind: AttentionKind,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.attention_with_flash_block(query, key, value, config, kind, None)
     }
 
@@ -40,7 +38,7 @@ impl KernelBatch<'_> {
         value: &Tensor,
         config: AttentionConfig,
         block_keys: usize,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         self.attention_with_flash_block(
             query,
             key,
@@ -59,7 +57,7 @@ impl KernelBatch<'_> {
         config: AttentionConfig,
         kind: AttentionKind,
         flash_block: Option<usize>,
-    ) -> Result<Tensor, CoreError> {
+    ) -> Result<Tensor, KernelError> {
         let kind = if kind == AttentionKind::FlashDecode && config.head_dim != 128 {
             AttentionKind::DecodeSplitKv
         } else {
@@ -69,13 +67,13 @@ impl KernelBatch<'_> {
         require_f16(key)?;
         require_f16(value)?;
         let [tokens, query_heads, query_dim] = query.shape() else {
-            return Err(CoreError::QueryRank);
+            return Err(KernelError::QueryRank);
         };
         let [kv_length, key_heads, key_dim] = key.shape() else {
-            return Err(CoreError::KeyRank);
+            return Err(KernelError::KeyRank);
         };
         let [value_length, value_heads, value_dim] = value.shape() else {
-            return Err(CoreError::ValueRank);
+            return Err(KernelError::ValueRank);
         };
         if *query_heads != config.query_heads
             || *query_dim != config.head_dim
@@ -85,21 +83,21 @@ impl KernelBatch<'_> {
             || value_heads != key_heads
             || value_dim != key_dim
         {
-            return Err(CoreError::AttentionShape);
+            return Err(KernelError::AttentionShape);
         }
         if config.kv_heads == 0 || !config.query_heads.is_multiple_of(config.kv_heads) {
-            return Err(CoreError::AttentionHeadRatio);
+            return Err(KernelError::AttentionHeadRatio);
         }
         if kind != AttentionKind::Reference
             && (!config.head_dim.is_power_of_two() || config.head_dim > 256)
         {
-            return Err(CoreError::TiledAttentionHeadDim);
+            return Err(KernelError::TiledAttentionHeadDim);
         }
         let flash_block_keys = if kind == AttentionKind::FlashDecode {
             let block = flash_block
                 .unwrap_or_else(|| self.kernels.flash_decode_block_for_length(*kv_length));
             if !matches!(block, 32 | 64 | 128 | 256) {
-                return Err(CoreError::FlashDecodeBlockSize);
+                return Err(KernelError::FlashDecodeBlockSize);
             }
             block
         } else {
@@ -121,11 +119,11 @@ impl KernelBatch<'_> {
             AttentionKind::DecodeSplitKv | AttentionKind::FlashDecode
         ) && *tokens != 1
         {
-            return Err(CoreError::DecodeAttentionTokens);
+            return Err(KernelError::DecodeAttentionTokens);
         }
         if kind == AttentionKind::FlashDecode {
             if config.query_heads / config.kv_heads != 2 {
-                return Err(CoreError::FlashDecodeHeadRatio);
+                return Err(KernelError::FlashDecodeHeadRatio);
             }
             let available = if config.causal {
                 (*kv_length).min(config.query_offset.saturating_add(1))
@@ -133,13 +131,13 @@ impl KernelBatch<'_> {
                 *kv_length
             };
             if available == 0 {
-                return Err(CoreError::FlashDecodeEmpty);
+                return Err(KernelError::FlashDecodeEmpty);
             }
             let blocks = available.div_ceil(flash_block_keys);
             let partial_width = config
                 .head_dim
                 .checked_add(2)
-                .ok_or_else(|| CoreError::FlashDecodePartialOverflow)?;
+                .ok_or_else(|| KernelError::FlashDecodePartialOverflow)?;
             let scratch = self.empty(&[config.kv_heads, blocks, 2, partial_width], DType::F32)?;
             let groups = checked_mul(config.kv_heads, blocks)?;
             self.dispatch(

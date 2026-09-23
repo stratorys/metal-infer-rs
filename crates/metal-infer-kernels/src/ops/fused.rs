@@ -1,9 +1,7 @@
-use metal_infer_runtime::{CoreError, DType, Tensor};
-
 use super::{
     NormMultiMatrixParams, checked_mul, matrix_shape, require_f16, require_same_shape, size, to_u32,
 };
-use crate::KernelBatch;
+use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
     pub fn rms_norm_matmul3(
@@ -14,7 +12,7 @@ impl KernelBatch<'_> {
         weight1: &Tensor,
         weight2: &Tensor,
         epsilon: f32,
-    ) -> Result<(Tensor, Tensor, Tensor), CoreError> {
+    ) -> Result<(Tensor, Tensor, Tensor), KernelError> {
         require_f16(input)?;
         require_f16(norm_weight)?;
         require_f16(weight0)?;
@@ -31,7 +29,7 @@ impl KernelBatch<'_> {
             || k1 != width
             || k2 != width
         {
-            return Err(CoreError::RmsNormMatmul3Shape);
+            return Err(KernelError::RmsNormMatmul3Shape);
         }
         let out0 = self.empty(&[1, n0], DType::F16)?;
         let out1 = self.empty(&[1, n1], DType::F16)?;
@@ -81,7 +79,7 @@ impl KernelBatch<'_> {
         weight0: &Tensor,
         weight1: &Tensor,
         epsilon: f32,
-    ) -> Result<(Tensor, Tensor, Tensor), CoreError> {
+    ) -> Result<(Tensor, Tensor, Tensor), KernelError> {
         require_f16(left)?;
         require_f16(right)?;
         require_f16(norm_weight)?;
@@ -97,7 +95,7 @@ impl KernelBatch<'_> {
             || k0 != width
             || k1 != width
         {
-            return Err(CoreError::AddRmsNormMatmul2Shape);
+            return Err(KernelError::AddRmsNormMatmul2Shape);
         }
         let residual = self.empty(&[1, width], DType::F16)?;
         let out0 = self.empty(&[1, n0], DType::F16)?;

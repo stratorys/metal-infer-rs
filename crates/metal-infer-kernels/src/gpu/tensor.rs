@@ -5,8 +5,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
-use crate::CoreError;
-use crate::context::ScratchLease;
+use crate::gpu::GpuError;
+use crate::gpu::scratch::ScratchLease;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DType {
@@ -86,10 +86,6 @@ impl Tensor {
         }
     }
 
-    pub fn buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.buffer
-    }
-
     pub const fn offset_bytes(&self) -> usize {
         self.offset_bytes
     }
@@ -117,14 +113,14 @@ impl Tensor {
     pub fn reshape(
         &self,
         shape: &[usize],
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, GpuError> {
         let length = shape.iter().try_fold(1usize, |value, dimension| {
             value
                 .checked_mul(*dimension)
-                .ok_or_else(|| CoreError::ReshapeOverflow)
+                .ok_or_else(|| GpuError::ReshapeOverflow)
         })?;
         if shape.is_empty() || shape.contains(&0) || length != self.len() {
-            return Err(CoreError::ReshapeMismatch);
+            return Err(GpuError::ReshapeMismatch);
         }
         Ok(Self {
             buffer: self.buffer.clone(),
@@ -138,15 +134,15 @@ impl Tensor {
     pub fn prefix(
         &self,
         first_dimension: usize,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, GpuError> {
         let Some(capacity) = self.shape.first().copied() else {
-            return Err(CoreError::PrefixRank);
+            return Err(GpuError::PrefixRank);
         };
         if first_dimension == 0 || first_dimension > capacity {
-            return Err(CoreError::PrefixOutOfRange);
+            return Err(GpuError::PrefixOutOfRange);
         }
         let mut shape = self.shape.clone();
-        let first = shape.first_mut().ok_or_else(|| CoreError::PrefixRank)?;
+        let first = shape.first_mut().ok_or_else(|| GpuError::PrefixRank)?;
         *first = first_dimension;
         Ok(Self {
             buffer: self.buffer.clone(),
@@ -160,12 +156,12 @@ impl Tensor {
     pub fn row(
         &self,
         row: usize,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, GpuError> {
         let [rows, width] = self.shape.as_slice() else {
-            return Err(CoreError::RowRank);
+            return Err(GpuError::RowRank);
         };
         if row >= *rows {
-            return Err(CoreError::RowOutOfRange);
+            return Err(GpuError::RowOutOfRange);
         }
         Ok(Self {
             buffer: self.buffer.clone(),
@@ -180,15 +176,15 @@ impl Tensor {
         &self,
         start: usize,
         len: usize,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, GpuError> {
         let [capacity] = self.shape.as_slice() else {
-            return Err(CoreError::SliceRank);
+            return Err(GpuError::SliceRank);
         };
         let end = start
             .checked_add(len)
-            .ok_or_else(|| CoreError::SliceOverflow)?;
+            .ok_or_else(|| GpuError::SliceOverflow)?;
         if len == 0 || end > *capacity {
-            return Err(CoreError::SliceOutOfRange);
+            return Err(GpuError::SliceOutOfRange);
         }
         Ok(Self {
             buffer: self.buffer.clone(),
@@ -202,9 +198,9 @@ impl Tensor {
     pub fn with_f16_bits<T>(
         &self,
         read: impl FnOnce(&[u16]) -> T,
-    ) -> Result<T, CoreError> {
+    ) -> Result<T, GpuError> {
         if self.dtype != DType::F16 {
-            return Err(CoreError::ExpectedF16);
+            return Err(GpuError::ExpectedF16);
         }
         // SAFETY: the caller reads only after command completion; Tensor owns
         // the shared buffer and checked views remain within its allocation.
@@ -214,9 +210,9 @@ impl Tensor {
         Ok(read(values))
     }
 
-    pub fn to_f32_vec(&self) -> Result<Vec<f32>, CoreError> {
+    pub fn to_f32_vec(&self) -> Result<Vec<f32>, GpuError> {
         if self.dtype != DType::F16 {
-            return Err(CoreError::ExpectedF16);
+            return Err(GpuError::ExpectedF16);
         }
         // SAFETY: offset_bytes was derived from a checked tensor view.
         let pointer =
@@ -231,9 +227,9 @@ impl Tensor {
             .collect())
     }
 
-    pub fn to_u32_vec(&self) -> Result<Vec<u32>, CoreError> {
+    pub fn to_u32_vec(&self) -> Result<Vec<u32>, GpuError> {
         if self.dtype != DType::U32 {
-            return Err(CoreError::ExpectedU32);
+            return Err(GpuError::ExpectedU32);
         }
         // SAFETY: offset_bytes was derived from a checked tensor view.
         let pointer =

@@ -693,7 +693,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "metal-infer-cli"
 version = "0.1.0"
 dependencies = [
- "axum",
  "clap",
  "metal-infer-kernels",
  "metal-infer-models",
@@ -702,8 +701,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
- "tokio-stream",
  "tracing",
  "tracing-subscriber",
 ]
@@ -745,11 +742,16 @@ dependencies = [
 name = "metal-infer-runtime"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "http-body-util",
  "metal-infer-kernels",
  "metal-infer-models",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
 ]
 
@@ -1346,6 +1348,7 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

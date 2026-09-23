@@ -1,5 +1,3 @@
-mod server;
-
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -8,9 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model};
 use metal_infer_kernels::MetalContext;
 use metal_infer_models::{GenerationOptions, KvCache, ModelSource, ModelTokenizer};
-use metal_infer_runtime::WorkerOptions;
-
-use crate::server::{ServerOptions, serve};
+use metal_infer_runtime::{ServerOptions, WorkerOptions, serve};
 
 #[derive(Parser)]
 #[command(name = "metal-infer", about = "Qwen3 inference on Apple Metal")]
@@ -98,6 +94,7 @@ fn serve_command(arguments: ServeArguments) -> Result<(), CliError> {
         },
         bind: arguments.bind,
     })
+    .map_err(CliError::from)
 }
 
 fn list_plan(

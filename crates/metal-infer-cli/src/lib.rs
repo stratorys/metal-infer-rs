@@ -9,7 +9,7 @@ use metal_infer_models::Qwen3Model;
 use metal_infer_planner::Plan;
 use tracing_subscriber::EnvFilter;
 
-pub use crate::error::{CliError, RequestError, ServerError};
+pub use crate::error::CliError;
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum LogFormat {

@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use objc2_metal::{
     MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLStorageMode,
 };
 
-use crate::gpu::{GpuError, MetalContext};
+use crate::gpu::GpuError;
 
 const PROFILE_SAMPLE_CAPACITY: usize = 2048;
 
@@ -19,13 +20,13 @@ pub struct KernelDispatchProfile {
     pub gpu_time: Duration,
 }
 
-pub(super) struct KernelBatchProfile {
-    pub(super) buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
+pub struct KernelBatchProfile {
+    pub buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
     kernels: Vec<String>,
 }
 
 impl KernelBatchProfile {
-    pub(super) fn reserve(
+    pub fn reserve(
         &mut self,
         kernel: &str,
     ) -> Result<usize, GpuError> {
@@ -37,7 +38,7 @@ impl KernelBatchProfile {
         Ok(index)
     }
 
-    pub(super) fn resolve(
+    fn resolve(
         self,
         nanoseconds_per_tick: f64,
     ) -> Result<Vec<KernelDispatchProfile>, GpuError> {
@@ -86,25 +87,32 @@ impl KernelBatchProfile {
     }
 }
 
-impl MetalContext {
-    /// Enables timestamp sampling for subsequent batches. Each profiled dispatch
-    /// uses a separate compute pass, so timings are diagnostic only.
-    pub fn set_kernel_profiling(
+pub struct Profiler {
+    tick_nanoseconds: Cell<Option<f64>>,
+    profiles: RefCell<Vec<KernelDispatchProfile>>,
+}
+
+impl Profiler {
+    pub const fn new() -> Self {
+        Self {
+            tick_nanoseconds: Cell::new(None),
+            profiles: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn set_enabled(
         &self,
+        device: &ProtocolObject<dyn MTLDevice>,
         enabled: bool,
     ) -> Result<(), GpuError> {
         if !enabled {
-            self.profile_tick_nanoseconds.set(None);
+            self.tick_nanoseconds.set(None);
             return Ok(());
         }
-        if !self
-            .device
-            .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
-        {
+        if !device.supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary) {
             return Err(GpuError::StageBoundaryCountersUnsupported);
         }
-        let sets = self
-            .device
+        let sets = device
             .counterSets()
             .ok_or_else(|| GpuError::NoCounterSets)?;
         let has_timestamps = (0..sets.count()).any(|index| {
@@ -121,7 +129,7 @@ impl MetalContext {
         let mut gpu_end = 0;
         // SAFETY: all four pointers refer to writable u64 values.
         unsafe {
-            self.device.sampleTimestamps_gpuTimestamp(
+            device.sampleTimestamps_gpuTimestamp(
                 NonNull::from(&mut cpu_start),
                 NonNull::from(&mut gpu_start),
             )
@@ -129,7 +137,7 @@ impl MetalContext {
         std::thread::sleep(Duration::from_millis(20));
         // SAFETY: both pointers refer to writable u64 values.
         unsafe {
-            self.device.sampleTimestamps_gpuTimestamp(
+            device.sampleTimestamps_gpuTimestamp(
                 NonNull::from(&mut cpu_end),
                 NonNull::from(&mut gpu_end),
             )
@@ -140,22 +148,23 @@ impl MetalContext {
         // Metal's CPU timestamps are already nanoseconds; GPU timestamps use
         // the device clock and need the ratio of the two sampled spans.
         let nanoseconds_per_tick = (cpu_end - cpu_start) as f64 / (gpu_end - gpu_start) as f64;
-        self.kernel_profiles.borrow_mut().clear();
-        self.profile_tick_nanoseconds
-            .set(Some(nanoseconds_per_tick));
+        self.profiles.borrow_mut().clear();
+        self.tick_nanoseconds.set(Some(nanoseconds_per_tick));
         Ok(())
     }
 
-    pub fn take_kernel_profiles(&self) -> Vec<KernelDispatchProfile> {
-        std::mem::take(&mut *self.kernel_profiles.borrow_mut())
+    pub fn take(&self) -> Vec<KernelDispatchProfile> {
+        std::mem::take(&mut *self.profiles.borrow_mut())
     }
 
-    pub(super) fn new_batch_profile(&self) -> Result<Option<KernelBatchProfile>, GpuError> {
-        if self.profile_tick_nanoseconds.get().is_none() {
+    pub fn new_batch_profile(
+        &self,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<Option<KernelBatchProfile>, GpuError> {
+        if self.tick_nanoseconds.get().is_none() {
             return Ok(None);
         }
-        let sets = self
-            .device
+        let sets = device
             .counterSets()
             .ok_or_else(|| GpuError::NoCounterSets)?;
         let counter_set = (0..sets.count())
@@ -170,8 +179,7 @@ impl MetalContext {
         descriptor.setStorageMode(MTLStorageMode::Shared);
         // SAFETY: the constant is below the Metal sample-buffer limit on Apple GPUs.
         unsafe { descriptor.setSampleCount(PROFILE_SAMPLE_CAPACITY) };
-        let buffer = self
-            .device
+        let buffer = device
             .newCounterSampleBufferWithDescriptor_error(&descriptor)
             .map_err(GpuError::TimestampBufferCreation)?;
         Ok(Some(KernelBatchProfile {
@@ -180,15 +188,15 @@ impl MetalContext {
         }))
     }
 
-    pub(super) fn record_kernel_profiles(
+    pub fn record(
         &self,
         profile: KernelBatchProfile,
     ) -> Result<(), GpuError> {
         let nanoseconds_per_tick = self
-            .profile_tick_nanoseconds
+            .tick_nanoseconds
             .get()
             .ok_or_else(|| GpuError::ProfilingDisabled)?;
-        self.kernel_profiles
+        self.profiles
             .borrow_mut()
             .extend(profile.resolve(nanoseconds_per_tick)?);
         Ok(())

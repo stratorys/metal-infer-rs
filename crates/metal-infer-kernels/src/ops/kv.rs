@@ -1,4 +1,5 @@
 use super::{require_f16, size, to_u32};
+use crate::kernels::dispatch;
 use crate::{KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
@@ -24,7 +25,8 @@ impl KernelBatch<'_> {
         }
         let stride = source_heads * source_dim;
         let params = [to_u32(*source_tokens)?, to_u32(offset)?, to_u32(stride)?];
-        self.dispatch(
+        dispatch(
+            self,
             "copy_kv_f16",
             &[source, cache],
             &params,

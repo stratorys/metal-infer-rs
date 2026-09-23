@@ -6,10 +6,9 @@ mod profiling;
 mod scratch;
 mod tensor;
 
-pub(crate) use batch::CommandBatch;
-pub use batch::{DispatchStats, PendingBatch};
-pub use context::MetalContext;
+pub use batch::{CommandBatch, DispatchStats, PendingBatch};
+pub use context::{MetalContext, begin_batch};
 pub use error::GpuError;
-pub(crate) use library::Library;
+pub use library::Library;
 pub use profiling::KernelDispatchProfile;
 pub use tensor::{DType, Tensor};

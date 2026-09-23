@@ -9,10 +9,11 @@ use objc2_metal::{
     MTLComputePassDescriptor, MTLSize,
 };
 
-use crate::gpu::context::checked_elements;
+use crate::gpu::context::{self, checked_elements};
 use crate::gpu::library::Pipeline;
 use crate::gpu::profiling::KernelBatchProfile;
 use crate::gpu::scratch::{self, ScratchPool};
+use crate::gpu::tensor::{from_scratch, metal_buffer};
 use crate::gpu::{DType, GpuError, MetalContext, Tensor};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -21,7 +22,7 @@ pub struct DispatchStats {
     pub wall_time: Duration,
 }
 
-pub(crate) struct CommandBatch<'context> {
+pub struct CommandBatch<'context> {
     context: &'context MetalContext,
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
@@ -40,7 +41,7 @@ pub struct PendingBatch<'context> {
 }
 
 impl<'context> CommandBatch<'context> {
-    pub(super) fn new(
+    pub fn new(
         context: &'context MetalContext,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         profile: Option<KernelBatchProfile>,
@@ -65,7 +66,7 @@ impl<'context> CommandBatch<'context> {
         })
     }
 
-    pub(crate) fn dispatch<T>(
+    pub fn dispatch<T>(
         &mut self,
         pipeline: &Pipeline,
         kernel: &str,
@@ -94,8 +95,8 @@ impl<'context> CommandBatch<'context> {
             // wrapper above.
             unsafe {
                 encoder.setBuffer_offset_atIndex(
-                    Some(tensor.buffer.as_ref()),
-                    tensor.offset_bytes,
+                    Some(metal_buffer(tensor)),
+                    tensor.offset_bytes(),
                     index,
                 )
             };
@@ -146,7 +147,7 @@ impl<'context> CommandBatch<'context> {
             .ok_or(GpuError::ProfiledEncoderCreation)
     }
 
-    pub(crate) fn empty(
+    pub fn empty(
         &self,
         shape: &[usize],
         dtype: DType,
@@ -155,8 +156,8 @@ impl<'context> CommandBatch<'context> {
         let byte_len = elements
             .checked_mul(dtype.size())
             .ok_or_else(|| GpuError::ByteLengthOverflow)?;
-        let allocation = scratch::allocate(&self.scratch, &self.context.device, byte_len)?;
-        Ok(Tensor::new_scratch(
+        let allocation = scratch::allocate(&self.scratch, context::device(self.context), byte_len)?;
+        Ok(from_scratch(
             allocation.buffer,
             allocation.offset_bytes,
             shape.to_vec(),
@@ -169,7 +170,7 @@ impl<'context> CommandBatch<'context> {
         self.encoder.as_deref().ok_or(GpuError::EncoderFinished)
     }
 
-    pub(crate) fn commit(mut self) -> Result<PendingBatch<'context>, GpuError> {
+    pub fn commit(mut self) -> Result<PendingBatch<'context>, GpuError> {
         self.end_compute_encoding()?;
         let started = Instant::now();
         self.command_buffer.commit();
@@ -184,7 +185,7 @@ impl<'context> CommandBatch<'context> {
         })
     }
 
-    pub(crate) fn finish(self) -> Result<DispatchStats, GpuError> {
+    pub fn finish(self) -> Result<DispatchStats, GpuError> {
         self.commit()?.wait()
     }
 }
@@ -204,7 +205,7 @@ impl PendingBatch<'_> {
         let gpu_seconds =
             (self.command_buffer.GPUEndTime() - self.command_buffer.GPUStartTime()).max(0.0);
         if let Some(profile) = self.profile.take() {
-            self.context.record_kernel_profiles(profile)?;
+            context::profiler(self.context).record(profile)?;
         }
         Ok(DispatchStats {
             gpu_time: Duration::from_secs_f64(gpu_seconds),

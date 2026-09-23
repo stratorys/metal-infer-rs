@@ -1,4 +1,5 @@
 use super::{QkTransformParams, RopeParams, checked_add, checked_mul, require_f16, size, to_u32};
+use crate::kernels::dispatch;
 use crate::{DType, KernelBatch, KernelError, Tensor};
 
 #[derive(Clone, Copy, Debug)]
@@ -32,7 +33,8 @@ impl KernelBatch<'_> {
             theta,
             padding: [0; 3],
         };
-        self.dispatch(
+        dispatch(
+            self,
             "rope_f16",
             &[input, &out],
             &params,
@@ -90,7 +92,8 @@ impl KernelBatch<'_> {
         };
         let heads = checked_add(*query_heads, *kv_heads)?;
         let groups = checked_mul(*tokens, heads)?;
-        self.dispatch(
+        dispatch(
+            self,
             "qk_norm_rope_cache_f16",
             &[query, key, query_weight, key_weight, &out, key_cache],
             &params,

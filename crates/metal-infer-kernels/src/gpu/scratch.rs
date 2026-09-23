@@ -11,31 +11,31 @@ use crate::gpu::GpuError;
 const SCRATCH_ALIGNMENT: usize = 256;
 const SCRATCH_CHUNK_BYTES: usize = 1024 * 1024;
 
-pub(super) type ScratchPool = Rc<RefCell<ScratchState>>;
+pub type ScratchPool = Rc<RefCell<ScratchState>>;
 
 struct ScratchChunk {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     free: Vec<Range<usize>>,
 }
 
-pub(super) struct ScratchState {
+pub struct ScratchState {
     chunks: Vec<ScratchChunk>,
     busy: bool,
 }
 
-pub(crate) struct ScratchLease {
+pub struct ScratchLease {
     state: Weak<RefCell<ScratchState>>,
     chunk: usize,
     range: Range<usize>,
 }
 
-pub(super) struct ScratchAllocation {
-    pub(super) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(super) offset_bytes: usize,
-    pub(super) lease: Rc<ScratchLease>,
+pub struct ScratchAllocation {
+    pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub offset_bytes: usize,
+    pub lease: Rc<ScratchLease>,
 }
 
-pub(super) fn acquire(pools: &RefCell<Vec<ScratchPool>>) -> ScratchPool {
+pub fn acquire(pools: &RefCell<Vec<ScratchPool>>) -> ScratchPool {
     let mut pools = pools.borrow_mut();
     if let Some(state) = pools.iter().find(|state| !state.borrow().busy) {
         let state = state.clone();
@@ -51,11 +51,11 @@ pub(super) fn acquire(pools: &RefCell<Vec<ScratchPool>>) -> ScratchPool {
     }
 }
 
-pub(super) fn release(pool: &ScratchPool) {
+pub fn release(pool: &ScratchPool) {
     pool.borrow_mut().busy = false;
 }
 
-pub(super) fn allocate(
+pub fn allocate(
     pool: &ScratchPool,
     device: &ProtocolObject<dyn MTLDevice>,
     byte_len: usize,

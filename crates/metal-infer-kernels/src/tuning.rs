@@ -1,4 +1,4 @@
-use crate::{KernelError, Kernels};
+use crate::KernelError;
 
 const M4_PRO_DEVICE_NAME: &str = "Apple M4 Pro";
 
@@ -140,7 +140,7 @@ const M4_PRO_TWO_QUERY_HEADS_FLASH_DECODE_BLOCKS: &[FlashDecodeBlock] = &[
     },
 ];
 
-pub(crate) fn single_rows(
+pub fn single_rows(
     device: DeviceProfile,
     n: usize,
     k: usize,
@@ -156,7 +156,7 @@ pub(crate) fn single_rows(
         .map_or(fallback, |shape| shape.rows.for_config(config))
 }
 
-pub(crate) fn fused_norm_rows(
+pub fn fused_norm_rows(
     device: DeviceProfile,
     widths: [usize; 3],
     k: usize,
@@ -214,81 +214,71 @@ impl KernelSelection {
 }
 
 #[derive(Clone)]
-pub(crate) struct Tuning {
+pub struct Tuning {
     device: DeviceProfile,
     selection: KernelSelection,
 }
 
 impl Tuning {
-    pub(crate) fn new(device_name: &str) -> Self {
+    pub fn new(device_name: &str) -> Self {
         Self {
             device: DeviceProfile::from_device_name(device_name),
             selection: KernelSelection::default(),
         }
     }
-}
 
-impl Kernels {
     pub const fn device(&self) -> DeviceProfile {
-        self.tuning.device
+        self.device
     }
 
     pub const fn selection(&self) -> &KernelSelection {
-        &self.tuning.selection
+        &self.selection
     }
 
     pub fn with_selection(
-        mut self,
+        self,
         selection: KernelSelection,
     ) -> Result<Self, KernelError> {
         selection.validate()?;
-        self.tuning.selection = selection;
-        Ok(self)
+        Ok(Self { selection, ..self })
     }
 
-    pub(crate) const fn is_m4_pro(&self) -> bool {
-        matches!(self.tuning.device, DeviceProfile::M4Pro)
+    pub const fn is_m4_pro(&self) -> bool {
+        matches!(self.device, DeviceProfile::M4Pro)
     }
 
-    pub(crate) fn flash_decode_block_for_length(
+    pub fn flash_decode_block_for_length(
         &self,
         length: usize,
     ) -> usize {
-        self.tuning
-            .selection
+        self.selection
             .flash_decode_blocks
             .iter()
             .find(|entry| length <= entry.max_length)
             .map_or(64, |entry| entry.block)
     }
 
-    pub(crate) fn matvec_rows_for_shape(
+    pub fn matvec_rows_for_shape(
         &self,
         n: usize,
         k: usize,
         vocabulary: bool,
     ) -> usize {
         single_rows(
-            self.tuning.device,
+            self.device,
             n,
             k,
             if vocabulary { 0 } else { 4 },
-            self.tuning.selection.decode_gemv,
+            self.selection.decode_gemv,
         )
     }
 
-    pub(crate) fn fused_norm_matvec_rows_for_shape(
+    pub fn fused_norm_matvec_rows_for_shape(
         &self,
         widths: [usize; 3],
         k: usize,
     ) -> usize {
-        fused_norm_rows(
-            self.tuning.device,
-            widths,
-            k,
-            2,
-            self.tuning.selection.decode_gemv,
-        )
+        fused_norm_rows(self.device, widths, k, 2, self.selection.decode_gemv)
     }
 }
 

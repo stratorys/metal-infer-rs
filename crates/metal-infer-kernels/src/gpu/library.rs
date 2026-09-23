@@ -6,34 +6,35 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary};
 
+use crate::gpu::context::device;
 use crate::gpu::{GpuError, MetalContext};
 
-pub(crate) type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
-pub(crate) struct Library {
+pub struct Library {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: RefCell<HashMap<String, Pipeline>>,
 }
 
 impl Library {
-    pub(crate) fn new(
+    pub fn new(
         context: &MetalContext,
         source: &str,
     ) -> Result<Self, GpuError> {
+        let metal_device = device(context);
         let source = NSString::from_str(source);
-        let library = context
-            .device
+        let library = metal_device
             .newLibraryWithSource_options_error(&source, None)
             .map_err(GpuError::ShaderCompilation)?;
         Ok(Self {
-            device: context.device.clone(),
+            device: metal_device.clone(),
             library,
             pipelines: RefCell::new(HashMap::new()),
         })
     }
 
-    pub(crate) fn pipeline(
+    pub fn pipeline(
         &self,
         name: &str,
     ) -> Result<Pipeline, GpuError> {

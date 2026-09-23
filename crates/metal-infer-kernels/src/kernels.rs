@@ -2,11 +2,12 @@ use std::rc::Rc;
 
 use objc2_metal::MTLSize;
 
-use crate::KernelError;
 use crate::gpu::{
     CommandBatch, DType, DispatchStats, GpuError, Library, MetalContext, PendingBatch, Tensor,
+    begin_batch,
 };
 use crate::tuning::Tuning;
+use crate::{DeviceProfile, KernelError, KernelSelection};
 
 const PRELUDE: &str = include_str!("../metal/prelude.metal");
 const PRELUDE_INCLUDE: &str = "#include \"prelude.metal\"\n";
@@ -34,7 +35,7 @@ fn shader_source() -> String {
 pub struct Kernels {
     context: MetalContext,
     library: Rc<Library>,
-    pub(crate) tuning: Tuning,
+    tuning: Tuning,
 }
 
 impl Kernels {
@@ -51,17 +52,35 @@ impl Kernels {
         &self.context
     }
 
+    pub const fn device(&self) -> DeviceProfile {
+        self.tuning.device()
+    }
+
+    pub const fn selection(&self) -> &KernelSelection {
+        self.tuning.selection()
+    }
+
+    pub fn with_selection(
+        self,
+        selection: KernelSelection,
+    ) -> Result<Self, KernelError> {
+        Ok(Self {
+            tuning: self.tuning.with_selection(selection)?,
+            ..self
+        })
+    }
+
     pub fn begin_batch(&self) -> Result<KernelBatch<'_>, GpuError> {
         Ok(KernelBatch {
-            batch: self.context.begin_batch()?,
+            batch: begin_batch(&self.context)?,
             kernels: self,
         })
     }
 }
 
 pub struct KernelBatch<'kernels> {
-    pub(crate) batch: CommandBatch<'kernels>,
-    pub(crate) kernels: &'kernels Kernels,
+    batch: CommandBatch<'kernels>,
+    kernels: &'kernels Kernels,
 }
 
 impl<'kernels> KernelBatch<'kernels> {
@@ -80,20 +99,25 @@ impl<'kernels> KernelBatch<'kernels> {
     ) -> Result<Tensor, GpuError> {
         self.batch.empty(shape, dtype)
     }
+}
 
-    pub(crate) fn dispatch<T>(
-        &mut self,
-        kernel: &str,
-        tensors: &[&Tensor],
-        params: &T,
-        grid: MTLSize,
-        threadgroup: MTLSize,
-    ) -> Result<(), KernelError> {
-        let pipeline = self.kernels.library.pipeline(kernel)?;
-        self.batch
-            .dispatch(&pipeline, kernel, tensors, params, grid, threadgroup)?;
-        Ok(())
-    }
+pub fn dispatch<T>(
+    batch: &mut KernelBatch<'_>,
+    kernel: &str,
+    tensors: &[&Tensor],
+    params: &T,
+    grid: MTLSize,
+    threadgroup: MTLSize,
+) -> Result<(), KernelError> {
+    let pipeline = batch.kernels.library.pipeline(kernel)?;
+    batch
+        .batch
+        .dispatch(&pipeline, kernel, tensors, params, grid, threadgroup)?;
+    Ok(())
+}
+
+pub fn tuning<'kernels>(batch: &KernelBatch<'kernels>) -> &'kernels Tuning {
+    &batch.kernels.tuning
 }
 
 #[cfg(test)]

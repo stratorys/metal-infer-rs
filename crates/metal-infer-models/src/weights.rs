@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::ModelError;
 
-pub(crate) struct WeightMap {
+pub struct WeightMap {
     tensors: HashMap<String, Tensor>,
 }
 
@@ -18,7 +18,7 @@ struct SafetensorIndex {
 }
 
 impl WeightMap {
-    pub(crate) fn load(
+    pub fn load(
         directory: &Path,
         context: &MetalContext,
     ) -> Result<Self, ModelError> {
@@ -42,7 +42,7 @@ impl WeightMap {
         Ok(Self { tensors })
     }
 
-    pub(crate) fn take(
+    pub fn take(
         &mut self,
         name: &str,
     ) -> Result<Tensor, ModelError> {

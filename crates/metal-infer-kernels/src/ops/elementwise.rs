@@ -1,4 +1,5 @@
 use super::{matrix_shape, require_f16, require_same_shape, size, to_u32};
+use crate::kernels::dispatch;
 use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
@@ -20,7 +21,8 @@ impl KernelBatch<'_> {
             return Err(KernelError::CopyRowShape);
         }
         let params = [to_u32(*width)?, to_u32(row)?, 0];
-        self.dispatch(
+        dispatch(
+            self,
             "copy_row_f16",
             &[source, destination],
             &params,
@@ -38,7 +40,8 @@ impl KernelBatch<'_> {
         require_same_shape(left, right)?;
         let out = self.empty(left.shape(), DType::F16)?;
         let count = to_u32(left.len())?;
-        self.dispatch(
+        dispatch(
+            self,
             "add_f16",
             &[left, right, &out],
             &count,
@@ -58,7 +61,8 @@ impl KernelBatch<'_> {
         require_same_shape(gate, up)?;
         let out = self.empty(gate.shape(), DType::F16)?;
         let count = to_u32(gate.len())?;
-        self.dispatch(
+        dispatch(
+            self,
             "swiglu_f16",
             &[gate, up, &out],
             &count,
@@ -80,7 +84,8 @@ impl KernelBatch<'_> {
         let [_, width] = matrix_shape(table)?;
         let out = self.empty(&[tokens.len(), width], DType::F16)?;
         let params = [to_u32(tokens.len())?, to_u32(width)?];
-        self.dispatch(
+        dispatch(
+            self,
             "embedding_f16",
             &[tokens, table, &out],
             &params,

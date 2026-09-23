@@ -1,4 +1,5 @@
 use super::{MatrixParams, checked_mul, matrix_shape, require_f16, round_up, size, to_u32};
+use crate::kernels::{dispatch, tuning};
 use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
@@ -21,11 +22,11 @@ impl KernelBatch<'_> {
             k: to_u32(k)?,
             padding: 0,
         };
-        let m4 = self.kernels.is_m4_pro();
+        let m4 = tuning(self).is_m4_pro();
         if m == 1 {
             let vocabulary = n >= 65_536;
             let rows = if m4 && k.is_multiple_of(256) {
-                self.kernels.matvec_rows_for_shape(n, k, vocabulary)
+                tuning(self).matvec_rows_for_shape(n, k, vocabulary)
             } else {
                 0
             };
@@ -39,7 +40,8 @@ impl KernelBatch<'_> {
                 32
             };
             let groups = n.div_ceil(outputs_per_threadgroup);
-            self.dispatch(
+            dispatch(
+                self,
                 match rows {
                     1 => "matvec_one_row_f16",
                     2 if vocabulary => "matvec_vocab_f16",
@@ -54,7 +56,8 @@ impl KernelBatch<'_> {
             )?;
         } else if m4 && (2..128).contains(&m) && n % 32 == 0 && k % 32 == 0 && n >= 256 && k >= 256
         {
-            self.dispatch(
+            dispatch(
+                self,
                 "matmul_skinny_f16",
                 &[input, weight, &out],
                 &params,
@@ -62,7 +65,8 @@ impl KernelBatch<'_> {
                 size(128, 1, 1),
             )?;
         } else if m4 && n % 32 == 0 && k % 32 == 0 && m >= 128 && n >= 256 && k >= 256 {
-            self.dispatch(
+            dispatch(
+                self,
                 "matmul_simd_db_f16",
                 &[input, weight, &out],
                 &params,
@@ -74,7 +78,8 @@ impl KernelBatch<'_> {
                 size(128, 1, 1),
             )?;
         } else {
-            self.dispatch(
+            dispatch(
+                self,
                 "matmul_f16",
                 &[input, weight, &out],
                 &params,

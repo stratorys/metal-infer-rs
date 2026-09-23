@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -11,17 +10,17 @@ use objc2_metal::{
 };
 
 use crate::gpu::batch::CommandBatch;
-use crate::gpu::profiling::KernelDispatchProfile;
+use crate::gpu::profiling::{KernelDispatchProfile, Profiler};
 use crate::gpu::scratch::{self, ScratchPool};
+use crate::gpu::tensor::{from_buffer, metal_buffer};
 use crate::gpu::{DType, GpuError, Tensor};
 
 #[derive(Clone)]
 pub struct MetalContext {
-    pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     device_name: String,
-    pub(super) profile_tick_nanoseconds: Rc<Cell<Option<f64>>>,
-    pub(super) kernel_profiles: Rc<RefCell<Vec<KernelDispatchProfile>>>,
+    profiler: Rc<Profiler>,
     scratch_pools: Rc<RefCell<Vec<ScratchPool>>>,
 }
 
@@ -36,8 +35,7 @@ impl MetalContext {
             device,
             queue,
             device_name,
-            profile_tick_nanoseconds: Rc::new(Cell::new(None)),
-            kernel_profiles: Rc::new(RefCell::new(Vec::new())),
+            profiler: Rc::new(Profiler::new()),
             scratch_pools: Rc::new(RefCell::new(Vec::new())),
         })
     }
@@ -50,15 +48,17 @@ impl MetalContext {
         self.device.currentAllocatedSize()
     }
 
-    pub(crate) fn begin_batch(&self) -> Result<CommandBatch<'_>, GpuError> {
-        let profile = self.new_batch_profile()?;
-        let command_buffer = self.command_buffer()?;
-        CommandBatch::new(
-            self,
-            command_buffer,
-            profile,
-            scratch::acquire(&self.scratch_pools),
-        )
+    /// Enables timestamp sampling for subsequent batches. Each profiled dispatch
+    /// uses a separate compute pass, so timings are diagnostic only.
+    pub fn set_kernel_profiling(
+        &self,
+        enabled: bool,
+    ) -> Result<(), GpuError> {
+        self.profiler.set_enabled(&self.device, enabled)
+    }
+
+    pub fn take_kernel_profiles(&self) -> Vec<KernelDispatchProfile> {
+        self.profiler.take()
     }
 
     pub fn empty(
@@ -74,7 +74,7 @@ impl MetalContext {
             .device
             .newBufferWithLength_options(byte_len.max(1), MTLResourceOptions::StorageModeShared)
             .ok_or(GpuError::BufferCreation)?;
-        Ok(Tensor::new(buffer, shape.to_vec(), dtype))
+        Ok(from_buffer(buffer, shape.to_vec(), dtype))
     }
 
     pub fn tensor_f16(
@@ -84,7 +84,7 @@ impl MetalContext {
     ) -> Result<Tensor, GpuError> {
         let tensor = self.empty(shape, DType::F16)?;
         check_data_len(tensor.len(), values.len())?;
-        let destination = tensor.buffer.contents().as_ptr().cast::<u16>();
+        let destination = metal_buffer(&tensor).contents().as_ptr().cast::<u16>();
         for (index, value) in values.iter().enumerate() {
             // SAFETY: destination has tensor.len() u16 slots and index is
             // bounded by values.
@@ -109,7 +109,7 @@ impl MetalContext {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr(),
-                tensor.buffer.contents().as_ptr().cast::<u16>(),
+                metal_buffer(&tensor).contents().as_ptr().cast::<u16>(),
                 values.len(),
             )
         };
@@ -130,7 +130,7 @@ impl MetalContext {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                tensor.buffer.contents().as_ptr().cast::<u8>(),
+                metal_buffer(&tensor).contents().as_ptr().cast::<u8>(),
                 bytes.len(),
             )
         };
@@ -153,7 +153,7 @@ impl MetalContext {
         if !remainder.is_empty() {
             return Err(GpuError::DataLengthMismatch);
         }
-        let destination = tensor.buffer.contents().as_ptr().cast::<u16>();
+        let destination = metal_buffer(&tensor).contents().as_ptr().cast::<u16>();
         for (index, [low, high]) in values.iter().enumerate() {
             let value = bf16::from_bits(u16::from_le_bytes([*low, *high]));
             // SAFETY: `values` contains exactly `tensor.len()` elements and
@@ -179,7 +179,7 @@ impl MetalContext {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr(),
-                tensor.buffer.contents().as_ptr().cast::<u32>(),
+                metal_buffer(&tensor).contents().as_ptr().cast::<u32>(),
                 values.len(),
             )
         };
@@ -193,7 +193,26 @@ impl MetalContext {
     }
 }
 
-pub(super) fn checked_elements(shape: &[usize]) -> Result<usize, GpuError> {
+pub fn device(context: &MetalContext) -> &Retained<ProtocolObject<dyn MTLDevice>> {
+    &context.device
+}
+
+pub fn profiler(context: &MetalContext) -> &Profiler {
+    &context.profiler
+}
+
+pub fn begin_batch(context: &MetalContext) -> Result<CommandBatch<'_>, GpuError> {
+    let profile = context.profiler.new_batch_profile(&context.device)?;
+    let command_buffer = context.command_buffer()?;
+    CommandBatch::new(
+        context,
+        command_buffer,
+        profile,
+        scratch::acquire(&context.scratch_pools),
+    )
+}
+
+pub fn checked_elements(shape: &[usize]) -> Result<usize, GpuError> {
     if shape.is_empty() || shape.contains(&0) {
         return Err(GpuError::EmptyShape);
     }

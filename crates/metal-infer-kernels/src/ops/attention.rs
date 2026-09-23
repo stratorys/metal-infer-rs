@@ -1,4 +1,5 @@
 use super::{AttentionParams, checked_mul, require_f16, size, to_u32};
+use crate::kernels::{dispatch, tuning};
 use crate::{DType, KernelBatch, KernelError, Tensor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,7 +96,7 @@ impl KernelBatch<'_> {
         }
         let flash_block_keys = if kind == AttentionKind::FlashDecode {
             let block = flash_block
-                .unwrap_or_else(|| self.kernels.flash_decode_block_for_length(*kv_length));
+                .unwrap_or_else(|| tuning(self).flash_decode_block_for_length(*kv_length));
             if !matches!(block, 32 | 64 | 128 | 256) {
                 return Err(KernelError::FlashDecodeBlockSize);
             }
@@ -140,14 +141,16 @@ impl KernelBatch<'_> {
                 .ok_or_else(|| KernelError::FlashDecodePartialOverflow)?;
             let scratch = self.empty(&[config.kv_heads, blocks, 2, partial_width], DType::F32)?;
             let groups = checked_mul(config.kv_heads, blocks)?;
-            self.dispatch(
+            dispatch(
+                self,
                 "attention_flash_decode_partial_f16",
                 &[query, key, value, &scratch],
                 &params,
                 size(checked_mul(groups, 128)?, 1, 1),
                 size(128, 1, 1),
             )?;
-            self.dispatch(
+            dispatch(
+                self,
                 "attention_flash_decode_reduce_f16",
                 &[&scratch, &out],
                 &params,
@@ -186,7 +189,8 @@ impl KernelBatch<'_> {
             ),
             AttentionKind::FlashDecode => unreachable!("handled above"),
         };
-        self.dispatch(
+        dispatch(
+            self,
             kernel,
             &[query, key, value, &out],
             &params,

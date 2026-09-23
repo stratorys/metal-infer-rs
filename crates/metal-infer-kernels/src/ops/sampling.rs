@@ -1,4 +1,5 @@
 use super::{require_f16, size, to_u32};
+use crate::kernels::dispatch;
 use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
@@ -18,14 +19,16 @@ impl KernelBatch<'_> {
         let groups = count.div_ceil(2048);
         let partial_values = self.empty(&[groups as usize], DType::F32)?;
         let partial_indices = self.empty(&[groups as usize], DType::U32)?;
-        self.dispatch(
+        dispatch(
+            self,
             "argmax_f16_partial",
             &[logits, &partial_values, &partial_indices],
             &count,
             size(groups as usize * 256, 1, 1),
             size(256, 1, 1),
         )?;
-        self.dispatch(
+        dispatch(
+            self,
             "argmax_f16_reduce",
             &[&partial_values, &partial_indices, output],
             &groups,

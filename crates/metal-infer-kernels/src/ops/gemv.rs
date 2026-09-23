@@ -1,4 +1,5 @@
 use super::{MultiMatrixParams, checked_mul, matrix_shape, require_f16, size, to_u32};
+use crate::kernels::{dispatch, tuning};
 use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
@@ -29,7 +30,7 @@ impl KernelBatch<'_> {
             k: to_u32(k)?,
         };
         let outputs = n0.max(n1);
-        let rows = if k.is_multiple_of(256) && self.kernels.is_m4_pro() {
+        let rows = if k.is_multiple_of(256) && tuning(self).is_m4_pro() {
             2
         } else {
             0
@@ -38,7 +39,8 @@ impl KernelBatch<'_> {
         let rows_per_group = if tuned { rows * 4 } else { 32 };
         let threads = if tuned { 128 } else { 256 };
         let groups = outputs.div_ceil(rows_per_group);
-        self.dispatch(
+        dispatch(
+            self,
             match rows {
                 2 => "matvec2_tuned_f16",
                 _ => "matvec2_f16",
@@ -86,7 +88,7 @@ impl KernelBatch<'_> {
             k: to_u32(k)?,
         };
         let outputs = n0.max(n1).max(n2);
-        let rows = if k.is_multiple_of(256) && self.kernels.is_m4_pro() {
+        let rows = if k.is_multiple_of(256) && tuning(self).is_m4_pro() {
             2
         } else {
             0
@@ -95,7 +97,8 @@ impl KernelBatch<'_> {
         let rows_per_group = if tuned { rows * 4 } else { 32 };
         let threads = if tuned { 128 } else { 256 };
         let groups = outputs.div_ceil(rows_per_group);
-        self.dispatch(
+        dispatch(
+            self,
             match rows {
                 2 => "matvec3_tuned_f16",
                 _ => "matvec3_f16",

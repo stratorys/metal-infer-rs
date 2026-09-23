@@ -34,11 +34,45 @@ impl DType {
 
 #[derive(Clone)]
 pub struct Tensor {
-    pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(crate) offset_bytes: usize,
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    offset_bytes: usize,
     shape: Vec<usize>,
     dtype: DType,
     scratch: Option<Rc<ScratchLease>>,
+}
+
+pub fn from_buffer(
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    shape: Vec<usize>,
+    dtype: DType,
+) -> Tensor {
+    Tensor {
+        buffer,
+        offset_bytes: 0,
+        shape,
+        dtype,
+        scratch: None,
+    }
+}
+
+pub fn from_scratch(
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    offset_bytes: usize,
+    shape: Vec<usize>,
+    dtype: DType,
+    scratch: Rc<ScratchLease>,
+) -> Tensor {
+    Tensor {
+        buffer,
+        offset_bytes,
+        shape,
+        dtype,
+        scratch: Some(scratch),
+    }
+}
+
+pub fn metal_buffer(tensor: &Tensor) -> &ProtocolObject<dyn MTLBuffer> {
+    &tensor.buffer
 }
 
 impl std::fmt::Debug for Tensor {
@@ -56,36 +90,6 @@ impl std::fmt::Debug for Tensor {
 }
 
 impl Tensor {
-    pub(crate) fn new(
-        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-        shape: Vec<usize>,
-        dtype: DType,
-    ) -> Self {
-        Self {
-            buffer,
-            offset_bytes: 0,
-            shape,
-            dtype,
-            scratch: None,
-        }
-    }
-
-    pub(crate) fn new_scratch(
-        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-        offset_bytes: usize,
-        shape: Vec<usize>,
-        dtype: DType,
-        scratch: Rc<ScratchLease>,
-    ) -> Self {
-        Self {
-            buffer,
-            offset_bytes,
-            shape,
-            dtype,
-            scratch: Some(scratch),
-        }
-    }
-
     pub const fn offset_bytes(&self) -> usize {
         self.offset_bytes
     }

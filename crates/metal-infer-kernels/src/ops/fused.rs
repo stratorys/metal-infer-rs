@@ -1,6 +1,7 @@
 use super::{
     NormMultiMatrixParams, checked_mul, matrix_shape, require_f16, require_same_shape, size, to_u32,
 };
+use crate::kernels::{dispatch, tuning};
 use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
@@ -41,15 +42,15 @@ impl KernelBatch<'_> {
             k: to_u32(width)?,
             epsilon,
         };
-        let rows = if self.kernels.is_m4_pro() {
-            self.kernels
-                .fused_norm_matvec_rows_for_shape([n0, n1, n2], width)
+        let rows = if tuning(self).is_m4_pro() {
+            tuning(self).fused_norm_matvec_rows_for_shape([n0, n1, n2], width)
         } else {
             2
         };
         let simdgroups = if rows == 1 { 8 } else { 4 };
         let groups = n0.max(n1).max(n2).div_ceil(rows * simdgroups);
-        self.dispatch(
+        dispatch(
+            self,
             match rows {
                 1 => "matvec3_rms_r1_f16",
                 _ => "matvec3_rms_f16",
@@ -107,15 +108,15 @@ impl KernelBatch<'_> {
             k: to_u32(width)?,
             epsilon,
         };
-        let rows = if self.kernels.is_m4_pro() {
-            self.kernels
-                .fused_norm_matvec_rows_for_shape([n0, n1, 0], width)
+        let rows = if tuning(self).is_m4_pro() {
+            tuning(self).fused_norm_matvec_rows_for_shape([n0, n1, 0], width)
         } else {
             2
         };
         let simdgroups = if rows == 1 { 8 } else { 4 };
         let groups = n0.max(n1).div_ceil(rows * simdgroups);
-        self.dispatch(
+        dispatch(
+            self,
             match rows {
                 1 => "matvec2_add_rms_r1_f16",
                 _ => "matvec2_add_rms_f16",

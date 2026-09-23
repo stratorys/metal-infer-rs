@@ -1,4 +1,5 @@
 use super::{NormParams, checked_mul, require_f16, require_same_shape, size, to_u32};
+use crate::kernels::dispatch;
 use crate::{DType, KernelBatch, KernelError, Tensor};
 
 impl KernelBatch<'_> {
@@ -25,7 +26,8 @@ impl KernelBatch<'_> {
             epsilon,
             padding: 0,
         };
-        self.dispatch(
+        dispatch(
+            self,
             "rms_norm_f16",
             &[input, weight, &out],
             &params,
@@ -62,7 +64,8 @@ impl KernelBatch<'_> {
             epsilon,
             padding: 0,
         };
-        self.dispatch(
+        dispatch(
+            self,
             "add_rms_norm_f16",
             &[left, right, weight, &residual, &normalized],
             &params,

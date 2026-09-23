@@ -4,9 +4,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model, resolve_model_path};
+use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model};
 use metal_infer_kernels::MetalContext;
-use metal_infer_models::{GenerationOptions, KvCache, ModelTokenizer};
+use metal_infer_models::{GenerationOptions, KvCache, ModelSource, ModelTokenizer};
 
 use crate::server::{ServerOptions, serve};
 
@@ -97,7 +97,7 @@ fn generate(arguments: GenerateArguments) -> Result<(), CliError> {
         context = arguments.context
     );
     let _guard = span.enter();
-    let model_path = resolve_model_path(&arguments.model)?;
+    let model_path = ModelSource::resolve(&arguments.model)?.directory;
     let context = MetalContext::new()?;
     tracing::info!(device = %context.device_name(), "Metal device ready");
     tracing::info!(path = %model_path.display(), "loading model");

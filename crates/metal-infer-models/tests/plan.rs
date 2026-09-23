@@ -1,8 +1,7 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use metal_infer_kernels::{Kernels, MetalContext};
-use metal_infer_models::{KvCache, Qwen3Model};
+use metal_infer_models::{KvCache, ModelSource, Qwen3Model};
 
 const PROMPT_TOKENS: usize = 600;
 const DECODE_STEPS: usize = 8;
@@ -131,17 +130,7 @@ fn model_directory() -> PathBuf {
     if let Some(path) = std::env::var_os("QWEN3_MODEL") {
         return PathBuf::from(path);
     }
-    let home = std::env::var_os("HOME").expect("HOME or QWEN3_MODEL must be set");
-    let snapshots =
-        Path::new(&home).join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
-    fs::read_dir(&snapshots)
-        .ok()
-        .and_then(|entries| entries.flatten().map(|entry| entry.path()).next())
-        .unwrap_or_else(|| {
-            panic!(
-                "Qwen3-0.6B not found in {}; set QWEN3_MODEL or run \
-                 `hf download Qwen/Qwen3-0.6B`",
-                snapshots.display()
-            )
-        })
+    ModelSource::resolve(Path::new("Qwen/Qwen3-0.6B"))
+        .expect("Qwen3-0.6B must be cached; set QWEN3_MODEL or run `hf download Qwen/Qwen3-0.6B`")
+        .directory
 }

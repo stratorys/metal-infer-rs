@@ -10,12 +10,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use metal_infer_cli::{
-    CliError, ServerError, hugging_face_model_id, load_model, resolve_model_path,
-};
+use metal_infer_cli::{CliError, ServerError, load_model};
 use metal_infer_kernels::MetalContext;
 use metal_infer_models::{
-    ChatMessage, GenerationOptions, KvCache, ModelTokenizer, Qwen3Model, TokenSampler,
+    ChatMessage, GenerationOptions, KvCache, ModelSource, ModelTokenizer, Qwen3Model, TokenSampler,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -358,9 +356,9 @@ fn run_inference(
     ready: oneshot::Sender<Result<String, ServerError>>,
 ) {
     let initialized = (|| -> Result<ServerState, ServerError> {
-        let requested_model_id = hugging_face_model_id(&options.model);
-        let model_path = resolve_model_path(&options.model)
-            .map_err(|source| ServerError::ModelInitialization(Box::new(source)))?;
+        let model_source = ModelSource::resolve(&options.model)
+            .map_err(|source| ServerError::ModelInitialization(Box::new(source.into())))?;
+        let model_path = model_source.directory;
         let context = MetalContext::new()
             .map_err(|source| ServerError::ModelInitialization(Box::new(source.into())))?;
         tracing::info!(message = "Metal device ready.", device = %context.device_name());
@@ -370,10 +368,7 @@ fn run_inference(
         let model = load_model(&model_path, &context, &options.with)
             .map_err(|source| ServerError::ModelInitialization(Box::new(source)))?
             .ok_or(ServerError::PlanListed)?;
-        let model_id = options
-            .model_id
-            .or(requested_model_id)
-            .unwrap_or_else(|| infer_model_id(&model_path));
+        let model_id = options.model_id.unwrap_or(model_source.model_id);
         Ok(ServerState {
             model_id,
             tokenizer,
@@ -914,21 +909,6 @@ fn completion_id() -> String {
         unix_seconds(),
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-fn infer_model_id(path: &std::path::Path) -> String {
-    for component in path.ancestors().filter_map(std::path::Path::file_name) {
-        let Some(name) = component.to_str() else {
-            continue;
-        };
-        if let Some(repository) = name.strip_prefix("models--") {
-            return repository.replace("--", "/");
-        }
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("qwen3")
-        .to_owned()
 }
 
 fn unix_seconds() -> u64 {

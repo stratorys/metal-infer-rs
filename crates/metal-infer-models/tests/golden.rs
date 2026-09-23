@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use half::f16;
 use metal_infer_kernels::MetalContext;
-use metal_infer_models::{ChatMessage, GenerationOptions, KvCache, ModelTokenizer, Qwen3Model};
+use metal_infer_models::{
+    ChatMessage, GenerationOptions, KvCache, ModelSource, ModelTokenizer, Qwen3Model,
+};
 use serde::{Deserialize, Serialize};
 
 const PROMPT_LENGTHS: [usize; 9] = [1, 63, 64, 65, 511, 512, 513, 2048, 4097];
@@ -322,19 +324,9 @@ fn model_directory() -> PathBuf {
     if let Some(path) = std::env::var_os("QWEN3_MODEL") {
         return PathBuf::from(path);
     }
-    let home = std::env::var_os("HOME").expect("HOME or QWEN3_MODEL must be set");
-    let snapshots =
-        Path::new(&home).join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
-    fs::read_dir(&snapshots)
-        .ok()
-        .and_then(|entries| entries.flatten().map(|entry| entry.path()).next())
-        .unwrap_or_else(|| {
-            panic!(
-                "Qwen3-0.6B not found in {}; set QWEN3_MODEL or run \
-                 `hf download Qwen/Qwen3-0.6B`",
-                snapshots.display()
-            )
-        })
+    ModelSource::resolve(Path::new("Qwen/Qwen3-0.6B"))
+        .expect("Qwen3-0.6B must be cached; set QWEN3_MODEL or run `hf download Qwen/Qwen3-0.6B`")
+        .directory
 }
 
 fn golden_path(device: &str) -> PathBuf {

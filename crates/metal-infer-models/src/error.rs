@@ -14,6 +14,16 @@ pub enum ModelError {
     Json(#[from] serde_json::Error),
     #[error("safetensors file is invalid")]
     Safetensors(#[from] safetensors::SafeTensorError),
+    #[error("model path is not valid UTF-8")]
+    NonUtf8ModelPath,
+    #[error("model directory does not exist")]
+    ModelDirectoryMissing,
+    #[error(
+        "cannot locate the Hugging Face cache because HOME, HF_HOME, and HUGGINGFACE_HUB_CACHE are unset"
+    )]
+    HuggingFaceCacheMissing,
+    #[error("Hugging Face model is not in the local cache, download it with `hf download`")]
+    ModelNotCached,
     #[error("cannot load the tokenizer")]
     TokenizerLoad,
     #[error("tokenizer cannot encode the text")]

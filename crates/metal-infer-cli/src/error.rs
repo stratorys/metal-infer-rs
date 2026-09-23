@@ -20,16 +20,6 @@ pub enum CliError {
     LogEnvironment(#[source] std::env::VarError),
     #[error("cannot install the tracing subscriber")]
     TracingInit(#[source] tracing::subscriber::SetGlobalDefaultError),
-    #[error("model path is not valid UTF-8")]
-    NonUtf8ModelPath,
-    #[error("model directory does not exist")]
-    ModelDirectoryMissing,
-    #[error(
-        "cannot locate the Hugging Face cache because HOME, HF_HOME, and HUGGINGFACE_HUB_CACHE are unset"
-    )]
-    HuggingFaceCacheMissing,
-    #[error("Hugging Face model is not in the local cache, download it with `hf download`")]
-    ModelNotCached,
     #[error("prompt and generated tokens exceed the context")]
     ContextExceeded,
     #[error("--max-active-requests must be positive")]

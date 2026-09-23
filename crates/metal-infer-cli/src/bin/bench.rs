@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model_with, resolve_model_path};
+use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model_with};
 use metal_infer_kernels::{KernelDispatchProfile, Kernels, MetalContext, Tensor};
-use metal_infer_models::{KvCache, Qwen3Model};
+use metal_infer_models::{KvCache, ModelSource, Qwen3Model};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -116,7 +116,7 @@ fn run(arguments: Arguments) -> Result<(), CliError> {
     }
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
-    let model_path = resolve_model_path(&arguments.model)?;
+    let model_path = ModelSource::resolve(&arguments.model)?.directory;
     let started = Instant::now();
     let Some(model) = load_model_with(&model_path, kernels, &arguments.with)? else {
         return Ok(());

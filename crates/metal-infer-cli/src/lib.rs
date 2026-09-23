@@ -1,7 +1,7 @@
 mod error;
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use clap::ValueEnum;
 use metal_infer_kernels::{Kernels, MetalContext};
@@ -77,88 +77,5 @@ pub fn print_plan(plan: &Plan) {
     let mut stdout = std::io::stdout().lock();
     for (key, value) in plan.entries() {
         let _ = stdout.write_all(format!("{key}={value}\n").as_bytes());
-    }
-}
-
-pub fn resolve_model_path(model: &Path) -> Result<PathBuf, CliError> {
-    if model.is_dir() {
-        return Ok(model.to_owned());
-    }
-    let identifier = model.to_str().ok_or(CliError::NonUtf8ModelPath)?;
-    if !is_hugging_face_id(identifier) {
-        return Err(CliError::ModelDirectoryMissing);
-    }
-    let cache = hugging_face_cache_root().ok_or(CliError::HuggingFaceCacheMissing)?;
-    let repository = cache.join(format!("models--{}", identifier.replace('/', "--")));
-    let snapshots = repository.join("snapshots");
-    let revision = std::fs::read_to_string(repository.join("refs/main"))
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains(".."));
-    let snapshot = if let Some(revision) = revision {
-        snapshots.join(revision)
-    } else {
-        newest_snapshot(&snapshots)?.ok_or(CliError::ModelNotCached)?
-    };
-    if snapshot.join("config.json").is_file() && snapshot.join("tokenizer.json").is_file() {
-        Ok(snapshot)
-    } else {
-        Err(CliError::ModelNotCached)
-    }
-}
-
-pub fn hugging_face_model_id(model: &Path) -> Option<String> {
-    let value = model.to_str()?;
-    is_hugging_face_id(value).then(|| value.to_owned())
-}
-
-fn is_hugging_face_id(value: &str) -> bool {
-    let mut parts = value.split('/');
-    matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty())
-}
-
-fn hugging_face_cache_root() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
-        return Some(PathBuf::from(path));
-    }
-    if let Some(path) = std::env::var_os("HF_HOME") {
-        return Some(PathBuf::from(path).join("hub"));
-    }
-    std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".cache/huggingface/hub"))
-}
-
-fn newest_snapshot(directory: &Path) -> Result<Option<PathBuf>, CliError> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let mut snapshots = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .collect::<Vec<_>>();
-    snapshots.sort_by_key(|entry| {
-        entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-    });
-    Ok(snapshots.pop().map(|entry| entry.path()))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::hugging_face_model_id;
-
-    #[test]
-    fn recognizes_hugging_face_repository_ids() {
-        assert_eq!(
-            hugging_face_model_id(Path::new("Qwen/Qwen3-8B")),
-            Some("Qwen/Qwen3-8B".into())
-        );
-        assert_eq!(hugging_face_model_id(Path::new("local-model")), None);
-        assert_eq!(hugging_face_model_id(Path::new("a/b/c")), None);
     }
 }

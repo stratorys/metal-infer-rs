@@ -67,6 +67,8 @@ def server_command(engine: Engine, args: argparse.Namespace) -> list[str]:
         f"127.0.0.1:{port}",
         "--context",
         str(context_size(args)),
+        "--max-active-requests",
+        str(max(args.concurrency)),
     ]
     for override in engine.overrides:
         command += ["--with", override]

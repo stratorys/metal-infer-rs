@@ -1,4 +1,11 @@
 #include "prelude.metal"
+kernel void copy_row_f16(device const half *source [[buffer(0)]],
+                         device half *destination [[buffer(1)]],
+                         constant uint3 &p [[buffer(2)]],
+                         uint id [[thread_position_in_grid]]) {
+  if (id < p.x)
+    destination[p.y * p.x + id] = source[id];
+}
 kernel void add_f16(device const half *a [[buffer(0)]],
                     device const half *b [[buffer(1)]],
                     device half *out [[buffer(2)]],

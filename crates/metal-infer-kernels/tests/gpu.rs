@@ -96,6 +96,11 @@ fn matmul_variants_match_cpu_reference() -> Result<(), CoreError> {
     let context = MetalContext::new()?;
     let kernels = Kernels::new(&context)?;
     for (m, n, k) in [
+        (2, 256, 256),
+        (7, 256, 256),
+        (8, 256, 256),
+        (31, 256, 256),
+        (64, 256, 256),
         (128, 256, 256),
         (129, 256, 256),
         (511, 256, 256),

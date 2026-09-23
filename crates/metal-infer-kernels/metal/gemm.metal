@@ -25,6 +25,67 @@ kernel void matmul_f16(device const half *x [[buffer(0)]],
     out[id.y * p.n + id.x] = half(sum);
 }
 
+kernel void matmul_skinny_f16(device const half *x [[buffer(0)]],
+                              device const half *weight [[buffer(1)]],
+                              device half *out [[buffer(2)]],
+                              constant MatrixParams &p [[buffer(3)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_threadgroup]],
+                              uint simdgroup_index
+                              [[simdgroup_index_in_threadgroup]],
+                              uint simd_lane [[thread_index_in_simdgroup]]) {
+  constexpr uint tile_m = 8;
+  constexpr uint tile_n = 32;
+  constexpr uint tile_k = 32;
+  constexpr uint stride = 40;
+  threadgroup half x_tile[tile_m * stride];
+  threadgroup half weight_tile[tile_n * stride];
+  uint n_tiles = p.n / tile_n;
+  uint output_row = (group / n_tiles) * tile_m;
+  uint output_column = (group % n_tiles) * tile_n;
+  simdgroup_float8x8 accumulator = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+  for (uint base = 0; base < p.k; base += tile_k) {
+    for (uint j = 0; j < 2; ++j) {
+      uint index = lane + j * 128;
+      uint row = index / tile_k;
+      uint column = index % tile_k;
+      x_tile[row * stride + column] =
+          output_row + row < p.m ? x[(output_row + row) * p.k + base + column]
+                                 : half(0.0f);
+    }
+    for (uint j = 0; j < 8; ++j) {
+      uint index = lane + j * 128;
+      uint row = index / tile_k;
+      uint column = index % tile_k;
+      weight_tile[row * stride + column] =
+          weight[(output_column + row) * p.k + base + column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint inner = 0; inner < tile_k; inner += 8) {
+      simdgroup_half8x8 activation;
+      simdgroup_half8x8 weights;
+      simdgroup_load(activation, x_tile + inner, stride);
+      simdgroup_load(weights,
+                     weight_tile + simdgroup_index * 8 * stride + inner, stride,
+                     ulong2(0), true);
+      simdgroup_multiply_accumulate(accumulator, activation, weights,
+                                    accumulator);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  uint quad = simd_lane / 4;
+  uint matrix_row = (quad & 4) + (simd_lane / 2) % 4;
+  uint matrix_column = (quad & 2) * 2 + (simd_lane % 2) * 2;
+  uint row = output_row + matrix_row;
+  uint column = output_column + simdgroup_index * 8 + matrix_column;
+  if (row < p.m) {
+    out[row * p.n + column] = half(accumulator.thread_elements()[0]);
+    out[row * p.n + column + 1] = half(accumulator.thread_elements()[1]);
+  }
+}
+
 kernel void matmul_simd_db_f16(
     device const half *x [[buffer(0)]], device const half *weight [[buffer(1)]],
     device half *out [[buffer(2)]], constant MatrixParams &p [[buffer(3)]],

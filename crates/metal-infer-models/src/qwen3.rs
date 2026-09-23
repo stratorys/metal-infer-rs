@@ -121,6 +121,44 @@ pub struct GenerationOptions {
     pub stop_token_ids: Vec<u32>,
 }
 
+pub struct TokenSampler {
+    options: GenerationOptions,
+    random: XorShift64,
+}
+
+impl TokenSampler {
+    pub fn new(options: GenerationOptions) -> Result<Self, ModelError> {
+        validate_generation_options(&options)?;
+        let random = XorShift64::new(options.seed);
+        Ok(Self { options, random })
+    }
+
+    pub fn sample(
+        &mut self,
+        logits: &Tensor,
+    ) -> Result<u32, ModelError> {
+        logits.with_f16_bits(|bits| {
+            if self.options.temperature == 0.0 {
+                bits.iter()
+                    .enumerate()
+                    .filter_map(|(index, bits)| {
+                        let value = f16::from_bits(*bits).to_f32();
+                        value.is_finite().then_some((index, value))
+                    })
+                    .max_by(|left, right| {
+                        left.1
+                            .total_cmp(&right.1)
+                            .then_with(|| right.0.cmp(&left.0))
+                    })
+                    .map(|(index, _)| index as u32)
+                    .ok_or_else(|| ModelError::Config("logits contain no finite value".into()))
+            } else {
+                sample_token_f16(bits, &self.options, &mut self.random)
+            }
+        })?
+    }
+}
+
 impl Default for GenerationOptions {
     fn default() -> Self {
         Self {
@@ -135,6 +173,163 @@ impl Default for GenerationOptions {
 }
 
 impl Qwen3Model {
+    pub const fn context(&self) -> &MetalContext {
+        &self.context
+    }
+    pub fn decode_batch(
+        &self,
+        tokens: &[u32],
+        caches: &mut [&mut KvCache],
+    ) -> Result<Tensor, ModelError> {
+        if tokens.is_empty() || tokens.len() != caches.len() {
+            return Err(ModelError::Config(
+                "decode batch needs one cache per token".into(),
+            ));
+        }
+        for cache in caches.iter() {
+            if cache.filled == 0 || cache.filled >= cache.capacity {
+                return Err(ModelError::CacheCapacity {
+                    capacity: cache.capacity,
+                    requested: cache.filled.saturating_add(1),
+                });
+            }
+        }
+        let input = self.context.tensor_u32(tokens, &[tokens.len()])?;
+        let mut batch = self.kernels.begin_batch()?;
+        let mut hidden = batch.embedding(&input, &self.embedding)?;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let normalized =
+                batch.rms_norm(&hidden, &layer.input_norm, self.config.rms_norm_eps)?;
+            let (query, key, value) = if self.fusions.qkv {
+                batch.matmul3(
+                    &normalized,
+                    &layer.attention.query,
+                    &layer.attention.key,
+                    &layer.attention.value,
+                )?
+            } else {
+                (
+                    batch.matmul(&normalized, &layer.attention.query)?,
+                    batch.matmul(&normalized, &layer.attention.key)?,
+                    batch.matmul(&normalized, &layer.attention.value)?,
+                )
+            };
+            let attention_rows =
+                batch.empty(&[tokens.len(), self.config.query_width()], DType::F16)?;
+            for (row, cache) in caches.iter().enumerate() {
+                let layer_cache = cache
+                    .layers
+                    .get(layer_index)
+                    .ok_or_else(|| ModelError::Config("missing KV cache layer".into()))?;
+                let offset = cache.filled;
+                let query_row = query.row(row)?.reshape(&[
+                    1,
+                    self.config.num_attention_heads,
+                    self.config.head_dim,
+                ])?;
+                let key_row = key.row(row)?.reshape(&[
+                    1,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                ])?;
+                let value_row = value.row(row)?.reshape(&[
+                    1,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                ])?;
+                let query_row = if self.fusions.qk_rope_cache {
+                    batch.qk_norm_rope_cache(
+                        &query_row,
+                        &key_row,
+                        &layer.attention.query_norm,
+                        &layer.attention.key_norm,
+                        &layer_cache.key,
+                        QkNormRopeCacheConfig {
+                            offset,
+                            theta: self.config.rope_theta,
+                            epsilon: self.config.rms_norm_eps,
+                        },
+                    )?
+                } else {
+                    let q = batch.rms_norm(
+                        &query_row,
+                        &layer.attention.query_norm,
+                        self.config.rms_norm_eps,
+                    )?;
+                    let q = batch.rope(&q, offset, self.config.rope_theta)?;
+                    let k = batch.rms_norm(
+                        &key_row,
+                        &layer.attention.key_norm,
+                        self.config.rms_norm_eps,
+                    )?;
+                    let k = batch.rope(&k, offset, self.config.rope_theta)?;
+                    batch.copy_into_cache(&k, &layer_cache.key, offset)?;
+                    q
+                };
+                batch.copy_into_cache(&value_row, &layer_cache.value, offset)?;
+                let length = offset + 1;
+                let kind = attention_kind_for_tokens(
+                    self.attention,
+                    1,
+                    length,
+                    self.config.num_attention_heads / self.config.num_key_value_heads,
+                );
+                let attention = batch.attention(
+                    &query_row,
+                    &layer_cache.key.prefix(length)?,
+                    &layer_cache.value.prefix(length)?,
+                    AttentionConfig {
+                        query_heads: self.config.num_attention_heads,
+                        kv_heads: self.config.num_key_value_heads,
+                        head_dim: self.config.head_dim,
+                        causal: true,
+                        query_offset: offset,
+                    },
+                    kind,
+                )?;
+                batch.copy_row(
+                    &attention.reshape(&[1, self.config.query_width()])?,
+                    &attention_rows,
+                    row,
+                )?;
+            }
+            let attention = batch.matmul(&attention_rows, &layer.attention.output)?;
+            let (residual, normalized) = if self.fusions.add_rms_norm {
+                batch.add_rms_norm(
+                    &hidden,
+                    &attention,
+                    &layer.post_attention_norm,
+                    self.config.rms_norm_eps,
+                )?
+            } else {
+                let residual = batch.add(&hidden, &attention)?;
+                let normalized = batch.rms_norm(
+                    &residual,
+                    &layer.post_attention_norm,
+                    self.config.rms_norm_eps,
+                )?;
+                (residual, normalized)
+            };
+            let (gate, up) = if self.fusions.gate_up {
+                batch.matmul2(&normalized, &layer.mlp.gate, &layer.mlp.up)?
+            } else {
+                (
+                    batch.matmul(&normalized, &layer.mlp.gate)?,
+                    batch.matmul(&normalized, &layer.mlp.up)?,
+                )
+            };
+            let activated = batch.swiglu(&gate, &up)?;
+            let down = batch.matmul(&activated, &layer.mlp.down)?;
+            hidden = batch.add(&residual, &down)?;
+        }
+        let normalized = batch.rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)?;
+        let logits = batch.matmul(&normalized, &self.lm_head)?;
+        batch.finish()?;
+        for cache in caches.iter_mut() {
+            cache.filled += 1;
+        }
+        Ok(logits)
+    }
     pub fn load(
         directory: &Path,
         context: &MetalContext,

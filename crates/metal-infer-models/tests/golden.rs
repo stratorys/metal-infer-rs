@@ -16,6 +16,63 @@ const PROMPTS: [&str; 3] = [
     "Write a Rust function that reverses a string.",
 ];
 
+#[test]
+fn batched_decode_matches_independent_requests() {
+    let context = MetalContext::new().expect("Metal device");
+    let model = Qwen3Model::load(&model_directory(), &context).expect("load Qwen3");
+    let prompts = [
+        synthetic_prompt(64),
+        synthetic_prompt(512),
+        synthetic_prompt(129),
+    ];
+    let mut independent = prompts
+        .iter()
+        .map(|prompt| {
+            let mut cache =
+                KvCache::new(&context, model.config(), prompt.len() + 4).expect("KV cache");
+            model.prefill(prompt, &mut cache).expect("prefill");
+            cache
+        })
+        .collect::<Vec<_>>();
+    let mut batched = prompts
+        .iter()
+        .map(|prompt| {
+            let mut cache =
+                KvCache::new(&context, model.config(), prompt.len() + 4).expect("KV cache");
+            model.prefill(prompt, &mut cache).expect("prefill");
+            cache
+        })
+        .collect::<Vec<_>>();
+    let mut tokens = vec![1, 2, 3];
+    for _ in 0..3 {
+        let expected = independent
+            .iter_mut()
+            .zip(&tokens)
+            .map(|(cache, token)| {
+                let logits = model.decode(*token, cache).expect("independent decode");
+                argmax(&logits.with_f16_bits(|bits| bits.to_vec()).expect("logits"))
+            })
+            .collect::<Vec<_>>();
+        let mut cache_refs = batched.iter_mut().collect::<Vec<_>>();
+        let logits = model
+            .decode_batch(&tokens, &mut cache_refs)
+            .expect("batched decode");
+        let actual = (0..tokens.len())
+            .map(|row| {
+                argmax(
+                    &logits
+                        .row(row)
+                        .expect("row")
+                        .with_f16_bits(|bits| bits.to_vec())
+                        .expect("logits"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        tokens = actual;
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 struct Golden {
     device: String,

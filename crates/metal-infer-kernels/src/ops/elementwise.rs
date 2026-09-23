@@ -4,6 +4,32 @@ use super::{matrix_shape, require_f16, require_same_shape, size, to_u32};
 use crate::KernelBatch;
 
 impl KernelBatch<'_> {
+    pub fn copy_row(
+        &mut self,
+        source: &Tensor,
+        destination: &Tensor,
+        row: usize,
+    ) -> Result<(), CoreError> {
+        require_f16(source)?;
+        require_f16(destination)?;
+        let [source_rows, width] = source.shape() else {
+            return Err(CoreError::Shape("source must be a matrix".into()));
+        };
+        let [rows, destination_width] = destination.shape() else {
+            return Err(CoreError::Shape("destination must be a matrix".into()));
+        };
+        if *source_rows != 1 || width != destination_width || row >= *rows {
+            return Err(CoreError::Shape("copy row shapes are incompatible".into()));
+        }
+        let params = [to_u32(*width, "row width")?, to_u32(row, "row index")?, 0];
+        self.dispatch(
+            "copy_row_f16",
+            &[source, destination],
+            &params,
+            size(*width, 1, 1),
+            size((*width).min(256), 1, 1),
+        )
+    }
     pub fn add(
         &mut self,
         left: &Tensor,

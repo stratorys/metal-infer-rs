@@ -1,22 +1,40 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use metal_infer_cli::{CliError, hugging_face_model_id, load_model, resolve_model_path};
-use metal_infer_models::{ChatMessage, GenerationOptions, KvCache, ModelTokenizer, Qwen3Model};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use metal_infer_cli::{
+    CliError, ServerError, hugging_face_model_id, load_model, resolve_model_path,
+};
+use metal_infer_models::{
+    ChatMessage, GenerationOptions, KvCache, ModelTokenizer, Qwen3Model, TokenSampler,
+};
 use metal_infer_runtime::MetalContext;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::{mpsc as async_mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::Instrument;
 
-const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_TOKENS: usize = 256;
+const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const COMMAND_CHANNEL_CAPACITY: usize = 16;
+const WAITING_CAPACITY: usize = 16;
+const STREAM_CHANNEL_CAPACITY: usize = 64;
 
 pub struct ServerOptions {
     pub model: PathBuf,
     pub model_id: Option<String>,
     pub bind: String,
     pub context: usize,
+    pub max_active_requests: usize,
     pub with: Vec<String>,
 }
 
@@ -24,7 +42,6 @@ struct ServerState {
     model_id: String,
     tokenizer: ModelTokenizer,
     model: Qwen3Model,
-    cache: KvCache,
     context: usize,
 }
 
@@ -81,12 +98,6 @@ enum StopSequences {
     Many(Vec<String>),
 }
 
-struct HttpRequest {
-    method: String,
-    path: String,
-    body: Vec<u8>,
-}
-
 struct PreparedCompletion {
     prompt: Vec<u32>,
     options: GenerationOptions,
@@ -94,120 +105,719 @@ struct PreparedCompletion {
     stream: bool,
 }
 
-pub fn serve(options: ServerOptions) -> Result<(), CliError> {
-    let requested_model_id = hugging_face_model_id(&options.model);
-    let model_path = resolve_model_path(&options.model)?;
-    let context = MetalContext::new()?;
-    eprintln!("Metal device: {}", context.device_name());
-    eprintln!("Loading {}", model_path.display());
-    let tokenizer = ModelTokenizer::from_directory(&model_path)?;
-    let Some(model) = load_model(&model_path, &context, &options.with)? else {
-        return Ok(());
-    };
-    let cache = KvCache::new(&context, model.config(), options.context)?;
-    let model_id = options
-        .model_id
-        .or(requested_model_id)
-        .unwrap_or_else(|| infer_model_id(&model_path));
-    let mut state = ServerState {
-        model_id,
-        tokenizer,
-        model,
-        cache,
-        context: options.context,
-    };
-    let listener = TcpListener::bind(&options.bind).map_err(|error| {
-        CliError::InvalidArguments(format!("cannot bind {}: {error}", options.bind))
-    })?;
-    eprintln!(
-        "OpenAI-compatible server listening on http://{}",
-        options.bind
-    );
-    for connection in listener.incoming() {
-        match connection {
-            Ok(mut stream) => {
-                if let Err(error) = handle_connection(&mut stream, &mut state) {
-                    eprintln!("request failed: {error}");
-                }
-            }
-            Err(error) => eprintln!("connection failed: {error}"),
-        }
-    }
-    Ok(())
+#[derive(Clone)]
+struct HttpState {
+    model_id: String,
+    commands: async_mpsc::Sender<Command>,
 }
 
-fn handle_connection(
-    stream: &mut TcpStream,
-    state: &mut ServerState,
-) -> Result<(), CliError> {
-    let request = match read_request(stream) {
-        Ok(request) => request,
+struct Command {
+    id: String,
+    span: tracing::Span,
+    received: Instant,
+    body: Value,
+    reply: Reply,
+}
+
+enum Reply {
+    Stream(async_mpsc::Sender<Result<Bytes, std::convert::Infallible>>),
+    Once(oneshot::Sender<Result<Value, ServerError>>),
+}
+
+impl Reply {
+    fn error(
+        self,
+        error: ServerError,
+    ) {
+        match self {
+            Self::Stream(sender) => {
+                let value = error_body(error_status(&error), error.message());
+                let _ = send_event(&sender, &value);
+            }
+            Self::Once(sender) => {
+                let _ = sender.send(Err(error));
+            }
+        }
+    }
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Stream(sender) => sender.is_closed(),
+            Self::Once(sender) => sender.is_closed(),
+        }
+    }
+}
+
+struct ActiveCompletion {
+    span: tracing::Span,
+    received: Instant,
+    started: Option<Instant>,
+    prefill_ms: Option<f64>,
+    first_token_ms: Option<f64>,
+    stream: bool,
+    reply: Option<Reply>,
+    id: String,
+    prompt: Vec<u32>,
+    options: GenerationOptions,
+    stop_sequences: Vec<String>,
+    cache: KvCache,
+    sampler: TokenSampler,
+    generated: Vec<u32>,
+    emitted_reasoning: usize,
+    emitted_content: usize,
+    role_sent: bool,
+    done: bool,
+}
+
+pub fn serve(options: ServerOptions) -> Result<(), CliError> {
+    if options.max_active_requests == 0 {
+        return Err(ServerError::InvalidOptions.into());
+    }
+    let bind = options.bind.clone();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| ServerError::Runtime { source })?;
+    runtime.block_on(async move {
+        let (commands, receiver) = async_mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let worker =
+            tokio::task::spawn_blocking(move || run_inference(options, receiver, ready_sender));
+        let model_id = match ready_receiver.await {
+            Ok(Ok(model_id)) => model_id,
+            Ok(Err(error)) => {
+                worker
+                    .await
+                    .map_err(|source| ServerError::WorkerJoin { source })?;
+                return Err(error.into());
+            }
+            Err(source) => {
+                worker
+                    .await
+                    .map_err(|source| ServerError::WorkerJoin { source })?;
+                return Err(ServerError::WorkerStoppedSource { source }.into());
+            }
+        };
+        let state = HttpState { model_id, commands };
+        let router = Router::new()
+            .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+            .route("/v1/models", get(models))
+            .route("/v1/chat/completions", post(completion))
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .map_err(|source| ServerError::Bind { source })?;
+        tracing::info!(%bind, "OpenAI-compatible server listening");
+        let result = axum::serve(listener, router).await;
+        worker
+            .await
+            .map_err(|source| ServerError::WorkerJoin { source })?;
+        result.map_err(|source| ServerError::Http { source }.into())
+    })
+}
+
+async fn models(State(state): State<HttpState>) -> Json<Value> {
+    Json(
+        json!({"object": "list", "data": [{"id": state.model_id, "object": "model", "owned_by": "metal-infer"}]}),
+    )
+}
+
+async fn completion(
+    State(state): State<HttpState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let id = completion_id();
+    let span = tracing::info_span!("completion", request_id = %id, stream = streaming);
+    completion_inner(state, body, streaming, id)
+        .instrument(span)
+        .await
+}
+
+async fn completion_inner(
+    state: HttpState,
+    body: Value,
+    streaming: bool,
+    id: String,
+) -> Response {
+    let received = Instant::now();
+    if streaming {
+        let (sender, receiver) = async_mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        if let Err(error) = state.commands.try_send(Command {
+            id,
+            span: tracing::Span::current(),
+            received,
+            body,
+            reply: Reply::Stream(sender),
+        }) {
+            return admission_error_response(error);
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+        headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        (headers, Body::from_stream(ReceiverStream::new(receiver))).into_response()
+    } else {
+        let (sender, receiver) = oneshot::channel();
+        if let Err(error) = state.commands.try_send(Command {
+            id,
+            span: tracing::Span::current(),
+            received,
+            body,
+            reply: Reply::Once(sender),
+        }) {
+            return admission_error_response(error);
+        }
+        match receiver.await {
+            Ok(Ok(value)) => Json(value).into_response(),
+            Ok(Err(error)) => error_response(error_status(&error), error.message()),
+            Err(error) => {
+                tracing::error!(message = "Inference worker stopped before replying.", error = %error);
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "inference worker stopped",
+                )
+            }
+        }
+    }
+}
+
+fn error_response(
+    status: StatusCode,
+    message: &str,
+) -> Response {
+    (status, Json(error_body(status, message))).into_response()
+}
+
+fn error_body(
+    status: StatusCode,
+    message: &str,
+) -> Value {
+    let kind = if status.is_server_error() {
+        "server_error"
+    } else {
+        "invalid_request_error"
+    };
+    json!({"error": {"message": message, "type": kind}})
+}
+
+const fn error_status(error: &ServerError) -> StatusCode {
+    match error {
+        ServerError::InvalidRequest
+        | ServerError::InvalidRequestSource { .. }
+        | ServerError::InvalidJson { .. }
+        | ServerError::InvalidOptions
+        | ServerError::InvalidOptionsSource { .. }
+        | ServerError::Disconnected
+        | ServerError::SlowClient => StatusCode::BAD_REQUEST,
+        ServerError::Runtime { .. }
+        | ServerError::Bind { .. }
+        | ServerError::Http { .. }
+        | ServerError::WorkerStopped
+        | ServerError::WorkerStoppedSource { .. }
+        | ServerError::WorkerJoin { .. }
+        | ServerError::ModelInitialization
+        | ServerError::ModelInitializationSource { .. }
+        | ServerError::CacheAllocation { .. }
+        | ServerError::Inference
+        | ServerError::InferenceSource { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn admission_error_response(error: async_mpsc::error::TrySendError<Command>) -> Response {
+    match error {
+        async_mpsc::error::TrySendError::Full(_) => {
+            tracing::warn!(message = "Request queue is full.");
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "request queue is full")
+        }
+        async_mpsc::error::TrySendError::Closed(_) => {
+            tracing::error!(message = "Inference worker stopped.");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "inference worker stopped",
+            )
+        }
+    }
+}
+
+fn log_server_error(
+    operation: &'static str,
+    error: &ServerError,
+) {
+    match error {
+        ServerError::Runtime { source }
+        | ServerError::Bind { source }
+        | ServerError::Http { source } => {
+            tracing::error!(message = "Server operation failed.", operation, error = %source);
+        }
+        ServerError::ModelInitializationSource { source }
+        | ServerError::InvalidRequestSource { source }
+        | ServerError::InferenceSource { source } => {
+            tracing::error!(message = "Server operation failed.", operation, error = %source);
+        }
+        ServerError::InvalidOptionsSource { source } | ServerError::CacheAllocation { source } => {
+            tracing::error!(message = "Server operation failed.", operation, error = %source);
+        }
+        ServerError::WorkerStoppedSource { source } => {
+            tracing::error!(message = "Server operation failed.", operation, error = %source);
+        }
+        ServerError::WorkerJoin { source } => {
+            tracing::error!(message = "Server operation failed.", operation, error = %source);
+        }
+        ServerError::InvalidJson { source } => {
+            tracing::error!(message = "Server operation failed.", operation, error = %source);
+        }
+        ServerError::WorkerStopped
+        | ServerError::ModelInitialization
+        | ServerError::InvalidRequest
+        | ServerError::InvalidOptions
+        | ServerError::Inference
+        | ServerError::Disconnected
+        | ServerError::SlowClient => {
+            tracing::error!(message = "Server operation failed.", operation, error = %error);
+        }
+    }
+}
+
+fn run_inference(
+    options: ServerOptions,
+    mut incoming: async_mpsc::Receiver<Command>,
+    ready: oneshot::Sender<Result<String, ServerError>>,
+) {
+    let initialized = (|| -> Result<ServerState, ServerError> {
+        let requested_model_id = hugging_face_model_id(&options.model);
+        let model_path = resolve_model_path(&options.model).map_err(|source| {
+            ServerError::ModelInitializationSource {
+                source: Box::new(source),
+            }
+        })?;
+        let context =
+            MetalContext::new().map_err(|source| ServerError::ModelInitializationSource {
+                source: Box::new(source.into()),
+            })?;
+        tracing::info!(message = "Metal device ready.", device = %context.device_name());
+        tracing::info!(message = "Loading model.", path = %model_path.display());
+        let tokenizer = ModelTokenizer::from_directory(&model_path).map_err(|source| {
+            ServerError::ModelInitializationSource {
+                source: Box::new(source.into()),
+            }
+        })?;
+        let model = load_model(&model_path, &context, &options.with)
+            .map_err(|source| ServerError::ModelInitializationSource {
+                source: Box::new(source),
+            })?
+            .ok_or(ServerError::ModelInitialization)?;
+        let model_id = options
+            .model_id
+            .or(requested_model_id)
+            .unwrap_or_else(|| infer_model_id(&model_path));
+        Ok(ServerState {
+            model_id,
+            tokenizer,
+            model,
+            context: options.context,
+        })
+    })();
+    let state = match initialized {
+        Ok(state) => state,
         Err(error) => {
-            write_json_error(stream, 400, &error.to_string())?;
-            return Ok(());
+            log_server_error("startup", &error);
+            let _ = ready.send(Err(error));
+            return;
         }
     };
-    match (request.method.as_str(), request.path.as_str()) {
-        ("OPTIONS", _) => write_empty(stream, 204)?,
-        ("GET", "/health") => write_json(stream, 200, &json!({ "status": "ok" }))?,
-        ("GET", "/v1/models") => write_json(
-            stream,
-            200,
-            &json!({
-                "object": "list",
-                "data": [{
-                    "id": state.model_id,
-                    "object": "model",
-                    "owned_by": "metal-infer"
-                }]
-            }),
-        )?,
-        ("POST", "/v1/chat/completions") => {
-            let parsed: ChatCompletionRequest = match serde_json::from_slice(&request.body) {
-                Ok(value) => value,
+    let _ = ready.send(Ok(state.model_id.clone()));
+    let mut waiting: VecDeque<Command> = VecDeque::new();
+    let mut active: Vec<ActiveCompletion> = Vec::new();
+    loop {
+        while waiting.len() < WAITING_CAPACITY {
+            let Ok(command) = incoming.try_recv() else {
+                break;
+            };
+            waiting.push_back(command);
+        }
+        if active.is_empty() && waiting.is_empty() {
+            let Some(command) = incoming.blocking_recv() else {
+                break;
+            };
+            waiting.push_back(command);
+        }
+        while active.len() < options.max_active_requests {
+            let Some(command) = waiting.pop_front() else {
+                break;
+            };
+            if command.reply.is_closed() {
+                continue;
+            }
+            let mut completion = match prepare_command(command, &state) {
+                Ok(completion) => completion,
                 Err(error) => {
-                    write_json_error(stream, 400, &format!("invalid JSON: {error}"))?;
-                    return Ok(());
+                    log_server_error("request preparation", &error);
+                    continue;
                 }
             };
-            let prepared = match prepare_completion(state, parsed) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    write_json_error(stream, 400, &error.to_string())?;
-                    return Ok(());
+            if completion.reply.as_ref().is_some_and(Reply::is_closed) {
+                continue;
+            }
+            let span = completion.span.clone();
+            let _guard = span.enter();
+            if let Err(source) = completion.start(&state) {
+                let error = ServerError::InferenceSource {
+                    source: Box::new(source),
+                };
+                log_server_error("prefill", &error);
+                completion.fail(ServerError::Inference);
+            }
+            if !completion.done {
+                active.push(completion);
+            }
+        }
+        active.retain(|completion| {
+            !completion.done && !completion.reply.as_ref().is_some_and(Reply::is_closed)
+        });
+        if active.is_empty() {
+            continue;
+        }
+        let inputs: Option<Vec<u32>> = active
+            .iter()
+            .map(|completion| completion.generated.last().copied())
+            .collect();
+        let Some(inputs) = inputs else {
+            let error = ServerError::Inference;
+            log_server_error("decode input", &error);
+            for completion in &mut active {
+                completion.fail(ServerError::Inference);
+            }
+            active.clear();
+            continue;
+        };
+        let logits = if active.len() == 1 {
+            let Some(&token) = inputs.first() else {
+                continue;
+            };
+            let Some(completion) = active.first_mut() else {
+                continue;
+            };
+            state.model.decode(token, &mut completion.cache)
+        } else {
+            let mut caches: Vec<_> = active
+                .iter_mut()
+                .map(|completion| &mut completion.cache)
+                .collect();
+            state.model.decode_batch(&inputs, &mut caches)
+        };
+        let logits = match logits {
+            Ok(logits) => logits,
+            Err(source) => {
+                let error = ServerError::InferenceSource {
+                    source: Box::new(source.into()),
+                };
+                log_server_error("decode", &error);
+                for completion in &mut active {
+                    completion.fail(ServerError::Inference);
                 }
-            };
-            let id = completion_id();
-            let completed = if prepared.stream {
-                stream_completion(
-                    stream,
-                    state,
-                    &id,
-                    &prepared.prompt,
-                    &prepared.options,
-                    &prepared.stop_sequences,
-                )
-            } else {
-                complete_once(
-                    stream,
-                    state,
-                    &id,
-                    &prepared.prompt,
-                    &prepared.options,
-                    &prepared.stop_sequences,
-                )
-            };
-            if let Err(error) = completed {
-                if prepared.stream {
-                    eprintln!("streaming completion failed: {error}");
-                } else {
-                    write_json_error(stream, 500, &error.to_string())?;
+                active.clear();
+                continue;
+            }
+        };
+        let sampled = active
+            .iter_mut()
+            .enumerate()
+            .map(|(row, completion)| {
+                logits
+                    .row(row)
+                    .map_err(|source| ServerError::InferenceSource {
+                        source: Box::new(source.into()),
+                    })
+                    .and_then(|row| {
+                        completion.sampler.sample(&row).map_err(|source| {
+                            ServerError::InferenceSource {
+                                source: Box::new(source.into()),
+                            }
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        for (completion, result) in active.iter_mut().zip(sampled) {
+            let span = completion.span.clone();
+            let _guard = span.enter();
+            match result {
+                Ok(token) => {
+                    if let Err(source) = completion.accept_token(token, &state) {
+                        let error = ServerError::InferenceSource {
+                            source: Box::new(source),
+                        };
+                        log_server_error("completion", &error);
+                        completion.fail(ServerError::Inference);
+                    }
+                }
+                Err(error) => {
+                    log_server_error("sampling", &error);
+                    completion.fail(ServerError::Inference);
                 }
             }
         }
-        _ => write_json_error(stream, 404, "route not found")?,
+        active.retain(|completion| !completion.done);
     }
-    Ok(())
+}
+
+fn prepare_command(
+    command: Command,
+    state: &ServerState,
+) -> Result<ActiveCompletion, ServerError> {
+    let Command {
+        id,
+        span,
+        received,
+        body,
+        reply,
+    } = command;
+    let parsed: ChatCompletionRequest = match serde_json::from_value(body) {
+        Ok(value) => value,
+        Err(source) => {
+            reply.error(ServerError::InvalidRequest);
+            return Err(ServerError::InvalidJson { source });
+        }
+    };
+    let prepared = match prepare_completion(state, parsed) {
+        Ok(value) => value,
+        Err(source) => {
+            reply.error(ServerError::InvalidRequest);
+            return Err(ServerError::InvalidRequestSource {
+                source: Box::new(source),
+            });
+        }
+    };
+    let sampler = match TokenSampler::new(prepared.options.clone()) {
+        Ok(value) => value,
+        Err(source) => {
+            reply.error(ServerError::InvalidOptions);
+            return Err(ServerError::InvalidOptionsSource { source });
+        }
+    };
+    let capacity = prepared
+        .prompt
+        .len()
+        .saturating_add(prepared.options.max_tokens)
+        .max(1);
+    let cache = match KvCache::new(state.model.context(), state.model.config(), capacity) {
+        Ok(value) => value,
+        Err(source) => {
+            reply.error(ServerError::Inference);
+            return Err(ServerError::CacheAllocation { source });
+        }
+    };
+    if prepared.stream != matches!(reply, Reply::Stream(_)) {
+        reply.error(ServerError::InvalidRequest);
+        return Err(ServerError::InvalidRequest);
+    }
+    Ok(ActiveCompletion {
+        span,
+        received,
+        started: None,
+        prefill_ms: None,
+        first_token_ms: None,
+        stream: prepared.stream,
+        reply: Some(reply),
+        id,
+        prompt: prepared.prompt,
+        options: prepared.options,
+        stop_sequences: prepared.stop_sequences,
+        cache,
+        sampler,
+        generated: Vec::new(),
+        emitted_reasoning: 0,
+        emitted_content: 0,
+        role_sent: false,
+        done: false,
+    })
+}
+
+impl ActiveCompletion {
+    fn start(
+        &mut self,
+        state: &ServerState,
+    ) -> Result<(), CliError> {
+        self.started = Some(Instant::now());
+        if self.options.max_tokens == 0 {
+            return self.finish(state);
+        }
+        let prefill_started = Instant::now();
+        let logits = state.model.prefill(&self.prompt, &mut self.cache)?;
+        self.prefill_ms = Some(prefill_started.elapsed().as_secs_f64() * 1000.0);
+        let token = self.sampler.sample(&logits)?;
+        self.accept_token(token, state)
+    }
+
+    fn accept_token(
+        &mut self,
+        token: u32,
+        state: &ServerState,
+    ) -> Result<(), CliError> {
+        if self.options.stop_token_ids.contains(&token) {
+            return self.finish(state);
+        }
+        self.generated.push(token);
+        if self.generated.len() == 1 {
+            self.first_token_ms = Some(self.received.elapsed().as_secs_f64() * 1000.0);
+        }
+        let decoded = state.tokenizer.decode(&self.generated)?;
+        let stopped = self
+            .stop_sequences
+            .iter()
+            .any(|stop| decoded.contains(stop));
+        if self.is_stream() {
+            if !self.role_sent {
+                self.send_stream(role_chunk(&self.id, &state.model_id))?;
+                self.role_sent = true;
+            }
+            let visible = truncate_stop(decoded, &self.stop_sequences);
+            let safe_end = if stopped {
+                visible.len()
+            } else {
+                safe_stream_boundary(&visible, &self.stop_sequences)
+            };
+            self.emit_delta(visible.get(..safe_end).unwrap_or_default(), &state.model_id)?;
+        }
+        if stopped || self.generated.len() == self.options.max_tokens {
+            self.finish(state)?;
+        }
+        Ok(())
+    }
+
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn send_stream(
+        &self,
+        value: Value,
+    ) -> Result<(), CliError> {
+        let Some(Reply::Stream(sender)) = &self.reply else {
+            return Ok(());
+        };
+        send_event(sender, &value).map_err(Into::into)
+    }
+
+    fn emit_delta(
+        &mut self,
+        visible: &str,
+        model_id: &str,
+    ) -> Result<(), CliError> {
+        let (reasoning, content) = stream_channels(visible);
+        if let Some(delta) = reasoning.get(self.emitted_reasoning..)
+            && !delta.is_empty()
+        {
+            self.send_stream(delta_chunk(&self.id, model_id, "reasoning_content", delta))?;
+            self.emitted_reasoning = reasoning.len();
+        }
+        if let Some(delta) = content.get(self.emitted_content..)
+            && !delta.is_empty()
+        {
+            self.send_stream(delta_chunk(&self.id, model_id, "content", delta))?;
+            self.emitted_content = content.len();
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        state: &ServerState,
+    ) -> Result<(), CliError> {
+        let decoded = truncate_stop(
+            state.tokenizer.decode(&self.generated)?,
+            &self.stop_sequences,
+        );
+        let reason = if self.generated.len() == self.options.max_tokens {
+            "length"
+        } else {
+            "stop"
+        };
+        let usage = json!({"prompt_tokens": self.prompt.len(), "completion_tokens": self.generated.len(), "total_tokens": self.prompt.len() + self.generated.len()});
+        if self.is_stream() {
+            if !self.role_sent {
+                self.send_stream(role_chunk(&self.id, &state.model_id))?;
+                self.role_sent = true;
+            }
+            self.emit_delta(&decoded, &state.model_id)?;
+            self.send_stream(json!({"id": self.id, "object": "chat.completion.chunk", "created": unix_seconds(),
+                "model": state.model_id, "choices": [{"index": 0, "delta": {}, "finish_reason": reason}], "usage": usage}))?;
+            if let Some(Reply::Stream(sender)) = &self.reply {
+                let _ = sender.try_send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+            }
+            self.reply.take();
+        } else {
+            let (reasoning, content) = split_reasoning(&decoded);
+            let mut message = json!({"role": "assistant", "content": content});
+            if let Some(reasoning) = reasoning
+                && let Some(object) = message.as_object_mut()
+            {
+                object.insert("reasoning_content".into(), Value::String(reasoning));
+            }
+            let value = json!({"id": self.id, "object": "chat.completion", "created": unix_seconds(),
+                "model": state.model_id, "choices": [{"index": 0, "message": message, "finish_reason": reason}], "usage": usage});
+            if let Some(Reply::Once(sender)) = self.reply.take() {
+                let _ = sender.send(Ok(value));
+            }
+        }
+        self.done = true;
+        tracing::info!(
+            request_id = %self.id,
+            prompt_tokens = self.prompt.len(),
+            generated_tokens = self.generated.len(),
+            queue_ms = self.started.map(|started| started.duration_since(self.received).as_secs_f64() * 1000.0),
+            prefill_ms = self.prefill_ms,
+            first_token_ms = self.first_token_ms,
+            total_ms = self.received.elapsed().as_secs_f64() * 1000.0,
+            message = "Completion finished.",
+        );
+        Ok(())
+    }
+
+    fn fail(
+        &mut self,
+        error: ServerError,
+    ) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(error);
+        }
+        self.done = true;
+    }
+}
+
+fn send_event(
+    sender: &async_mpsc::Sender<Result<Bytes, std::convert::Infallible>>,
+    value: &Value,
+) -> Result<(), ServerError> {
+    sender
+        .try_send(Ok(Bytes::from(format!("data: {value}\n\n"))))
+        .map_err(|error| match error {
+            async_mpsc::error::TrySendError::Full(_) => ServerError::SlowClient,
+            async_mpsc::error::TrySendError::Closed(_) => ServerError::Disconnected,
+        })
+}
+
+fn role_chunk(
+    id: &str,
+    model_id: &str,
+) -> Value {
+    json!({"id": id, "object": "chat.completion.chunk", "created": unix_seconds(), "model": model_id,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]})
+}
+
+fn delta_chunk(
+    id: &str,
+    model_id: &str,
+    field: &str,
+    value: &str,
+) -> Value {
+    let mut delta = serde_json::Map::new();
+    delta.insert(field.to_owned(), Value::String(value.to_owned()));
+    json!({"id": id, "object": "chat.completion.chunk", "created": unix_seconds(), "model": model_id,
+        "choices": [{"index": 0, "delta": Value::Object(delta), "finish_reason": null}]})
 }
 
 fn prepare_completion(
@@ -256,156 +866,6 @@ fn prepare_completion(
     })
 }
 
-fn complete_once(
-    stream: &mut TcpStream,
-    state: &mut ServerState,
-    id: &str,
-    prompt: &[u32],
-    options: &GenerationOptions,
-    stop_sequences: &[String],
-) -> Result<(), CliError> {
-    let generated = state
-        .model
-        .generate_with(prompt, options, &mut state.cache, |_| true)?;
-    let decoded = truncate_stop(state.tokenizer.decode(&generated)?, stop_sequences);
-    let (reasoning, content) = split_reasoning(&decoded);
-    let mut message = json!({ "role": "assistant", "content": content });
-    if let Some(reasoning) = reasoning
-        && let Some(object) = message.as_object_mut()
-    {
-        object.insert("reasoning_content".into(), Value::String(reasoning));
-    }
-    write_json(
-        stream,
-        200,
-        &json!({
-            "id": id,
-            "object": "chat.completion",
-            "created": unix_seconds(),
-            "model": state.model_id,
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": if generated.len() == options.max_tokens { "length" } else { "stop" }
-            }],
-            "usage": {
-                "prompt_tokens": prompt.len(),
-                "completion_tokens": generated.len(),
-                "total_tokens": prompt.len() + generated.len()
-            }
-        }),
-    )?;
-    Ok(())
-}
-
-fn stream_completion(
-    stream: &mut TcpStream,
-    state: &mut ServerState,
-    id: &str,
-    prompt: &[u32],
-    options: &GenerationOptions,
-    stop_sequences: &[String],
-) -> Result<(), CliError> {
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-    )?;
-    let tokenizer = &state.tokenizer;
-    let model_id = state.model_id.clone();
-    let mut tokens = Vec::new();
-    let mut role_sent = false;
-    let mut emitted_reasoning = 0usize;
-    let mut emitted_content = 0usize;
-    let mut write_error = None;
-    let generated = state
-        .model
-        .generate_with(prompt, options, &mut state.cache, |token| {
-            if !role_sent {
-                if let Err(error) = write_stream_role(stream, id, &model_id) {
-                    write_error = Some(error);
-                    return false;
-                }
-                role_sent = true;
-            }
-            tokens.push(token);
-            let Ok(decoded) = tokenizer.decode(&tokens) else {
-                return false;
-            };
-            let stopped = stop_sequences.iter().any(|stop| decoded.contains(stop));
-            let visible = truncate_stop(decoded, stop_sequences);
-            let safe_end = if stopped {
-                visible.len()
-            } else {
-                safe_stream_boundary(&visible, stop_sequences)
-            };
-            let Some(safe) = visible.get(..safe_end) else {
-                return false;
-            };
-            let (reasoning, content) = stream_channels(safe);
-            if let Some(delta) = reasoning.get(emitted_reasoning..)
-                && !delta.is_empty()
-            {
-                if let Err(error) =
-                    write_stream_delta(stream, id, &model_id, "reasoning_content", delta)
-                {
-                    write_error = Some(error);
-                    return false;
-                }
-                emitted_reasoning = reasoning.len();
-            }
-            if let Some(delta) = content.get(emitted_content..)
-                && !delta.is_empty()
-            {
-                if let Err(error) = write_stream_delta(stream, id, &model_id, "content", delta) {
-                    write_error = Some(error);
-                    return false;
-                }
-                emitted_content = content.len();
-            }
-            !stopped
-        })?;
-    if let Some(error) = write_error {
-        return Err(error.into());
-    }
-    if !role_sent {
-        write_stream_role(stream, id, &state.model_id)?;
-    }
-    let decoded = truncate_stop(tokenizer.decode(&generated)?, stop_sequences);
-    let (reasoning, content) = stream_channels(&decoded);
-    if let Some(delta) = reasoning.get(emitted_reasoning..)
-        && !delta.is_empty()
-    {
-        write_stream_delta(stream, id, &state.model_id, "reasoning_content", delta)?;
-    }
-    if let Some(delta) = content.get(emitted_content..)
-        && !delta.is_empty()
-    {
-        write_stream_delta(stream, id, &state.model_id, "content", delta)?;
-    }
-    write_sse(
-        stream,
-        &json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": unix_seconds(),
-            "model": state.model_id,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": if generated.len() == options.max_tokens { "length" } else { "stop" }
-            }],
-            "usage": {
-                "prompt_tokens": prompt.len(),
-                "completion_tokens": generated.len(),
-                "total_tokens": prompt.len() + generated.len()
-            }
-        }),
-    )?;
-    stream.write_all(b"data: [DONE]\n\n")?;
-    stream.flush()?;
-    Ok(())
-}
-
 impl WireMessage {
     fn into_chat_message(self) -> Result<ChatMessage, CliError> {
         let content = match self.content {
@@ -452,188 +912,6 @@ impl StopSequences {
 
 const fn default_top_p() -> f32 {
     1.0
-}
-
-fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, std::io::Error> {
-    let mut bytes = Vec::new();
-    let mut buffer = [0u8; 8192];
-    let header_end = loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed before HTTP headers",
-            ));
-        }
-        let chunk = buffer.get(..read).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid socket read size")
-        })?;
-        bytes.extend_from_slice(chunk);
-        if bytes.len() > MAX_REQUEST_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request is too large",
-            ));
-        }
-        if let Some(position) = find_bytes(&bytes, b"\r\n\r\n") {
-            break position + 4;
-        }
-    };
-    let header_bytes = bytes.get(..header_end).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid HTTP header length",
-        )
-    })?;
-    let headers = std::str::from_utf8(header_bytes).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "headers are not UTF-8")
-    })?;
-    let mut lines = headers.split("\r\n");
-    let request_line = lines.next().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing request line")
-    })?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().unwrap_or_default().to_owned();
-    let path = request_parts
-        .next()
-        .unwrap_or_default()
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .to_owned();
-    let content_length = lines
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .map(|(_, value)| value.trim().parse::<usize>())
-        .transpose()
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid Content-Length")
-        })?
-        .unwrap_or(0);
-    if header_end + content_length > MAX_REQUEST_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "request is too large",
-        ));
-    }
-    while bytes.len() < header_end + content_length {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed before HTTP body",
-            ));
-        }
-        let chunk = buffer.get(..read).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid socket read size")
-        })?;
-        bytes.extend_from_slice(chunk);
-    }
-    let body = bytes
-        .get(header_end..header_end + content_length)
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP body length")
-        })?
-        .to_vec();
-    Ok(HttpRequest { method, path, body })
-}
-
-fn write_json(
-    stream: &mut TcpStream,
-    status: u16,
-    value: &Value,
-) -> std::io::Result<()> {
-    let body = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Error",
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(&body)?;
-    stream.flush()
-}
-
-fn write_empty(
-    stream: &mut TcpStream,
-    status: u16,
-) -> std::io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {status} No Content\r\nContent-Length: 0\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n"
-    )?;
-    stream.flush()
-}
-
-fn write_json_error(
-    stream: &mut TcpStream,
-    status: u16,
-    message: &str,
-) -> std::io::Result<()> {
-    write_json(
-        stream,
-        status,
-        &json!({ "error": { "message": message, "type": "invalid_request_error" } }),
-    )
-}
-
-fn write_sse(
-    stream: &mut TcpStream,
-    value: &Value,
-) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-    stream.write_all(b"data: ")?;
-    stream.write_all(&bytes)?;
-    stream.write_all(b"\n\n")?;
-    stream.flush()
-}
-
-fn write_stream_delta(
-    stream: &mut TcpStream,
-    id: &str,
-    model_id: &str,
-    field: &str,
-    value: &str,
-) -> std::io::Result<()> {
-    let mut delta = serde_json::Map::new();
-    delta.insert(field.to_owned(), Value::String(value.to_owned()));
-    write_sse(
-        stream,
-        &json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": unix_seconds(),
-            "model": model_id,
-            "choices": [{
-                "index": 0,
-                "delta": Value::Object(delta),
-                "finish_reason": null
-            }]
-        }),
-    )
-}
-
-fn write_stream_role(
-    stream: &mut TcpStream,
-    id: &str,
-    model_id: &str,
-) -> std::io::Result<()> {
-    write_sse(
-        stream,
-        &json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": unix_seconds(),
-            "model": model_id,
-            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]
-        }),
-    )
 }
 
 fn truncate_stop(
@@ -693,7 +971,12 @@ fn stream_channels(value: &str) -> (&str, &str) {
 }
 
 fn completion_id() -> String {
-    format!("chatcmpl-metal-{}", unix_seconds())
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "chatcmpl-metal-{}-{}",
+        unix_seconds(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn infer_model_id(path: &std::path::Path) -> String {
@@ -715,72 +998,4 @@ fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
-}
-
-fn find_bytes(
-    haystack: &[u8],
-    needle: &[u8],
-) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::{
-        ChatCompletionRequest, infer_model_id, safe_stream_boundary, split_reasoning,
-        stream_channels, truncate_stop,
-    };
-
-    #[test]
-    fn max_completion_tokens_takes_precedence_over_max_tokens() -> Result<(), serde_json::Error> {
-        let parse = serde_json::from_str::<ChatCompletionRequest>;
-        assert_eq!(
-            parse(r#"{"messages":[],"max_completion_tokens":7}"#)?.max_tokens(),
-            7
-        );
-        assert_eq!(parse(r#"{"messages":[],"max_tokens":5}"#)?.max_tokens(), 5);
-        assert_eq!(
-            parse(r#"{"messages":[],"max_tokens":5,"max_completion_tokens":7}"#)?.max_tokens(),
-            7
-        );
-        assert_eq!(parse(r#"{"messages":[]}"#)?.max_tokens(), 256);
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sequences_are_not_returned() {
-        assert_eq!(
-            truncate_stop("hello STOP later".into(), &["STOP".into()]),
-            "hello "
-        );
-        assert_eq!(safe_stream_boundary("hello ST", &["STOP".into()]), 6);
-    }
-
-    #[test]
-    fn reasoning_is_split_from_answer() {
-        assert_eq!(
-            split_reasoning("<think>work</think> answer"),
-            (Some("work".into()), "answer".into())
-        );
-        assert_eq!(stream_channels("<thi"), ("", ""));
-        assert_eq!(stream_channels("<think>work</thi"), ("work", ""));
-        assert_eq!(
-            stream_channels("<think>work</think>answer"),
-            ("work", "answer")
-        );
-    }
-
-    #[test]
-    fn hugging_face_cache_path_has_readable_model_id() {
-        assert_eq!(
-            infer_model_id(Path::new(
-                "/cache/models--Qwen--Qwen3-8B/snapshots/revision"
-            )),
-            "Qwen/Qwen3-8B"
-        );
-    }
 }

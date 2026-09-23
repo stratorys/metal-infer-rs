@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use metal_infer_cli::{CliError, load_model_with, resolve_model_path};
+use metal_infer_cli::{CliError, LogFormat, init_tracing, load_model_with, resolve_model_path};
 use metal_infer_kernels::Kernels;
 use metal_infer_models::{KvCache, Qwen3Model};
 use metal_infer_runtime::{KernelDispatchProfile, MetalContext, Tensor};
@@ -15,6 +16,8 @@ use serde::Serialize;
     about = "Offline prompt processing and token generation benchmark"
 )]
 struct Arguments {
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     #[arg(long)]
     model: PathBuf,
     #[arg(long, default_value_t = 512)]
@@ -92,14 +95,18 @@ struct KernelRow {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let arguments = Arguments::parse();
+    if let Err(error) = init_tracing(arguments.log_format) {
         eprintln!("{error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = run(arguments) {
+        tracing::error!(%error, "benchmark failed");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), CliError> {
-    let arguments = Arguments::parse();
+fn run(arguments: Arguments) -> Result<(), CliError> {
     if arguments.iterations == 0
         || (matches!(arguments.test, BenchTest::Pp | BenchTest::Pg) && arguments.prompt == 0)
         || (matches!(arguments.test, BenchTest::Tg | BenchTest::Pg) && arguments.generate == 0)
@@ -180,7 +187,14 @@ fn run() -> Result<(), CliError> {
             decode: kernel_rows(decode_dispatches, arguments.iterations),
         }),
     };
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    tracing::info!(
+        iterations = arguments.iterations,
+        load_ms,
+        allocated_bytes = report.allocated_bytes,
+        "benchmark complete"
+    );
+    std::io::stdout()
+        .write_all(format!("{}\n", serde_json::to_string_pretty(&report)?).as_bytes())?;
     Ok(())
 }
 

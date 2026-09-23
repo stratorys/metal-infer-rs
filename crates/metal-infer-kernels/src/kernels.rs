@@ -72,7 +72,7 @@ impl<'kernels> KernelBatch<'kernels> {
         self.batch.finish()
     }
 
-    pub(crate) fn empty(
+    pub fn empty(
         &self,
         shape: &[usize],
         dtype: DType,
@@ -111,7 +111,7 @@ mod tests {
         );
         assert_eq!(
             source.matches("\nkernel void").count(),
-            31,
+            33,
             "every kernel must be part of the shader source"
         );
     }

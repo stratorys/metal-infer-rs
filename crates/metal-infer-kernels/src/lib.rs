@@ -10,4 +10,4 @@ pub use gpu::{
 };
 pub use kernels::{KernelBatch, Kernels};
 pub use ops::{AttentionConfig, AttentionKind, QkNormRopeCacheConfig};
-pub use tuning::{DecodeGemvConfig, FlashDecodeBlock, KernelSelection};
+pub use tuning::{DecodeGemvConfig, DeviceProfile, FlashDecodeBlock, KernelSelection};

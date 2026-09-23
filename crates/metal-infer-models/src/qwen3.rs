@@ -4,10 +4,10 @@ use std::path::Path;
 use half::f16;
 
 use metal_infer_kernels::{
-    AttentionConfig, AttentionKind, DType, DispatchStats, KernelBatch, Kernels, MetalContext,
-    PendingBatch, QkNormRopeCacheConfig, Tensor,
+    AttentionConfig, DType, DispatchStats, KernelBatch, Kernels, MetalContext, PendingBatch,
+    QkNormRopeCacheConfig, Tensor,
 };
-use metal_infer_planner::{Fusions, Plan};
+use metal_infer_planner::{Plan, PlanInputs};
 
 use crate::weights::WeightMap;
 use crate::{ModelError, Qwen3Config};
@@ -39,14 +39,6 @@ struct LayerCache {
     key: Tensor,
     value: Tensor,
 }
-
-const INITIAL_FUSIONS: Fusions = Fusions {
-    qkv: true,
-    gate_up: true,
-    add_rms_norm: true,
-    qk_rope_cache: true,
-    decode_norm: false,
-};
 
 #[derive(Clone)]
 pub struct KvCache {
@@ -105,8 +97,7 @@ pub struct Qwen3Model {
     layers: Vec<LayerWeights>,
     final_norm: Tensor,
     lm_head: Tensor,
-    fusions: Fusions,
-    attention: AttentionKind,
+    plan: Plan,
 }
 
 #[derive(Clone, Debug)]
@@ -193,7 +184,7 @@ impl Qwen3Model {
         for (layer_index, layer) in self.layers.iter().enumerate() {
             let normalized =
                 batch.rms_norm(&hidden, &layer.input_norm, self.config.rms_norm_eps)?;
-            let (query, key, value) = if self.fusions.qkv {
+            let (query, key, value) = if self.plan.fusions.qkv {
                 batch.matmul3(
                     &normalized,
                     &layer.attention.query,
@@ -230,7 +221,7 @@ impl Qwen3Model {
                     self.config.num_key_value_heads,
                     self.config.head_dim,
                 ])?;
-                let query_row = if self.fusions.qk_rope_cache {
+                let query_row = if self.plan.fusions.qk_rope_cache {
                     batch.qk_norm_rope_cache(
                         &query_row,
                         &key_row,
@@ -261,8 +252,7 @@ impl Qwen3Model {
                 };
                 batch.copy_into_cache(&value_row, &layer_cache.value, offset)?;
                 let length = offset + 1;
-                let kind = attention_kind_for_tokens(
-                    self.attention,
+                let kind = self.plan.attention_for_tokens(
                     1,
                     length,
                     self.config.num_attention_heads / self.config.num_key_value_heads,
@@ -287,7 +277,7 @@ impl Qwen3Model {
                 )?;
             }
             let attention = batch.matmul(&attention_rows, &layer.attention.output)?;
-            let (residual, normalized) = if self.fusions.add_rms_norm {
+            let (residual, normalized) = if self.plan.fusions.add_rms_norm {
                 batch.add_rms_norm(
                     &hidden,
                     &attention,
@@ -303,7 +293,7 @@ impl Qwen3Model {
                 )?;
                 (residual, normalized)
             };
-            let (gate, up) = if self.fusions.gate_up {
+            let (gate, up) = if self.plan.fusions.gate_up {
                 batch.matmul2(&normalized, &layer.mlp.gate, &layer.mlp.up)?
             } else {
                 (
@@ -335,20 +325,21 @@ impl Qwen3Model {
         kernels: Kernels,
         overrides: &[String],
     ) -> Result<Self, ModelError> {
-        let context = kernels.context();
-        let mut initial = Plan {
-            kernels: kernels.selection(),
-            fusions: INITIAL_FUSIONS,
-            attention: AttentionKind::Tiled,
-        };
-        for assignment in overrides {
-            initial.apply_override(assignment)?;
-        }
-        kernels.select(&initial.kernels)?;
         let config: Qwen3Config =
             serde_json::from_slice(&fs::read(directory.join("config.json"))?)?;
         config.validate()?;
-        let mut weights = WeightMap::load(directory, context)?;
+        let plan = Plan::resolve(
+            PlanInputs {
+                device: kernels.device(),
+                query_heads: config.num_attention_heads,
+                kv_heads: config.num_key_value_heads,
+                hidden_size: config.hidden_size,
+            },
+            overrides,
+        )?;
+        let kernels = kernels.with_selection(plan.kernels.clone())?;
+        let context = kernels.context().clone();
+        let mut weights = WeightMap::load(directory, &context)?;
         let embedding = weights.take("model.embed_tokens.weight")?;
         expect_shape(&embedding, &[config.vocab_size, config.hidden_size])?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -384,53 +375,24 @@ impl Qwen3Model {
         };
         expect_shape(&final_norm, &[config.hidden_size])?;
         expect_shape(&lm_head, &[config.vocab_size, config.hidden_size])?;
-        kernels.select(
-            &kernels.device_selection(config.num_attention_heads, config.num_key_value_heads),
-        )?;
-        let decode_norm =
-            context.device_name() == "Apple M4 Pro" && config.hidden_size.is_multiple_of(256);
-        let mut model = Self {
-            context: context.clone(),
-            kernels: kernels.clone(),
+        Ok(Self {
+            context,
+            kernels,
             config,
             embedding,
             layers,
             final_norm,
             lm_head,
-            fusions: Fusions {
-                decode_norm,
-                ..initial.fusions
-            },
-            attention: initial.attention,
-        };
-        let mut plan = model.plan();
-        for assignment in overrides {
-            plan.apply_override(assignment)?;
-        }
-        model.apply_plan(&plan)?;
-        Ok(model)
+            plan,
+        })
     }
 
     pub const fn config(&self) -> &Qwen3Config {
         &self.config
     }
 
-    pub fn plan(&self) -> Plan {
-        Plan {
-            kernels: self.kernels.selection(),
-            fusions: self.fusions,
-            attention: self.attention,
-        }
-    }
-
-    fn apply_plan(
-        &mut self,
-        plan: &Plan,
-    ) -> Result<(), ModelError> {
-        self.kernels.select(&plan.kernels)?;
-        self.fusions = plan.fusions;
-        self.attention = plan.attention;
-        Ok(())
+    pub const fn plan(&self) -> &Plan {
+        &self.plan
     }
 
     pub fn prefill(
@@ -732,7 +694,7 @@ impl Qwen3Model {
             .first()
             .copied()
             .ok_or(ModelError::HiddenStateRank)?;
-        let fused_qkv = tokens == 1 && self.fusions.decode_norm && self.fusions.qkv;
+        let fused_qkv = tokens == 1 && self.plan.fusions.decode_norm && self.plan.fusions.qkv;
         let (query, key, value) = if fused_qkv {
             batch.rms_norm_matmul3(
                 &hidden,
@@ -745,7 +707,7 @@ impl Qwen3Model {
         } else {
             let normalized =
                 batch.rms_norm(&hidden, &layer.input_norm, self.config.rms_norm_eps)?;
-            if self.fusions.qkv {
+            if self.plan.fusions.qkv {
                 batch.matmul3(
                     &normalized,
                     &layer.attention.query,
@@ -775,7 +737,7 @@ impl Qwen3Model {
             self.config.num_key_value_heads,
             self.config.head_dim,
         ])?;
-        let query = if self.fusions.qk_rope_cache {
+        let query = if self.plan.fusions.qk_rope_cache {
             batch.qk_norm_rope_cache(
                 &query,
                 &key,
@@ -803,8 +765,7 @@ impl Qwen3Model {
         batch.copy_into_cache(&value, &cache.value, offset)?;
         let active_key = cache.key.prefix(active_length)?;
         let active_value = cache.value.prefix(active_length)?;
-        let attention_kind = attention_kind_for_tokens(
-            self.attention,
+        let attention_kind = self.plan.attention_for_tokens(
             tokens,
             active_length,
             self.config.num_attention_heads / self.config.num_key_value_heads,
@@ -825,9 +786,9 @@ impl Qwen3Model {
         let attention = attention.reshape(&[tokens, self.config.query_width()])?;
         let attention = batch.matmul(&attention, &layer.attention.output)?;
         let fused_gate_up = tokens == 1
-            && self.fusions.decode_norm
-            && self.fusions.add_rms_norm
-            && self.fusions.gate_up;
+            && self.plan.fusions.decode_norm
+            && self.plan.fusions.add_rms_norm
+            && self.plan.fusions.gate_up;
         let (residual, gate, up) = if fused_gate_up {
             batch.add_rms_norm_matmul2(
                 &hidden,
@@ -838,7 +799,7 @@ impl Qwen3Model {
                 self.config.rms_norm_eps,
             )?
         } else {
-            let (residual, normalized) = if self.fusions.add_rms_norm {
+            let (residual, normalized) = if self.plan.fusions.add_rms_norm {
                 batch.add_rms_norm(
                     &hidden,
                     &attention,
@@ -854,7 +815,7 @@ impl Qwen3Model {
                 )?;
                 (residual, normalized)
             };
-            let (gate, up) = if self.fusions.gate_up {
+            let (gate, up) = if self.plan.fusions.gate_up {
                 batch.matmul2(&normalized, &layer.mlp.gate, &layer.mlp.up)?
             } else {
                 (
@@ -867,31 +828,6 @@ impl Qwen3Model {
         let activated = batch.swiglu(&gate, &up)?;
         let down = batch.matmul(&activated, &layer.mlp.down)?;
         batch.add(&residual, &down).map_err(Into::into)
-    }
-}
-
-const fn attention_kind_for_tokens(
-    configured: AttentionKind,
-    tokens: usize,
-    active_length: usize,
-    query_heads_per_kv: usize,
-) -> AttentionKind {
-    match (configured, tokens) {
-        (AttentionKind::Tiled, 32..) => AttentionKind::FlashPrefill,
-        (AttentionKind::Tiled, 1) if active_length >= 256 && query_heads_per_kv == 2 => {
-            AttentionKind::FlashDecode
-        }
-        (AttentionKind::Tiled, 1) => AttentionKind::DecodeSplitKv,
-        (AttentionKind::DecodeSplitKv, 1) => AttentionKind::DecodeSplitKv,
-        (AttentionKind::DecodeSplitKv, _) => AttentionKind::Tiled,
-        (AttentionKind::FlashDecode, 1) if query_heads_per_kv == 2 => AttentionKind::FlashDecode,
-        (AttentionKind::FlashDecode, 1) => AttentionKind::DecodeSplitKv,
-        (AttentionKind::FlashDecode, _) => AttentionKind::Tiled,
-        (AttentionKind::FlashPrefill, 1) if active_length >= 256 && query_heads_per_kv == 2 => {
-            AttentionKind::FlashDecode
-        }
-        (AttentionKind::FlashPrefill, 1) => AttentionKind::DecodeSplitKv,
-        (kind, _) => kind,
     }
 }
 
@@ -1074,50 +1010,9 @@ impl XorShift64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AttentionKind, GenerationOptions, KvCache, Qwen3Model, XorShift64, argmax,
-        attention_kind_for_tokens, sample_token,
-    };
     use metal_infer_kernels::MetalContext;
 
-    #[test]
-    fn tiled_attention_selects_flash_decode_for_long_gqa_decode() {
-        assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 1, 640, 2),
-            AttentionKind::FlashDecode,
-            "long single-token decode should select flash decode"
-        );
-        assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 1, 255, 2),
-            AttentionKind::DecodeSplitKv,
-            "short single-token decode should select split-KV attention"
-        );
-        assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 1, 640, 4),
-            AttentionKind::DecodeSplitKv,
-            "other GQA ratios should select split-KV attention"
-        );
-        assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 31, 31, 2),
-            AttentionKind::Tiled,
-            "short prefill should keep tiled attention"
-        );
-        assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 32, 32, 2),
-            AttentionKind::FlashPrefill,
-            "32-token prefill should select flash prefill"
-        );
-        assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Tiled, 512, 512, 2),
-            AttentionKind::FlashPrefill,
-            "long prefill should select flash prefill"
-        );
-        assert_eq!(
-            attention_kind_for_tokens(AttentionKind::Reference, 1, 640, 2),
-            AttentionKind::Reference,
-            "reference attention should remain explicitly selectable"
-        );
-    }
+    use super::{GenerationOptions, KvCache, Qwen3Model, XorShift64, argmax, sample_token};
 
     #[test]
     fn zero_temperature_is_greedy() {

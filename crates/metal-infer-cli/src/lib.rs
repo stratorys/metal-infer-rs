@@ -67,7 +67,7 @@ pub fn load_model_with(
         .collect::<Vec<_>>();
     let model = Qwen3Model::load_with(model_path, kernels, &overrides)?;
     if list {
-        print_plan(&model.plan());
+        print_plan(model.plan());
         return Ok(None);
     }
     Ok(Some(model))

@@ -1,7 +1,22 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::{KernelError, Kernels};
+
+const M4_PRO_DEVICE_NAME: &str = "Apple M4 Pro";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceProfile {
+    M4Pro,
+    Generic,
+}
+
+impl DeviceProfile {
+    pub fn from_device_name(name: &str) -> Self {
+        if name == M4_PRO_DEVICE_NAME {
+            Self::M4Pro
+        } else {
+            Self::Generic
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeGemvConfig {
@@ -37,14 +52,14 @@ impl GemvRows {
 }
 
 struct SingleShape {
-    device: &'static str,
+    device: DeviceProfile,
     n: usize,
     k: usize,
     rows: GemvRows,
 }
 
 struct FusedNormShape {
-    device: &'static str,
+    device: DeviceProfile,
     widths: [usize; 3],
     k: usize,
     rows: GemvRows,
@@ -52,7 +67,7 @@ struct FusedNormShape {
 
 const SINGLE_SHAPES: &[SingleShape] = &[
     SingleShape {
-        device: "Apple M4 Pro",
+        device: DeviceProfile::M4Pro,
         n: 1024,
         k: 1024,
         rows: GemvRows {
@@ -61,7 +76,7 @@ const SINGLE_SHAPES: &[SingleShape] = &[
         },
     },
     SingleShape {
-        device: "Apple M4 Pro",
+        device: DeviceProfile::M4Pro,
         n: 1024,
         k: 2048,
         rows: GemvRows {
@@ -70,7 +85,7 @@ const SINGLE_SHAPES: &[SingleShape] = &[
         },
     },
     SingleShape {
-        device: "Apple M4 Pro",
+        device: DeviceProfile::M4Pro,
         n: 1024,
         k: 3072,
         rows: GemvRows {
@@ -79,7 +94,7 @@ const SINGLE_SHAPES: &[SingleShape] = &[
         },
     },
     SingleShape {
-        device: "Apple M4 Pro",
+        device: DeviceProfile::M4Pro,
         n: 151_936,
         k: 1024,
         rows: GemvRows {
@@ -91,7 +106,7 @@ const SINGLE_SHAPES: &[SingleShape] = &[
 
 const FUSED_NORM_SHAPES: &[FusedNormShape] = &[
     FusedNormShape {
-        device: "Apple M4 Pro",
+        device: DeviceProfile::M4Pro,
         widths: [2048, 1024, 1024],
         k: 1024,
         rows: GemvRows {
@@ -100,7 +115,7 @@ const FUSED_NORM_SHAPES: &[FusedNormShape] = &[
         },
     },
     FusedNormShape {
-        device: "Apple M4 Pro",
+        device: DeviceProfile::M4Pro,
         widths: [3072, 3072, 0],
         k: 1024,
         rows: GemvRows {
@@ -126,7 +141,7 @@ const M4_PRO_TWO_QUERY_HEADS_FLASH_DECODE_BLOCKS: &[FlashDecodeBlock] = &[
 ];
 
 pub(crate) fn single_rows(
-    device: &str,
+    device: DeviceProfile,
     n: usize,
     k: usize,
     fallback: usize,
@@ -142,7 +157,7 @@ pub(crate) fn single_rows(
 }
 
 pub(crate) fn fused_norm_rows(
-    device: &str,
+    device: DeviceProfile,
     widths: [usize; 3],
     k: usize,
     fallback: usize,
@@ -170,6 +185,24 @@ pub struct KernelSelection {
 }
 
 impl KernelSelection {
+    pub fn for_device(
+        device: DeviceProfile,
+        query_heads: usize,
+        kv_heads: usize,
+    ) -> Self {
+        match device {
+            DeviceProfile::Generic => Self::default(),
+            DeviceProfile::M4Pro => Self {
+                decode_gemv: Some(DecodeGemvConfig::Tuned),
+                flash_decode_blocks: if query_heads == kv_heads * 2 {
+                    M4_PRO_TWO_QUERY_HEADS_FLASH_DECODE_BLOCKS.to_vec()
+                } else {
+                    Vec::new()
+                },
+            },
+        }
+    }
+
     pub fn validate(&self) -> Result<(), KernelError> {
         for entry in &self.flash_decode_blocks {
             if !matches!(entry.block, 32 | 64 | 128 | 256) {
@@ -182,37 +215,39 @@ impl KernelSelection {
 
 #[derive(Clone)]
 pub(crate) struct Tuning {
-    device_name: String,
-    is_m4_pro: bool,
-    selection: Rc<RefCell<KernelSelection>>,
+    device: DeviceProfile,
+    selection: KernelSelection,
 }
 
 impl Tuning {
     pub(crate) fn new(device_name: &str) -> Self {
         Self {
-            device_name: device_name.to_owned(),
-            is_m4_pro: device_name == "Apple M4 Pro",
-            selection: Rc::new(RefCell::new(KernelSelection::default())),
+            device: DeviceProfile::from_device_name(device_name),
+            selection: KernelSelection::default(),
         }
     }
 }
 
 impl Kernels {
-    pub fn selection(&self) -> KernelSelection {
-        self.tuning.selection.borrow().clone()
+    pub const fn device(&self) -> DeviceProfile {
+        self.tuning.device
     }
 
-    pub fn select(
-        &self,
-        selection: &KernelSelection,
-    ) -> Result<(), KernelError> {
+    pub const fn selection(&self) -> &KernelSelection {
+        &self.tuning.selection
+    }
+
+    pub fn with_selection(
+        mut self,
+        selection: KernelSelection,
+    ) -> Result<Self, KernelError> {
         selection.validate()?;
-        *self.tuning.selection.borrow_mut() = selection.clone();
-        Ok(())
+        self.tuning.selection = selection;
+        Ok(self)
     }
 
-    pub(crate) fn is_m4_pro(&self) -> bool {
-        self.tuning.is_m4_pro
+    pub(crate) const fn is_m4_pro(&self) -> bool {
+        matches!(self.tuning.device, DeviceProfile::M4Pro)
     }
 
     pub(crate) fn flash_decode_block_for_length(
@@ -221,7 +256,6 @@ impl Kernels {
     ) -> usize {
         self.tuning
             .selection
-            .borrow()
             .flash_decode_blocks
             .iter()
             .find(|entry| length <= entry.max_length)
@@ -235,11 +269,11 @@ impl Kernels {
         vocabulary: bool,
     ) -> usize {
         single_rows(
-            &self.tuning.device_name,
+            self.tuning.device,
             n,
             k,
             if vocabulary { 0 } else { 4 },
-            self.tuning.selection.borrow().decode_gemv,
+            self.tuning.selection.decode_gemv,
         )
     }
 
@@ -249,30 +283,12 @@ impl Kernels {
         k: usize,
     ) -> usize {
         fused_norm_rows(
-            &self.tuning.device_name,
+            self.tuning.device,
             widths,
             k,
             2,
-            self.tuning.selection.borrow().decode_gemv,
+            self.tuning.selection.decode_gemv,
         )
-    }
-
-    pub fn device_selection(
-        &self,
-        query_heads: usize,
-        kv_heads: usize,
-    ) -> KernelSelection {
-        if !self.tuning.is_m4_pro {
-            return KernelSelection::default();
-        }
-        KernelSelection {
-            decode_gemv: Some(DecodeGemvConfig::Tuned),
-            flash_decode_blocks: if query_heads == kv_heads * 2 {
-                M4_PRO_TWO_QUERY_HEADS_FLASH_DECODE_BLOCKS.to_vec()
-            } else {
-                Vec::new()
-            },
-        }
     }
 }
 
@@ -283,32 +299,59 @@ mod tests {
     #[test]
     fn tuned_shapes_and_fallbacks() {
         let tuned = Some(DecodeGemvConfig::Tuned);
-        assert_eq!(single_rows("Apple M4 Pro", 1024, 3072, 4, tuned), 1);
-        assert_eq!(single_rows("Apple M4 Pro", 1024, 2048, 4, tuned), 2);
-        assert_eq!(single_rows("Apple M4 Pro", 151_936, 1024, 0, tuned), 2);
-        assert_eq!(single_rows("Apple M3", 1024, 3072, 4, tuned), 4);
-        assert_eq!(
-            fused_norm_rows("Apple M4 Pro", [3072, 3072, 0], 1024, 2, tuned),
-            1
-        );
-        assert_eq!(
-            fused_norm_rows("Apple M4 Pro", [4096, 4096, 0], 1024, 2, tuned),
-            2
-        );
+        let m4_pro = DeviceProfile::M4Pro;
+        assert_eq!(single_rows(m4_pro, 1024, 3072, 4, tuned), 1);
+        assert_eq!(single_rows(m4_pro, 1024, 2048, 4, tuned), 2);
+        assert_eq!(single_rows(m4_pro, 151_936, 1024, 0, tuned), 2);
+        assert_eq!(single_rows(DeviceProfile::Generic, 1024, 3072, 4, tuned), 4);
+        assert_eq!(fused_norm_rows(m4_pro, [3072, 3072, 0], 1024, 2, tuned), 1);
+        assert_eq!(fused_norm_rows(m4_pro, [4096, 4096, 0], 1024, 2, tuned), 2);
     }
 
     #[test]
     fn missing_config_and_baseline_use_their_rows() {
-        assert_eq!(single_rows("Apple M4 Pro", 1024, 3072, 4, None), 4);
+        assert_eq!(single_rows(DeviceProfile::M4Pro, 1024, 3072, 4, None), 4);
         assert_eq!(
             single_rows(
-                "Apple M4 Pro",
+                DeviceProfile::M4Pro,
                 1024,
                 3072,
                 4,
                 Some(DecodeGemvConfig::Baseline)
             ),
             4
+        );
+    }
+
+    #[test]
+    fn device_profile_is_derived_from_the_device_name() {
+        assert_eq!(
+            DeviceProfile::from_device_name("Apple M4 Pro"),
+            DeviceProfile::M4Pro
+        );
+        assert_eq!(
+            DeviceProfile::from_device_name("Apple M3"),
+            DeviceProfile::Generic
+        );
+    }
+
+    #[test]
+    fn device_selection_tunes_only_the_m4_pro() {
+        assert_eq!(
+            KernelSelection::for_device(DeviceProfile::Generic, 16, 8),
+            KernelSelection::default()
+        );
+        let tuned = KernelSelection::for_device(DeviceProfile::M4Pro, 16, 8);
+        assert_eq!(tuned.decode_gemv, Some(DecodeGemvConfig::Tuned));
+        assert_eq!(
+            tuned.flash_decode_blocks,
+            M4_PRO_TWO_QUERY_HEADS_FLASH_DECODE_BLOCKS.to_vec()
+        );
+        assert!(
+            KernelSelection::for_device(DeviceProfile::M4Pro, 32, 8)
+                .flash_decode_blocks
+                .is_empty(),
+            "flash decode blocks are tuned only for two query heads per KV head"
         );
     }
 }

@@ -199,8 +199,8 @@ fn matvec_variants_match_cpu_reference_at_qwen_shapes() -> Result<(), KernelErro
             Some(DecodeGemvConfig::Baseline),
             Some(DecodeGemvConfig::Tuned),
         ] {
-            select(&kernels, |selection| selection.decode_gemv = config)?;
-            let actual = kernels.matmul(&input, &weight)?.to_f32_vec()?;
+            let configured = with_decode_gemv(&kernels, config)?;
+            let actual = configured.matmul(&input, &weight)?.to_f32_vec()?;
             assert_close(&actual, &expected);
         }
     }
@@ -414,9 +414,9 @@ fn fused_decode_norm_projections_match_separate_ops_at_qwen_dimensions() -> Resu
         Some(DecodeGemvConfig::Baseline),
         Some(DecodeGemvConfig::Tuned),
     ] {
-        select(&kernels, |selection| selection.decode_gemv = config)?;
-        let normalized = kernels.rms_norm(&input, &norm_weight, 1.0e-6)?;
-        let mut batch = kernels.begin_batch()?;
+        let configured = with_decode_gemv(&kernels, config)?;
+        let normalized = configured.rms_norm(&input, &norm_weight, 1.0e-6)?;
+        let mut batch = configured.begin_batch()?;
         let (expected_query, expected_key, expected_value) =
             batch.matmul3(&normalized, &query, &key, &value)?;
         let (actual_query, actual_key, actual_value) =
@@ -750,11 +750,12 @@ fn cpu_matmul(
         .collect()
 }
 
-fn select(
+fn with_decode_gemv(
     kernels: &Kernels,
-    change: impl FnOnce(&mut KernelSelection),
-) -> Result<(), KernelError> {
-    let mut selection = kernels.selection();
-    change(&mut selection);
-    kernels.select(&selection)
+    decode_gemv: Option<DecodeGemvConfig>,
+) -> Result<Kernels, KernelError> {
+    kernels.clone().with_selection(KernelSelection {
+        decode_gemv,
+        ..kernels.selection().clone()
+    })
 }

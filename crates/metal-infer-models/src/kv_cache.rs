@@ -3,16 +3,16 @@ use metal_infer_kernels::{DType, MetalContext, Tensor};
 use crate::{ModelError, Qwen3Config};
 
 #[derive(Clone)]
-pub(crate) struct LayerCache {
-    pub(crate) key: Tensor,
-    pub(crate) value: Tensor,
+pub struct LayerCache {
+    pub key: Tensor,
+    pub value: Tensor,
 }
 
 #[derive(Clone)]
 pub struct KvCache {
-    pub(crate) layers: Vec<LayerCache>,
-    pub(crate) capacity: usize,
-    pub(crate) filled: usize,
+    layers: Vec<LayerCache>,
+    capacity: usize,
+    filled: usize,
 }
 
 impl KvCache {
@@ -54,5 +54,41 @@ impl KvCache {
 
     pub fn reset(&mut self) {
         self.filled = 0;
+    }
+
+    pub fn layer(
+        &self,
+        index: usize,
+    ) -> Result<&LayerCache, ModelError> {
+        self.layers.get(index).ok_or(ModelError::MissingCacheLayer)
+    }
+
+    pub const fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn reserve(
+        &self,
+        tokens: usize,
+    ) -> Result<usize, ModelError> {
+        self.filled
+            .checked_add(tokens)
+            .filter(|length| *length <= self.capacity)
+            .ok_or(ModelError::CacheCapacity)
+    }
+
+    pub fn advance(
+        &mut self,
+        tokens: usize,
+    ) -> Result<(), ModelError> {
+        self.filled = self.reserve(tokens)?;
+        Ok(())
+    }
+
+    pub fn truncate(
+        &mut self,
+        length: usize,
+    ) {
+        self.filled = self.filled.min(length);
     }
 }

@@ -2,29 +2,29 @@ use metal_infer_kernels::Tensor;
 
 use crate::{ModelError, Qwen3Config};
 
-pub(super) struct AttentionWeights {
-    pub(super) query: Tensor,
-    pub(super) key: Tensor,
-    pub(super) value: Tensor,
-    pub(super) output: Tensor,
-    pub(super) query_norm: Tensor,
-    pub(super) key_norm: Tensor,
+pub struct AttentionWeights {
+    pub query: Tensor,
+    pub key: Tensor,
+    pub value: Tensor,
+    pub output: Tensor,
+    pub query_norm: Tensor,
+    pub key_norm: Tensor,
 }
 
-pub(super) struct MlpWeights {
-    pub(super) gate: Tensor,
-    pub(super) up: Tensor,
-    pub(super) down: Tensor,
+pub struct MlpWeights {
+    pub gate: Tensor,
+    pub up: Tensor,
+    pub down: Tensor,
 }
 
-pub(super) struct LayerWeights {
-    pub(super) input_norm: Tensor,
-    pub(super) post_attention_norm: Tensor,
-    pub(super) attention: AttentionWeights,
-    pub(super) mlp: MlpWeights,
+pub struct LayerWeights {
+    pub input_norm: Tensor,
+    pub post_attention_norm: Tensor,
+    pub attention: AttentionWeights,
+    pub mlp: MlpWeights,
 }
 
-pub(super) fn validate_layer(
+pub fn validate_layer(
     config: &Qwen3Config,
     attention: &AttentionWeights,
     mlp: &MlpWeights,
@@ -47,7 +47,7 @@ pub(super) fn validate_layer(
     Ok(())
 }
 
-pub(super) fn expect_shape(
+pub fn expect_shape(
     tensor: &Tensor,
     expected: &[usize],
 ) -> Result<(), ModelError> {

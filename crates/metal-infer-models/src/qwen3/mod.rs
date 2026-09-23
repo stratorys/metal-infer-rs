@@ -7,7 +7,6 @@ use std::path::Path;
 use metal_infer_kernels::{DType, DispatchStats, Kernels, MetalContext, PendingBatch, Tensor};
 use metal_infer_planner::{Plan, PlanInputs};
 
-use crate::kv_cache::LayerCache;
 use crate::qwen3::layers::{
     AttentionWeights, LayerWeights, MlpWeights, expect_shape, validate_layer,
 };
@@ -113,6 +112,14 @@ impl Qwen3Model {
         &self.plan
     }
 
+    pub fn decode_batch(
+        &self,
+        tokens: &[u32],
+        caches: &mut [&mut KvCache],
+    ) -> Result<Tensor, ModelError> {
+        forward::decode_batch(self, tokens, caches)
+    }
+
     pub fn prefill(
         &self,
         tokens: &[u32],
@@ -131,7 +138,7 @@ impl Qwen3Model {
             return Err(ModelError::EmptyPrefill);
         }
         cache.reset();
-        self.forward_with_stats(tokens, cache)
+        forward::forward_with_stats(self, tokens, cache)
     }
 
     pub fn decode(
@@ -148,7 +155,7 @@ impl Qwen3Model {
         token: u32,
         cache: &mut KvCache,
     ) -> Result<(Tensor, DispatchStats), ModelError> {
-        self.forward_with_stats(&[token], cache)
+        forward::forward_with_stats(self, &[token], cache)
     }
 
     pub fn prefill_argmax(
@@ -162,12 +169,12 @@ impl Qwen3Model {
         }
         cache.reset();
         let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
-        let previous = cache.filled;
-        let (logits, pending) = self.forward_async(&token_tensor, cache, Some(output))?;
+        let previous = cache.len();
+        let (logits, pending) = forward::forward_async(self, &token_tensor, cache, Some(output))?;
         match pending.wait() {
             Ok(stats) => Ok((logits, stats)),
             Err(error) => {
-                cache.filled = previous;
+                cache.truncate(previous);
                 Err(error.into())
             }
         }
@@ -182,7 +189,7 @@ impl Qwen3Model {
         if token.shape() != [1] || token.dtype() != DType::U32 {
             return Err(ModelError::DecodeTokenShape);
         }
-        self.forward_async(token, cache, Some(output))
+        forward::forward_async(self, token, cache, Some(output))
     }
 
     pub fn generate(
@@ -260,7 +267,7 @@ impl Qwen3Model {
             if token == u32::MAX {
                 if let Some((pending, previous)) = prefetched.take() {
                     let result = pending.wait();
-                    cache.filled = previous;
+                    cache.truncate(previous);
                     result?;
                 }
                 return Err(ModelError::NoFiniteLogit);
@@ -270,7 +277,7 @@ impl Qwen3Model {
                     Some(pending)
                 } else {
                     let output = slots.slice_1d(step + 1, 1)?;
-                    let previous = cache.filled;
+                    let previous = cache.len();
                     Some((self.decode_argmax(&input, cache, &output)?.1, previous))
                 }
             } else {
@@ -286,7 +293,7 @@ impl Qwen3Model {
             if !continued {
                 if let Some((pending, previous)) = pending {
                     let result = pending.wait();
-                    cache.filled = previous;
+                    cache.truncate(previous);
                     result?;
                 }
                 break;
@@ -295,12 +302,12 @@ impl Qwen3Model {
                 let next = if step + 2 < options.max_tokens {
                     let next_input = slots.slice_1d(step + 1, 1)?;
                     let next_output = slots.slice_1d(step + 2, 1)?;
-                    let next_previous = cache.filled;
+                    let next_previous = cache.len();
                     match self.decode_argmax(&next_input, cache, &next_output) {
                         Ok((_, batch)) => Some((batch, next_previous)),
                         Err(error) => {
                             let _ = pending.wait();
-                            cache.filled = previous;
+                            cache.truncate(previous);
                             return Err(error);
                         }
                     }
@@ -309,38 +316,13 @@ impl Qwen3Model {
                 };
                 if let Err(error) = pending.wait() {
                     drop(next);
-                    cache.filled = previous;
+                    cache.truncate(previous);
                     return Err(error.into());
                 }
                 prefetched = next;
             }
         }
         Ok(generated)
-    }
-
-    pub fn run_first_block(
-        &self,
-        tokens: &[u32],
-    ) -> Result<Tensor, ModelError> {
-        if tokens.is_empty() {
-            return Err(ModelError::EmptyBlock);
-        }
-        let token_tensor = self.context.tensor_u32(tokens, &[tokens.len()])?;
-        let mut batch = self.kernels.begin_batch()?;
-        let hidden = batch.embedding(&token_tensor, &self.embedding)?;
-        let shape = [
-            tokens.len(),
-            self.config.num_key_value_heads,
-            self.config.head_dim,
-        ];
-        let cache = LayerCache {
-            key: self.context.empty(&shape, DType::F16)?,
-            value: self.context.empty(&shape, DType::F16)?,
-        };
-        let layer = self.layers.first().ok_or(ModelError::NoLayer)?;
-        let output = self.forward_layer(&mut batch, hidden, layer, &cache, 0, tokens.len())?;
-        batch.finish()?;
-        Ok(output)
     }
 }
 

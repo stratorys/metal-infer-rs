@@ -44,19 +44,7 @@ impl TokenSampler {
     ) -> Result<u32, ModelError> {
         logits.with_f16_bits(|bits| {
             if self.options.temperature == 0.0 {
-                bits.iter()
-                    .enumerate()
-                    .filter_map(|(index, bits)| {
-                        let value = f16::from_bits(*bits).to_f32();
-                        value.is_finite().then_some((index, value))
-                    })
-                    .max_by(|left, right| {
-                        left.1
-                            .total_cmp(&right.1)
-                            .then_with(|| right.0.cmp(&left.0))
-                    })
-                    .map(|(index, _)| index as u32)
-                    .ok_or(ModelError::NoFiniteLogit)
+                greedy_token_f16(bits)
             } else {
                 sample_token_f16(bits, &self.options, &mut self.random)
             }
@@ -64,8 +52,19 @@ impl TokenSampler {
     }
 }
 
+fn greedy_token_f16(bits: &[u16]) -> Result<u32, ModelError> {
+    let (index, _) = bits
+        .iter()
+        .enumerate()
+        .map(|(index, bits)| (index, f16::from_bits(*bits).to_f32()))
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .ok_or(ModelError::NoFiniteLogit)?;
+    index.try_into().map_err(|_| ModelError::TokenIdOverflow)
+}
+
 #[cfg(test)]
-pub(crate) fn argmax(values: &[f32]) -> Result<u32, ModelError> {
+pub fn argmax(values: &[f32]) -> Result<u32, ModelError> {
     let (index, _) = values
         .iter()
         .enumerate()
@@ -75,7 +74,7 @@ pub(crate) fn argmax(values: &[f32]) -> Result<u32, ModelError> {
     index.try_into().map_err(|_| ModelError::TokenIdOverflow)
 }
 
-pub(crate) fn validate_generation_options(options: &GenerationOptions) -> Result<(), ModelError> {
+pub fn validate_generation_options(options: &GenerationOptions) -> Result<(), ModelError> {
     if !options.temperature.is_finite() || options.temperature < 0.0 {
         return Err(ModelError::InvalidTemperature);
     }
@@ -103,7 +102,7 @@ fn sample_token(
     sample_candidates(candidates, options, random)
 }
 
-pub(crate) fn sample_token_f16(
+pub fn sample_token_f16(
     bits: &[u16],
     options: &GenerationOptions,
     random: &mut XorShift64,
@@ -182,12 +181,12 @@ fn sample_candidates(
     Err(ModelError::SamplingFailed)
 }
 
-pub(crate) struct XorShift64 {
+pub struct XorShift64 {
     state: u64,
 }
 
 impl XorShift64 {
-    pub(crate) const fn new(seed: u64) -> Self {
+    pub const fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 {
                 0x9e37_79b9_7f4a_7c15
@@ -209,7 +208,26 @@ impl XorShift64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationOptions, XorShift64, sample_token};
+    use half::f16;
+
+    use super::{GenerationOptions, XorShift64, argmax, greedy_token_f16, sample_token};
+
+    #[test]
+    fn greedy_ties_pick_the_highest_index_like_the_gpu_argmax() {
+        let bits = [1.0f32, 4.0, 2.0, 4.0].map(|value| f16::from_f32(value).to_bits());
+        assert_eq!(greedy_token_f16(&bits).expect("finite logits"), 3);
+        assert_eq!(argmax(&[1.0, 4.0, 2.0, 4.0]).expect("finite logits"), 3);
+    }
+
+    #[test]
+    fn greedy_ignores_non_finite_logits() {
+        let bits = [f32::INFINITY, f32::NAN, 2.0, 1.0].map(|value| f16::from_f32(value).to_bits());
+        assert_eq!(greedy_token_f16(&bits).expect("finite logits"), 2);
+        assert!(
+            greedy_token_f16(&[f16::INFINITY.to_bits()]).is_err(),
+            "logits without a finite value must be rejected"
+        );
+    }
 
     #[test]
     fn zero_temperature_is_greedy() {

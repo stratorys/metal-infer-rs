@@ -62,8 +62,6 @@ pub enum ModelError {
     EmptyPrefill,
     #[error("decode token must be one u32")]
     DecodeTokenShape,
-    #[error("block benchmark requires tokens")]
-    EmptyBlock,
     #[error("tokens must be a nonempty u32 vector")]
     TokensShape,
     #[error("hidden state has no token dimension")]

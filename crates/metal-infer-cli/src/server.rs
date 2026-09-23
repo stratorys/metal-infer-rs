@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_TOKENS: usize = 256;
 
 pub struct ServerOptions {
     pub model: PathBuf,
@@ -32,8 +33,10 @@ struct ChatCompletionRequest {
     #[serde(default)]
     model: Option<String>,
     messages: Vec<WireMessage>,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: usize,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
     #[serde(default)]
     temperature: f32,
     #[serde(default = "default_top_p")]
@@ -82,6 +85,13 @@ struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+}
+
+struct PreparedCompletion {
+    prompt: Vec<u32>,
+    options: GenerationOptions,
+    stop_sequences: Vec<String>,
+    stream: bool,
 }
 
 pub fn serve(options: ServerOptions) -> Result<(), CliError> {
@@ -160,12 +170,38 @@ fn handle_connection(
                     return Ok(());
                 }
             };
-            let streaming = parsed.stream;
-            if let Err(error) = chat_completion(stream, state, parsed) {
-                if streaming {
+            let prepared = match prepare_completion(state, parsed) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    write_json_error(stream, 400, &error.to_string())?;
+                    return Ok(());
+                }
+            };
+            let id = completion_id();
+            let completed = if prepared.stream {
+                stream_completion(
+                    stream,
+                    state,
+                    &id,
+                    &prepared.prompt,
+                    &prepared.options,
+                    &prepared.stop_sequences,
+                )
+            } else {
+                complete_once(
+                    stream,
+                    state,
+                    &id,
+                    &prepared.prompt,
+                    &prepared.options,
+                    &prepared.stop_sequences,
+                )
+            };
+            if let Err(error) = completed {
+                if prepared.stream {
                     eprintln!("streaming completion failed: {error}");
                 } else {
-                    write_json_error(stream, 400, &error.to_string())?;
+                    write_json_error(stream, 500, &error.to_string())?;
                 }
             }
         }
@@ -174,11 +210,11 @@ fn handle_connection(
     Ok(())
 }
 
-fn chat_completion(
-    stream: &mut TcpStream,
-    state: &mut ServerState,
+fn prepare_completion(
+    state: &ServerState,
     request: ChatCompletionRequest,
-) -> Result<(), CliError> {
+) -> Result<PreparedCompletion, CliError> {
+    let max_tokens = request.max_tokens();
     if let Some(model) = &request.model
         && model != &state.model_id
     {
@@ -192,7 +228,7 @@ fn chat_completion(
         .map(WireMessage::into_chat_message)
         .collect::<Result<Vec<_>, _>>()?;
     let prompt = state.tokenizer.encode_chat(&messages)?;
-    let required = prompt.len().saturating_add(request.max_tokens);
+    let required = prompt.len().saturating_add(max_tokens);
     if required > state.context {
         return Err(CliError::InvalidArguments(format!(
             "prompt + generated tokens ({required}) exceeds context {}",
@@ -201,7 +237,7 @@ fn chat_completion(
     }
     let stop_sequences = request.stop.map_or_else(Vec::new, StopSequences::into_vec);
     let options = GenerationOptions {
-        max_tokens: request.max_tokens,
+        max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
         top_k: request.top_k,
@@ -212,12 +248,12 @@ fn chat_completion(
             state.tokenizer.eos_token_ids().to_vec()
         },
     };
-    let id = completion_id();
-    if request.stream {
-        stream_completion(stream, state, &id, &prompt, &options, &stop_sequences)
-    } else {
-        complete_once(stream, state, &id, &prompt, &options, &stop_sequences)
-    }
+    Ok(PreparedCompletion {
+        prompt,
+        options,
+        stop_sequences,
+        stream: request.stream,
+    })
 }
 
 fn complete_once(
@@ -274,25 +310,23 @@ fn stream_completion(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
     )?;
-    write_sse(
-        stream,
-        &json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": unix_seconds(),
-            "model": state.model_id,
-            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]
-        }),
-    )?;
     let tokenizer = &state.tokenizer;
     let model_id = state.model_id.clone();
     let mut tokens = Vec::new();
+    let mut role_sent = false;
     let mut emitted_reasoning = 0usize;
     let mut emitted_content = 0usize;
     let mut write_error = None;
     let generated = state
         .model
         .generate_with(prompt, options, &mut state.cache, |token| {
+            if !role_sent {
+                if let Err(error) = write_stream_role(stream, id, &model_id) {
+                    write_error = Some(error);
+                    return false;
+                }
+                role_sent = true;
+            }
             tokens.push(token);
             let Ok(decoded) = tokenizer.decode(&tokens) else {
                 return false;
@@ -332,6 +366,9 @@ fn stream_completion(
         })?;
     if let Some(error) = write_error {
         return Err(error.into());
+    }
+    if !role_sent {
+        write_stream_role(stream, id, &state.model_id)?;
     }
     let decoded = truncate_stop(tokenizer.decode(&generated)?, stop_sequences);
     let (reasoning, content) = stream_channels(&decoded);
@@ -396,6 +433,14 @@ impl WireMessage {
     }
 }
 
+impl ChatCompletionRequest {
+    fn max_tokens(&self) -> usize {
+        self.max_completion_tokens
+            .or(self.max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS)
+    }
+}
+
 impl StopSequences {
     fn into_vec(self) -> Vec<String> {
         match self {
@@ -403,10 +448,6 @@ impl StopSequences {
             Self::Many(values) => values,
         }
     }
-}
-
-const fn default_max_tokens() -> usize {
-    256
 }
 
 const fn default_top_p() -> f32 {
@@ -507,6 +548,7 @@ fn write_json(
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        500 => "Internal Server Error",
         _ => "Error",
     };
     write!(
@@ -573,6 +615,23 @@ fn write_stream_delta(
                 "delta": Value::Object(delta),
                 "finish_reason": null
             }]
+        }),
+    )
+}
+
+fn write_stream_role(
+    stream: &mut TcpStream,
+    id: &str,
+    model_id: &str,
+) -> std::io::Result<()> {
+    write_sse(
+        stream,
+        &json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": unix_seconds(),
+            "model": model_id,
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]
         }),
     )
 }
@@ -672,8 +731,25 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        infer_model_id, safe_stream_boundary, split_reasoning, stream_channels, truncate_stop,
+        ChatCompletionRequest, infer_model_id, safe_stream_boundary, split_reasoning,
+        stream_channels, truncate_stop,
     };
+
+    #[test]
+    fn max_completion_tokens_takes_precedence_over_max_tokens() -> Result<(), serde_json::Error> {
+        let parse = serde_json::from_str::<ChatCompletionRequest>;
+        assert_eq!(
+            parse(r#"{"messages":[],"max_completion_tokens":7}"#)?.max_tokens(),
+            7
+        );
+        assert_eq!(parse(r#"{"messages":[],"max_tokens":5}"#)?.max_tokens(), 5);
+        assert_eq!(
+            parse(r#"{"messages":[],"max_tokens":5,"max_completion_tokens":7}"#)?.max_tokens(),
+            7
+        );
+        assert_eq!(parse(r#"{"messages":[]}"#)?.max_tokens(), 256);
+        Ok(())
+    }
 
     #[test]
     fn stop_sequences_are_not_returned() {

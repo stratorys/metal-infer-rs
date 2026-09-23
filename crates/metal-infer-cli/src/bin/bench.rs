@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use metal_infer_cli::{CliError, load_model_with, resolve_model_path};
 use metal_infer_kernels::Kernels;
 use metal_infer_models::{KvCache, Qwen3Model};
@@ -25,10 +25,31 @@ struct Arguments {
     iterations: usize,
     #[arg(long, default_value_t = 1)]
     warmup: usize,
+    #[arg(long, value_enum, default_value_t = BenchTest::Pg)]
+    test: BenchTest,
+    #[arg(long, default_value_t = 0)]
+    depth: usize,
     #[arg(long = "with", value_name = "KEY=VALUE")]
     with: Vec<String>,
     #[arg(long)]
     profile: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum BenchTest {
+    Pp,
+    Tg,
+    Pg,
+}
+
+#[derive(Clone, Copy)]
+struct Iteration<'input> {
+    prompt: &'input [u32],
+    depth_prompt: &'input [u32],
+    generate: usize,
+    profile: bool,
+    test: BenchTest,
 }
 
 #[derive(Serialize)]
@@ -38,6 +59,8 @@ struct Report {
     prompt_tokens: usize,
     generated_tokens: usize,
     warmup: usize,
+    test: BenchTest,
+    depth: usize,
     load_ms: f64,
     allocated_bytes: usize,
     allocation_growth_bytes: usize,
@@ -49,8 +72,10 @@ struct Report {
 
 #[derive(Clone, Copy, Serialize)]
 struct Sample {
-    prefill_ms: f64,
-    decode_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decode_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -75,9 +100,14 @@ fn main() {
 
 fn run() -> Result<(), CliError> {
     let arguments = Arguments::parse();
-    if arguments.prompt == 0 || arguments.generate == 0 || arguments.iterations == 0 {
+    if arguments.iterations == 0
+        || (matches!(arguments.test, BenchTest::Pp | BenchTest::Pg) && arguments.prompt == 0)
+        || (matches!(arguments.test, BenchTest::Tg | BenchTest::Pg) && arguments.generate == 0)
+        || (matches!(arguments.test, BenchTest::Tg) && arguments.depth == 0)
+        || (arguments.profile && !matches!(arguments.test, BenchTest::Pg))
+    {
         return Err(CliError::InvalidArguments(
-            "prompt, generate, and iterations must be greater than zero".into(),
+            "invalid test lengths, iterations, or profile mode (profile requires pg)".into(),
         ));
     }
     let context = MetalContext::new()?;
@@ -91,17 +121,22 @@ fn run() -> Result<(), CliError> {
     let mut cache = KvCache::new(
         &context,
         model.config(),
-        arguments.prompt + arguments.generate,
+        arguments.prompt.max(arguments.depth) + arguments.generate.max(1),
     )?;
     let prompt = vec![1; arguments.prompt];
+    let depth_prompt = vec![1; arguments.depth];
     for _ in 0..arguments.warmup {
         run_iteration(
             &context,
             &model,
-            &prompt,
-            arguments.generate,
             &mut cache,
-            false,
+            Iteration {
+                prompt: &prompt,
+                depth_prompt: &depth_prompt,
+                generate: arguments.generate,
+                profile: false,
+                test: arguments.test,
+            },
         )?;
     }
     context.set_kernel_profiling(arguments.profile)?;
@@ -113,10 +148,14 @@ fn run() -> Result<(), CliError> {
         let (sample, prefill, decode) = run_iteration(
             &context,
             &model,
-            &prompt,
-            arguments.generate,
             &mut cache,
-            arguments.profile,
+            Iteration {
+                prompt: &prompt,
+                depth_prompt: &depth_prompt,
+                generate: arguments.generate,
+                profile: arguments.profile,
+                test: arguments.test,
+            },
         )?;
         samples.push(sample);
         prefill_dispatches.extend(prefill);
@@ -129,6 +168,8 @@ fn run() -> Result<(), CliError> {
         prompt_tokens: arguments.prompt,
         generated_tokens: arguments.generate,
         warmup: arguments.warmup,
+        test: arguments.test,
+        depth: arguments.depth,
         load_ms,
         allocated_bytes: context.allocated_bytes(),
         allocation_growth_bytes: context.allocated_bytes().saturating_sub(allocated_before),
@@ -146,10 +187,8 @@ fn run() -> Result<(), CliError> {
 fn run_iteration(
     context: &MetalContext,
     model: &Qwen3Model,
-    prompt: &[u32],
-    generate: usize,
     cache: &mut KvCache,
-    profile: bool,
+    iteration: Iteration<'_>,
 ) -> Result<
     (
         Sample,
@@ -158,6 +197,39 @@ fn run_iteration(
     ),
     CliError,
 > {
+    let Iteration {
+        prompt,
+        depth_prompt,
+        generate,
+        profile,
+        test,
+    } = iteration;
+    if matches!(test, BenchTest::Pp) {
+        let started = Instant::now();
+        model.prefill(prompt, cache)?;
+        return Ok((
+            Sample {
+                prefill_ms: Some(milliseconds(started.elapsed())),
+                decode_ms: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+    if matches!(test, BenchTest::Tg) {
+        let slots = context.tensor_u32(&vec![u32::MAX; generate + 1], &[generate + 1])?;
+        model.prefill_argmax(depth_prompt, cache, &slots.slice_1d(0, 1)?)?;
+        let started = Instant::now();
+        run_pipelined_decode(model, &slots, generate, cache)?;
+        return Ok((
+            Sample {
+                prefill_ms: None,
+                decode_ms: Some(milliseconds(started.elapsed())),
+            },
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
     let started = Instant::now();
     let (prefill_ms, mut logits, slots) = if profile {
         let (logits, _) = model.prefill_with_stats(prompt, cache)?;
@@ -189,8 +261,8 @@ fn run_iteration(
     };
     Ok((
         Sample {
-            prefill_ms,
-            decode_ms,
+            prefill_ms: Some(prefill_ms),
+            decode_ms: Some(decode_ms),
         },
         prefill_dispatches,
         decode_dispatches,

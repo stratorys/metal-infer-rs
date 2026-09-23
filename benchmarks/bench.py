@@ -7,12 +7,14 @@
 import argparse
 import concurrent.futures
 import datetime
+import html
 import http.client
 import json
 import os
 import pathlib
 import platform
 import re
+import shutil
 import signal
 import statistics
 import subprocess
@@ -31,6 +33,8 @@ MLX = ["uvx", "--from", f"mlx-lm=={MLX_LM_VERSION}", "--with", f"mlx=={MLX_VERSI
 ENGINE_PROCESSES = ("metal-infer", "mlx_lm", "llama-server", "llama-bench", "vllm")
 PEAK_BANDWIDTH_GBS = {"Apple M4 Pro": 273.0, "Apple M4": 120.0}
 PERCENTILES = (50, 90, 99)
+COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
+FONT = "-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
 PROMPT_TEXT = (
     "You are reviewing the design of a small inference engine for Apple Silicon. "
     "The engine loads FP16 weights, runs a prefill pass over the prompt, then "
@@ -46,7 +50,9 @@ class BenchmarkError(RuntimeError):
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Hugging Face id or local directory")
+    parser.add_argument("--model", help="Hugging Face id or local directory")
+    parser.add_argument("--render", type=pathlib.Path, metavar="RESULTS_JSON",
+                        help="write the report of an existing results file without measuring")
     parser.add_argument("--mlx-model", help="model id for MLX (default: --model)")
     parser.add_argument("--engines", nargs="+", default=["metal-infer", "mlx"],
                         choices=["metal-infer", "mlx"])
@@ -206,12 +212,21 @@ class Energy:
         return statistics.fmean(samples) / 1000, result, seconds
 
 
-def offline_metal(args: argparse.Namespace, overrides: list[str]) -> list[dict[str, float]]:
+def metal_bench_command(args: argparse.Namespace, overrides: list[str]) -> list[str]:
     command = [str(METAL_BENCH), "--model", args.model, "--prompt", str(args.prompt),
                "--generate", str(args.generate), "--iterations", str(args.iterations)]
     for override in overrides:
         command += ["--with", override]
-    report = json.loads(run(command))
+    return command
+
+
+def mlx_bench_command(args: argparse.Namespace) -> list[str]:
+    return MLX + ["mlx_lm.benchmark", "--model", args.mlx_model, "-p", str(args.prompt),
+                  "-g", str(args.generate), "-n", str(args.iterations)]
+
+
+def offline_metal(args: argparse.Namespace, overrides: list[str]) -> list[dict[str, float]]:
+    report = json.loads(run(metal_bench_command(args, overrides)))
     return [
         {
             "pp_tps": args.prompt / (sample["prefill_ms"] / 1000),
@@ -224,8 +239,7 @@ def offline_metal(args: argparse.Namespace, overrides: list[str]) -> list[dict[s
 
 
 def offline_mlx(args: argparse.Namespace) -> list[dict[str, float]]:
-    output = run(MLX + ["mlx_lm.benchmark", "--model", args.mlx_model, "-p", str(args.prompt),
-                        "-g", str(args.generate), "-n", str(args.iterations)])
+    output = run(mlx_bench_command(args))
     trials = re.findall(r"Trial \d+:\s*prompt_tps=([0-9.]+), generation_tps=([0-9.]+), "
                         r"peak_memory=([0-9.]+)", output)
     if not trials:
@@ -417,16 +431,23 @@ def percent(value: float | None) -> str:
     return "—" if value is None else f"{value * 100:.1f} %"
 
 
-def markdown(document: dict[str, Any]) -> str:
+def markdown(document: dict[str, Any], image: bool = False) -> str:
     args = document["arguments"]
+    system = document["system"]
+    power = (system.get("power_source") or "").removeprefix("Now drawing from ").strip("'")
     lines = [
-        f"# {document['system']['chip']} — {args['model']}",
+        f"# {system['chip']} — {args['model']}",
         "",
-        f"{document['generated_at']} · commit `{document['system']['metal_infer_commit']}`"
-        f"{' (dirty)' if document['system']['metal_infer_dirty'] else ''} · "
+        f"{document['generated_at']} · commit `{system['metal_infer_commit']}`"
+        f"{' (dirty)' if system['metal_infer_dirty'] else ''} · "
         f"prompt {args['prompt']}, generate {args['generate']}, {args['rounds']} rounds",
         "",
+        f"macOS {system['macos']} · {system['memory_bytes'] / 2**30:.0f} GB · {power or 'unknown power'} · "
+        f"mlx-lm {system['mlx_lm']}, mlx {system['mlx']}",
+        "",
     ]
+    if image:
+        lines += ["![Benchmark results](results.svg)", ""]
     offline = [result for result in document["results"] if "offline" in result]
     if offline:
         lines += [
@@ -476,8 +497,218 @@ def markdown(document: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def setup(document: dict[str, Any]) -> str:
+    arguments = document["arguments"]
+    args = argparse.Namespace(**arguments)
+    system = document["system"]
+    facts = document["model"]
+    modes = ["offline", "server"] if args.mode == "all" else [args.mode]
+    rows = [
+        ("model", f"`{args.model}`"),
+        ("MLX model", f"`{args.mlx_model}`"),
+        ("engines", ", ".join(args.engines)),
+        ("candidates", ", ".join(f"`{candidate}`" for candidate in args.candidate) or "none"),
+        ("modes", ", ".join(modes)),
+        ("prompt / generated tokens", f"{args.prompt} / {args.generate}"),
+        ("iterations per offline run", str(args.iterations)),
+        ("rounds (engine order reversed every other round)", str(args.rounds)),
+        ("cooldown after each run", f"{args.cooldown:.0f} s"),
+        ("peak bandwidth for MBU", f"{number(document['peak_bandwidth_gbs'])} GB/s"),
+        ("peak FP16 TFLOPS for MFU", number(args.peak_tflops)),
+        ("energy", "powermetrics, idle power subtracted" if args.energy else "not measured"),
+        ("parameters read per token", f"{facts['parameters_read_per_token']:,}"),
+        ("weight bytes read per token", f"{facts['weight_bytes_read_per_token'] / 1e9:.3f} GB"),
+        ("KV bytes per context token", f"{facts['kv_bytes_per_token']:,}"),
+        ("chip / memory", f"{system['chip']} / {system['memory_bytes'] / 2**30:.0f} GB"),
+        ("macOS", system["macos"]),
+        ("power source", system.get("power_source") or "unknown"),
+        ("thermal state", "; ".join((system.get("thermal") or "unknown").split("\n"))),
+        ("metal-infer commit", f"`{system['metal_infer_commit']}`"
+                               f"{' (dirty working tree)' if system['metal_infer_dirty'] else ''}"),
+        ("MLX versions", f"mlx-lm {system['mlx_lm']}, mlx {system['mlx']}"),
+    ]
+    if "server" in modes:
+        rows += [
+            ("server concurrency levels", ", ".join(str(level) for level in args.concurrency)),
+            ("requests per level", str(args.requests)),
+            ("server prompt", f"fixed English text repeated {max(1, args.prompt // 95)} times, "
+                              "unique prefix per request, greedy, `ignore_eos`"),
+        ]
+    lines = ["## Setup", "", "| parameter | value |", "|---|---|"]
+    lines += [f"| {name} | {value} |" for name, value in rows]
+    entries = [(engine, []) for engine in args.engines if engine == "metal-infer"]
+    entries += [(f"metal-infer {candidate}", [candidate]) for candidate in args.candidate]
+    commands = []
+    if "offline" in modes:
+        commands += [" ".join(metal_bench_command(args, overrides)) for _, overrides in entries]
+        if "mlx" in args.engines:
+            commands.append(" ".join(mlx_bench_command(args)))
+    if "server" in modes:
+        commands += [" ".join(server_command("metal-infer", args, overrides)) for _, overrides in entries]
+        if "mlx" in args.engines:
+            commands.append(" ".join(server_command("mlx", args, [])))
+    lines += [
+        "",
+        "Offline: pp = prompt tokens / prefill time and tg = generated tokens / decode time, "
+        "one sample per iteration; MBU = (weight bytes + KV bytes × (prompt + generated / 2)) "
+        "× tg p50 / peak bandwidth.",
+        "",
+        "### Commands",
+        "",
+        "```sh",
+        *commands,
+        "```",
+    ]
+    for result in document["results"]:
+        plan = (result.get("offline") or {}).get("plan")
+        if plan:
+            lines += ["", f"### Plan — {result['engine']}", "", "| key | value |", "|---|---|"]
+            lines += [f"| `{key}` | `{value}` |" for key, value in plan.items()]
+    return "\n".join(lines) + "\n"
+
+
+def run_readme(document: dict[str, Any]) -> str:
+    return (markdown(document, image=True) + setup(document)
+            + "\nRaw measurements: [results.json](results.json). Protocol and metrics: "
+            "[benchmark guide](../../../README.md).\n")
+
+
+def svg_text(x: float, y: float, value: str, anchor: str = "middle", size: int = 13,
+             weight: str = "normal", fill: str = "#24292f") -> str:
+    return (f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}" font-family="{FONT}" '
+            f'font-size="{size}" font-weight="{weight}" fill="{fill}">{html.escape(value)}</text>')
+
+
+def chart_panels(document: dict[str, Any]) -> list[tuple[str, list[tuple[str, dict[str, float]]]]]:
+    args = document["arguments"]
+    panels = []
+    offline = [result for result in document["results"] if "offline" in result]
+    if offline:
+        for key, name in ((f"pp{args['prompt']}_tps", "Prefill"), (f"tg{args['generate']}_tps", "Decode")):
+            panels.append((f"{name} {key.removesuffix('_tps')} (tok/s)",
+                           [(result["engine"], result["offline"][key]) for result in offline]))
+    server = [result for result in document["results"] if result.get("server")]
+    if server:
+        concurrency = min(level["concurrency"] for result in server for level in result["server"])
+        levels = [(result["engine"], next((level for level in result["server"]
+                                           if level["concurrency"] == concurrency), None))
+                  for result in server]
+        for key, name in (("ttft_ms", "TTFT"), ("tpot_ms", "TPOT")):
+            panels.append((f"{name} at concurrency {concurrency} (ms)",
+                           [(engine, level[key]) for engine, level in levels if level]))
+    return panels
+
+
+def svg(document: dict[str, Any]) -> str:
+    panels = chart_panels(document)
+    if not panels:
+        raise BenchmarkError("the results contain nothing to plot")
+    args = document["arguments"]
+    width, height, top, chart_height, gap = 1000, 440, 110, 250, 70
+    baseline = top + chart_height
+    panel_width = (width - 90 - gap * (len(panels) - 1)) / len(panels)
+    body = [
+        svg_text(width / 2, 36, f"{args['model']} on {document['system']['chip']}", size=22, weight="600"),
+        svg_text(width / 2, 60, f"prompt {args['prompt']}, generate {args['generate']} · "
+                 "bar = p50, whisker = mean ± std", size=12, fill="#57606a"),
+    ]
+    for panel_index, (title, entries) in enumerate(panels):
+        left = 70 + panel_index * (panel_width + gap)
+        maximum = max(max(stats["p50"], stats["mean"] + stats["std"]) for _, stats in entries) * 1.12 or 1.0
+        digits = 0 if maximum >= 100 else 1
+        body.append(svg_text(left + panel_width / 2, top - 24, title, size=15, weight="600"))
+        for tick in range(6):
+            y = baseline - chart_height * tick / 5
+            body.append(f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{left + panel_width:.1f}" '
+                        f'y2="{y:.1f}" stroke="#d8dee4"/>')
+            body.append(svg_text(left - 6, y + 4, number(maximum * tick / 5, digits), anchor="end",
+                                 size=11, fill="#57606a"))
+        slot = panel_width / len(entries)
+        bar_width = min(80.0, slot * 0.6)
+        for index, (engine, stats) in enumerate(entries):
+            center = left + slot * (index + 0.5)
+            y = baseline - chart_height * stats["p50"] / maximum
+            low = baseline - chart_height * max(stats["mean"] - stats["std"], 0.0) / maximum
+            high = baseline - chart_height * (stats["mean"] + stats["std"]) / maximum
+            body.append(f'<rect x="{center - bar_width / 2:.1f}" y="{y:.1f}" width="{bar_width:.1f}" '
+                        f'height="{baseline - y:.1f}" fill="{COLORS[index % len(COLORS)]}" rx="2"/>')
+            body.append(f'<line x1="{center:.1f}" y1="{low:.1f}" x2="{center:.1f}" y2="{high:.1f}" '
+                        'stroke="#24292f" stroke-width="1.5"/>')
+            body.append(svg_text(center, min(y, high) - 8, number(stats["p50"]), size=12, weight="600"))
+            body.append(svg_text(center, baseline + 20, engine, size=11))
+    return "\n".join([
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" role="img">',
+        f"<title>{html.escape(args['model'])} benchmark</title>",
+        "<desc>Throughput and latency per engine, p50 with mean ± standard deviation.</desc>",
+        f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
+        *body,
+        "</svg>",
+        "",
+    ])
+
+
+def slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "unknown"
+
+
+def run_directory(document: dict[str, Any]) -> pathlib.Path:
+    system = document["system"]
+    generated = datetime.datetime.fromisoformat(document["generated_at"])
+    commit = (system.get("metal_infer_commit") or "uncommitted")[:7]
+    dirty = "-dirty" if system.get("metal_infer_dirty") else ""
+    return RESULTS / slug(system["chip"]) / f"{generated:%Y%m%d-%H%M%S}-{commit}{dirty}"
+
+
+def rebuild_index() -> None:
+    runs = []
+    for path in RESULTS.glob("*/*/results.json"):
+        try:
+            runs.append((path.parent, json.loads(path.read_text())))
+        except (OSError, json.JSONDecodeError):
+            continue
+    runs.sort(key=lambda run: run[1]["generated_at"], reverse=True)
+    lines = [
+        "# Benchmark results",
+        "",
+        "Written by `benchmarks/bench.py`, newest first.",
+        "",
+        "| generated | chip | model | workload | decode tok/s p50 | report |",
+        "|---|---|---|---|---|---|",
+    ]
+    latest: dict[pathlib.Path, pathlib.Path] = {}
+    for directory, document in runs:
+        args = document["arguments"]
+        key = f"tg{args['generate']}_tps"
+        decode = " · ".join(f"{result['engine']} {number(result['offline'][key]['p50'])}"
+                            for result in document["results"] if "offline" in result)
+        lines.append(f"| `{document['generated_at'][:19]}` | {document['system']['chip']} | {args['model']} "
+                     f"| pp{args['prompt']} / tg{args['generate']} | {decode or '—'} "
+                     f"| [open]({directory.relative_to(RESULTS).as_posix()}/README.md) |")
+        latest.setdefault(directory.parent, directory)
+    (RESULTS / "README.md").write_text("\n".join(lines) + "\n")
+    for chip_directory, directory in latest.items():
+        shutil.copyfile(directory / "results.svg", chip_directory / "latest.svg")
+
+
+def write_report(document: dict[str, Any]) -> pathlib.Path:
+    directory = run_directory(document)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "results.json").write_text(json.dumps(document, indent=2) + "\n")
+    (directory / "results.svg").write_text(svg(document))
+    (directory / "README.md").write_text(run_readme(document))
+    rebuild_index()
+    return directory
+
+
 def main() -> None:
     args = arguments()
+    if args.render:
+        directory = write_report(json.loads(args.render.read_text()))
+        print(f"report: {directory / 'README.md'}")
+        return
+    if not args.model:
+        raise BenchmarkError("--model is required unless --render is given")
     args.mlx_model = args.mlx_model or args.model
     facts = model_facts(model_directory(args.model))
     if not args.skip_build:
@@ -514,14 +745,9 @@ def main() -> None:
         "results": [aggregate(entry, facts, args, bandwidth) for entry in entries],
         "raw": entries,
     }
-    directory = RESULTS / re.sub(r"[^a-z0-9]+", "-", machine["chip"].lower()).strip("-")
-    directory.mkdir(parents=True, exist_ok=True)
-    stem = generated_at.strftime("%Y%m%d-%H%M%S")
-    (directory / f"{stem}.json").write_text(json.dumps(document, indent=2) + "\n")
-    table = markdown(document)
-    (directory / f"{stem}.md").write_text(table)
-    print(table)
-    print(f"results: {directory / stem}.json")
+    directory = write_report(document)
+    print(markdown(document))
+    print(f"report: {directory / 'README.md'}")
 
 
 if __name__ == "__main__":

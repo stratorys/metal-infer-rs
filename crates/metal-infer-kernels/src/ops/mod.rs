@@ -163,22 +163,8 @@ impl Kernels {
         config: AttentionConfig,
         block_keys: usize,
     ) -> Result<Tensor, CoreError> {
-        self.attention_flash_decode_with_configuration(query, key, value, config, block_keys, 256)
-    }
-
-    pub fn attention_flash_decode_with_configuration(
-        &self,
-        query: &Tensor,
-        key: &Tensor,
-        value: &Tensor,
-        config: AttentionConfig,
-        block_keys: usize,
-        threads: usize,
-    ) -> Result<Tensor, CoreError> {
         self.immediate(|batch| {
-            batch.attention_flash_decode_with_configuration(
-                query, key, value, config, block_keys, threads,
-            )
+            batch.attention_flash_decode_with_block(query, key, value, config, block_keys)
         })
     }
 

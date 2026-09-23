@@ -7,7 +7,19 @@ uv run benchmarks/bench.py --model Qwen/Qwen3-0.6B
 ```
 
 It builds the release binaries, then runs each engine alone and writes
-`results/<chip>/<date>.json` (every raw sample) and `<date>.md` (the tables).
+`results/<chip>/<date>-<commit>/` with `results.json` (every raw sample),
+`results.svg` (the chart) and `README.md` (chart, tables, every parameter, the
+exact commands and the metal-infer plan). It also rebuilds the
+[results index](results/README.md) and `results/<chip>/latest.svg`.
+
+`--render results.json` writes the same report from an existing results file
+without measuring.
+
+## Latest results
+
+![Latest Apple M4 Pro results](results/apple-m4-pro/latest.svg)
+
+All runs: [results index](results/README.md).
 
 ## Protocol
 
@@ -59,6 +71,7 @@ sudo; run `sudo -v` just before.
 | `--prompt 512 --generate 128` | workload |
 | `--rounds`, `--iterations`, `--requests`, `--concurrency`, `--cooldown` | repetitions |
 | `--peak-bandwidth`, `--peak-tflops` | chip peaks when the built-in table does not know the chip |
+| `--render results.json` | rewrite the report of an existing run, without measuring |
 
 A/B example (same machine state, alternated):
 

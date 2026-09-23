@@ -12,13 +12,6 @@ pub enum AttentionKind {
     FlashDecode,
 }
 
-enum AttentionExecution {
-    Kind(AttentionKind),
-    FlashDecode {
-        configuration: Option<(usize, usize)>,
-    },
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct AttentionConfig {
     pub query_heads: usize,
@@ -37,13 +30,7 @@ impl KernelBatch<'_> {
         config: AttentionConfig,
         kind: AttentionKind,
     ) -> Result<Tensor, CoreError> {
-        self.attention_with_flash_configuration(
-            query,
-            key,
-            value,
-            config,
-            AttentionExecution::Kind(kind),
-        )
+        self.attention_with_flash_block(query, key, value, config, kind, None)
     }
 
     pub fn attention_flash_decode_with_block(
@@ -54,42 +41,29 @@ impl KernelBatch<'_> {
         config: AttentionConfig,
         block_keys: usize,
     ) -> Result<Tensor, CoreError> {
-        self.attention_flash_decode_with_configuration(query, key, value, config, block_keys, 256)
-    }
-
-    pub fn attention_flash_decode_with_configuration(
-        &mut self,
-        query: &Tensor,
-        key: &Tensor,
-        value: &Tensor,
-        config: AttentionConfig,
-        block_keys: usize,
-        threads: usize,
-    ) -> Result<Tensor, CoreError> {
-        self.attention_with_flash_configuration(
+        self.attention_with_flash_block(
             query,
             key,
             value,
             config,
-            AttentionExecution::FlashDecode {
-                configuration: Some((block_keys, threads)),
-            },
+            AttentionKind::FlashDecode,
+            Some(block_keys),
         )
     }
 
-    fn attention_with_flash_configuration(
+    fn attention_with_flash_block(
         &mut self,
         query: &Tensor,
         key: &Tensor,
         value: &Tensor,
         config: AttentionConfig,
-        execution: AttentionExecution,
+        kind: AttentionKind,
+        flash_block: Option<usize>,
     ) -> Result<Tensor, CoreError> {
-        let (kind, flash_configuration) = match execution {
-            AttentionExecution::Kind(kind) => (kind, None),
-            AttentionExecution::FlashDecode { configuration } => {
-                (AttentionKind::FlashDecode, configuration)
-            }
+        let kind = if kind == AttentionKind::FlashDecode && config.head_dim != 128 {
+            AttentionKind::DecodeSplitKv
+        } else {
+            kind
         };
         require_f16(query)?;
         require_f16(key)?;
@@ -127,28 +101,17 @@ impl KernelBatch<'_> {
                 "tiled attention requires a power-of-two head_dim <= 256".into(),
             ));
         }
-        let (flash_block_keys, flash_threads) = if kind == AttentionKind::FlashDecode {
-            let (block, threads) = flash_configuration.unwrap_or_else(|| {
-                self.kernels
-                    .flash_decode_configuration_for_length(*kv_length)
-            });
+        let flash_block_keys = if kind == AttentionKind::FlashDecode {
+            let block = flash_block
+                .unwrap_or_else(|| self.kernels.flash_decode_block_for_length(*kv_length));
             if !matches!(block, 32 | 64 | 128 | 256) {
                 return Err(CoreError::Shape(
                     "flash decode block size must be 32, 64, 128, or 256".into(),
                 ));
             }
-            if !matches!(threads, 128 | 256) {
-                return Err(CoreError::Shape(
-                    "flash decode threadgroup size must be 128 or 256".into(),
-                ));
-            }
-            if threads == 128 && config.head_dim != 128 {
-                (block, 256)
-            } else {
-                (block, threads)
-            }
+            block
         } else {
-            (0, 0)
+            0
         };
         let out = self.empty(query.shape(), DType::F16)?;
         let params = AttentionParams {
@@ -193,40 +156,23 @@ impl KernelBatch<'_> {
                 .ok_or_else(|| CoreError::Shape("flash decode partial width overflow".into()))?;
             let scratch = self.empty(&[config.kv_heads, blocks, 2, partial_width], DType::F32)?;
             let groups = checked_mul(config.kv_heads, blocks, "flash decode groups")?;
-            let optimized_128 = flash_threads == 128;
             self.dispatch(
-                if optimized_128 {
-                    "attention_flash_decode_partial_128_opt_f16"
-                } else {
-                    "attention_flash_decode_partial_legacy_f16"
-                },
+                "attention_flash_decode_partial_f16",
                 &[query, key, value, &scratch],
                 &params,
-                size(
-                    checked_mul(groups, flash_threads, "flash decode grid")?,
-                    1,
-                    1,
-                ),
-                size(flash_threads, 1, 1),
+                size(checked_mul(groups, 128, "flash decode grid")?, 1, 1),
+                size(128, 1, 1),
             )?;
             self.dispatch(
-                if optimized_128 {
-                    "attention_flash_decode_reduce_128_f16"
-                } else {
-                    "attention_flash_decode_reduce_legacy_f16"
-                },
+                "attention_flash_decode_reduce_f16",
                 &[&scratch, &out],
                 &params,
                 size(
-                    checked_mul(
-                        config.query_heads,
-                        if optimized_128 { 128 } else { 32 },
-                        "flash decode reduction grid",
-                    )?,
+                    checked_mul(config.query_heads, 128, "flash decode reduction grid")?,
                     1,
                     1,
                 ),
-                size(if optimized_128 { 128 } else { 32 }, 1, 1),
+                size(128, 1, 1),
             )?;
             return Ok(out);
         }

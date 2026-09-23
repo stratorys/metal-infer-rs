@@ -29,15 +29,8 @@ const SINGLE_SHAPES: &[(&str, usize, usize, usize, usize)] = &[
     ("Apple M4 Pro", 151_936, 1024, 0, 2),
 ];
 
-// (max active length, keys per block, threads) for two query heads per KV head.
-const M4_PRO_FLASH_DECODE_BLOCKS: &[(usize, usize, usize)] = &[
-    (512, 32, 128),
-    (640, 64, 128),
-    (1024, 64, 128),
-    (2048, 128, 128),
-    (4096, 256, 256),
-    (8192, 256, 256),
-];
+// (max active length, keys per block) for two query heads per KV head.
+const M4_PRO_FLASH_DECODE_BLOCKS: &[(usize, usize)] = &[(1024, 64), (3072, 128), (usize::MAX, 256)];
 
 // (device, output widths, K, baseline rows, tuned rows).
 const FUSED_NORM_SHAPES: &[(&str, [usize; 3], usize, usize, usize)] = &[
@@ -89,7 +82,6 @@ pub(crate) fn fused_norm_rows(
 pub struct FlashDecodeBlock {
     pub max_length: usize,
     pub block: usize,
-    pub threads: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -101,10 +93,9 @@ pub struct KernelSelection {
 impl KernelSelection {
     pub fn validate(&self) -> Result<(), CoreError> {
         for entry in &self.flash_decode_blocks {
-            if !matches!(entry.block, 32 | 64 | 128 | 256) || !matches!(entry.threads, 128 | 256) {
+            if !matches!(entry.block, 32 | 64 | 128 | 256) {
                 return Err(CoreError::Shape(
-                    "flash decode blocks must use 32, 64, 128, or 256 keys and 128 or 256 threads"
-                        .into(),
+                    "flash decode blocks must use 32, 64, 128, or 256 keys".into(),
                 ));
             }
         }
@@ -147,17 +138,17 @@ impl Kernels {
         self.tuning.is_m4_pro
     }
 
-    pub(crate) fn flash_decode_configuration_for_length(
+    pub(crate) fn flash_decode_block_for_length(
         &self,
         length: usize,
-    ) -> (usize, usize) {
+    ) -> usize {
         self.tuning
             .selection
             .borrow()
             .flash_decode_blocks
             .iter()
             .find(|entry| length <= entry.max_length)
-            .map_or((64, 256), |entry| (entry.block, entry.threads))
+            .map_or(64, |entry| entry.block)
     }
 
     pub(crate) fn matvec_rows_for_shape(
@@ -202,11 +193,7 @@ impl Kernels {
             flash_decode_blocks: if query_heads == kv_heads * 2 {
                 M4_PRO_FLASH_DECODE_BLOCKS
                     .iter()
-                    .map(|&(max_length, block, threads)| FlashDecodeBlock {
-                        max_length,
-                        block,
-                        threads,
-                    })
+                    .map(|&(max_length, block)| FlashDecodeBlock { max_length, block })
                     .collect()
             } else {
                 Vec::new()

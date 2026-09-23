@@ -638,7 +638,7 @@ fn flash_decode_matches_reference_across_block_boundaries() -> Result<(), CoreEr
         .map(|index| if index % 3 == 0 { 2.0 } else { -2.0 })
         .collect();
     let query = context.tensor_f16(&query_values, &[1, 2, 128])?;
-    for length in [1, 63, 64, 65, 256, 640, 8192] {
+    for length in [1, 7, 17, 33, 63, 64, 65, 256, 640, 2049, 8192] {
         let key_values: Vec<f32> = (0..length * 128)
             .map(|index| if index % 7 < 3 { 2.0 } else { -2.0 })
             .collect();
@@ -658,14 +658,10 @@ fn flash_decode_matches_reference_across_block_boundaries() -> Result<(), CoreEr
             .attention(&query, &key, &value, config, AttentionKind::Reference)?
             .to_f32_vec()?;
         for block in [32, 64, 128, 256] {
-            for threads in [128, 256] {
-                let flash = kernels
-                    .attention_flash_decode_with_configuration(
-                        &query, &key, &value, config, block, threads,
-                    )?
-                    .to_f32_vec()?;
-                assert_close(&flash, &reference);
-            }
+            let flash = kernels
+                .attention_flash_decode_with_block(&query, &key, &value, config, block)?
+                .to_f32_vec()?;
+            assert_close(&flash, &reference);
         }
     }
     Ok(())
@@ -700,11 +696,9 @@ fn flash_decode_matches_reference_for_multiple_gqa_groups_and_causal_limit() -> 
         let reference = kernels
             .attention(&query, &key, &value, config, AttentionKind::Reference)?
             .to_f32_vec()?;
-        for threads in [128, 256] {
+        for block in [32, 64, 128, 256] {
             let flash = kernels
-                .attention_flash_decode_with_configuration(
-                    &query, &key, &value, config, 64, threads,
-                )?
+                .attention_flash_decode_with_block(&query, &key, &value, config, block)?
                 .to_f32_vec()?;
             assert_close(&flash, &reference);
         }

@@ -34,7 +34,7 @@ pub enum PlanError {
 const SWITCH: &str = "on or off";
 const ATTENTION: &str = "reference, tiled, flash-prefill, decode-split-kv, or flash-decode";
 const GEMV_CONFIG: &str = "none, baseline, or tuned";
-const BLOCKS: &str = "default, BLOCKxTHREADS, or LENGTH:BLOCKxTHREADS entries separated by commas";
+const BLOCKS: &str = "default, BLOCK, or LENGTH:BLOCK entries separated by commas";
 
 impl Plan {
     pub fn apply_override(
@@ -164,24 +164,22 @@ fn parse_blocks(
     value
         .split(',')
         .map(|entry| {
-            let (max_length, shape) = match entry.split_once(':') {
-                Some((length, shape)) => (
+            let (max_length, block) = match entry.split_once(':') {
+                Some((length, block)) => (
                     length
                         .trim()
                         .parse()
                         .map_err(|_| invalid(key, value, BLOCKS))?,
-                    shape,
+                    block,
                 ),
                 None => (usize::MAX, entry),
             };
-            let (block, threads) = shape
-                .trim()
-                .split_once('x')
-                .ok_or_else(|| invalid(key, value, BLOCKS))?;
             Ok(FlashDecodeBlock {
                 max_length,
-                block: block.parse().map_err(|_| invalid(key, value, BLOCKS))?,
-                threads: threads.parse().map_err(|_| invalid(key, value, BLOCKS))?,
+                block: block
+                    .trim()
+                    .parse()
+                    .map_err(|_| invalid(key, value, BLOCKS))?,
             })
         })
         .collect()
@@ -195,9 +193,9 @@ fn blocks_name(blocks: &[FlashDecodeBlock]) -> String {
         .iter()
         .map(|entry| {
             if entry.max_length == usize::MAX {
-                format!("{}x{}", entry.block, entry.threads)
+                entry.block.to_string()
             } else {
-                format!("{}:{}x{}", entry.max_length, entry.block, entry.threads)
+                format!("{}:{}", entry.max_length, entry.block)
             }
         })
         .collect::<Vec<_>>()
@@ -227,7 +225,7 @@ mod tests {
     #[test]
     fn every_listed_value_can_be_applied_back() -> Result<(), PlanError> {
         let mut original = plan();
-        original.apply_override("flash_decode.blocks=512:64x128,1024:128x256")?;
+        original.apply_override("flash_decode.blocks=512:64,1024:128")?;
         let mut copy = plan();
         for (key, value) in original.entries() {
             copy.apply_override(&format!("{key}={value}"))?;

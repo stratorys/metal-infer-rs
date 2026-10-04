@@ -1,0 +1,6 @@
+[test-groups]
+metal-model = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "binary(worker) | binary(server) | binary(golden) | binary(plan) | test(pipelined_greedy_matches_synchronous_bits)"
+test-group = "metal-model"

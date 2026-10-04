@@ -1,8 +1,10 @@
 [workspace]
 members = [
     "crates/metal-infer-cli",
-    "crates/metal-infer-core",
+    "crates/metal-infer-kernels",
     "crates/metal-infer-models",
+    "crates/metal-infer-planner",
+    "crates/metal-infer-runtime",
 ]
 resolver = "3"
 
@@ -17,17 +19,11 @@ half = "2.7.1"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", features = ["NSString"] }
 objc2-metal = "0.3.2"
-objc2-metal-performance-shaders = { version = "0.3.2", features = [
-    "MPSCore",
-    "MPSCoreTypes",
-    "MPSKernel",
-    "MPSMatrix",
-    "MPSMatrixMultiplication",
-] }
 safetensors = "0.8.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
+tracing = "0.1.44"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 
 [workspace.lints.rust]

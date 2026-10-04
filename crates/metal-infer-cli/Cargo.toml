@@ -7,11 +7,15 @@ autobins = false
 
 [dependencies]
 clap.workspace = true
-metal-infer-core = { path = "../metal-infer-core" }
+metal-infer-kernels = { path = "../metal-infer-kernels" }
 metal-infer-models = { path = "../metal-infer-models" }
+metal-infer-planner = { path = "../metal-infer-planner" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+metal-infer-runtime = { version = "0.1.0", path = "../metal-infer-runtime" }
 
 [[bin]]
 name = "metal-infer"

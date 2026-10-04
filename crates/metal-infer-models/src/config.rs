@@ -23,15 +23,10 @@ pub struct Qwen3Config {
 impl Qwen3Config {
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.model_type != "qwen3" {
-            return Err(ModelError::Unsupported(format!(
-                "expected model_type qwen3, got {}",
-                self.model_type
-            )));
+            return Err(ModelError::UnsupportedModelType);
         }
         if self.attention_bias {
-            return Err(ModelError::Unsupported(
-                "attention biases are not implemented".into(),
-            ));
+            return Err(ModelError::AttentionBias);
         }
         if self.hidden_size == 0
             || self.intermediate_size == 0
@@ -42,17 +37,13 @@ impl Qwen3Config {
             || self.vocab_size == 0
             || !self.head_dim.is_multiple_of(2)
         {
-            return Err(ModelError::Config(
-                "model dimensions must be non-zero and head_dim even".into(),
-            ));
+            return Err(ModelError::InvalidDimensions);
         }
         if !self
             .num_attention_heads
             .is_multiple_of(self.num_key_value_heads)
         {
-            return Err(ModelError::Config(
-                "num_attention_heads must be divisible by num_key_value_heads".into(),
-            ));
+            return Err(ModelError::InvalidHeadRatio);
         }
         Ok(())
     }

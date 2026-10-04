@@ -1,0 +1,24 @@
+[package]
+name = "metal-infer-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = "0.8.9"
+metal-infer-kernels = { version = "0.1.0", path = "../metal-infer-kernels" }
+metal-infer-models = { version = "0.1.0", path = "../metal-infer-models" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.53.1", features = ["net", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = "0.1.19"
+tracing.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tokio = { version = "1.53.1", features = ["rt", "macros", "net", "io-util"] }
+tower = { version = "0.5.3", features = ["util"] }
